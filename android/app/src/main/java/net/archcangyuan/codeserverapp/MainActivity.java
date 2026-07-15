@@ -50,7 +50,11 @@ public final class MainActivity extends Activity {
     private static final String ADDRESS_KEY = "server_address";
     private static final String PROJECTS_KEY = "saved_projects";
     private static final String LEGACY_NATIVE_ZOOM_PERCENT_KEY = "zoom_percent";
+    private static final String LAYOUT_ZOOM_STEPS_KEY = "layout_zoom_steps";
     private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
+    private static final int MIN_LAYOUT_ZOOM_STEPS = -6;
+    private static final int MAX_LAYOUT_ZOOM_STEPS = 6;
+    private static final double LAYOUT_ZOOM_FACTOR = 1.1;
     private static final long PROJECT_SESSION_TTL_MS = 30L * 60L * 1_000L;
     private static final int MAX_HOT_PROJECT_SESSIONS = 6;
     private static final int ACCENT = Color.rgb(103, 80, 164);
@@ -61,16 +65,26 @@ public final class MainActivity extends Activity {
 
     private static final String KEYBOARD_BRIDGE = """
         (() => {
-          let viewport = document.querySelector('meta[name="viewport"]');
-          if (!viewport) {
-            viewport = document.createElement('meta');
-            viewport.setAttribute('name', 'viewport');
-            (document.head || document.documentElement).appendChild(viewport);
-          }
-          viewport.setAttribute(
-            'content',
-            'width=1280, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes'
-          );
+          const setViewportWidth = (requestedWidth) => {
+            const numericWidth = Number(requestedWidth) || 1280;
+            const width = Math.max(640, Math.min(2400, Math.round(numericWidth)));
+            let viewport = document.querySelector('meta[name="viewport"]');
+            if (!viewport) {
+              viewport = document.createElement('meta');
+              viewport.setAttribute('name', 'viewport');
+              (document.head || document.documentElement).appendChild(viewport);
+            }
+            viewport.setAttribute(
+              'content',
+              `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`
+            );
+            window.__codeServerAppViewportWidth = width;
+            requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+            return width;
+          };
+
+          window.__codeServerAppSetViewportWidth = setViewportWidth;
+          setViewportWidth(window.__codeServerAppViewportWidth || 1280);
 
           if (window.__codeServerAppKeyboard) return;
 
@@ -170,12 +184,20 @@ public final class MainActivity extends Activity {
     private boolean controlLocked;
     private boolean shiftLocked;
     private boolean fullscreen;
+    private int layoutZoomSteps;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
         preferences.edit().remove(LEGACY_NATIVE_ZOOM_PERCENT_KEY).apply();
+        layoutZoomSteps = Math.max(
+            MIN_LAYOUT_ZOOM_STEPS,
+            Math.min(
+                MAX_LAYOUT_ZOOM_STEPS,
+                preferences.getInt(LAYOUT_ZOOM_STEPS_KEY, 0)
+            )
+        );
         loadProjects();
         setContentView(createContentView());
         configureSystemUi();
@@ -435,7 +457,7 @@ public final class MainActivity extends Activity {
         settings.setBuiltInZoomControls(true);
         settings.setDisplayZoomControls(false);
         settings.setTextZoom(90);
-        target.setInitialScale(calculateDesktopScale());
+        target.setInitialScale(0);
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
@@ -486,35 +508,46 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        WebView target = webView;
-        int keyCode = direction > 0 ? KeyEvent.KEYCODE_EQUALS : KeyEvent.KEYCODE_MINUS;
-        int metaState = KeyEvent.META_CTRL_ON | KeyEvent.META_CTRL_LEFT_ON;
-        target.requestFocus();
-        target.post(() -> {
-            if (target != webView) {
-                return;
-            }
-            long eventTime = SystemClock.uptimeMillis();
-            target.dispatchKeyEvent(
-                new KeyEvent(
-                    eventTime,
-                    eventTime,
-                    KeyEvent.ACTION_DOWN,
-                    keyCode,
-                    0,
-                    metaState
-                )
-            );
-            target.dispatchKeyEvent(
-                new KeyEvent(
-                    eventTime,
-                    eventTime + 1L,
-                    KeyEvent.ACTION_UP,
-                    keyCode,
-                    0,
-                    metaState
-                )
-            );
+        int nextSteps = Math.max(
+            MIN_LAYOUT_ZOOM_STEPS,
+            Math.min(MAX_LAYOUT_ZOOM_STEPS, layoutZoomSteps + direction)
+        );
+        if (nextSteps == layoutZoomSteps) {
+            return;
+        }
+
+        layoutZoomSteps = nextSteps;
+        preferences.edit().putInt(LAYOUT_ZOOM_STEPS_KEY, layoutZoomSteps).apply();
+        applyLayoutZoom(webView);
+
+        int zoomPercent = (int) Math.round(
+            Math.pow(LAYOUT_ZOOM_FACTOR, layoutZoomSteps) * 100.0
+        );
+        Toast.makeText(
+            this,
+            "Layout zoom " + zoomPercent + "% · full width",
+            Toast.LENGTH_SHORT
+        ).show();
+    }
+
+    private int calculateLayoutViewportWidth() {
+        return (int) Math.round(
+            DESKTOP_VIEWPORT_WIDTH / Math.pow(LAYOUT_ZOOM_FACTOR, layoutZoomSteps)
+        );
+    }
+
+    private void applyLayoutZoom(WebView target) {
+        if (target == null) {
+            return;
+        }
+        int viewportWidth = calculateLayoutViewportWidth();
+        String script = "window.__codeServerAppViewportWidth=" + viewportWidth + ";"
+            + "if(window.__codeServerAppSetViewportWidth){"
+            + "window.__codeServerAppSetViewportWidth(" + viewportWidth + ");}";
+        target.evaluateJavascript(script, value -> {
+            target.setInitialScale(0);
+            target.requestLayout();
+            target.invalidate();
         });
     }
 
@@ -576,6 +609,7 @@ public final class MainActivity extends Activity {
         webView.setVisibility(View.VISIBLE);
         webView.bringToFront();
         webView.onResume();
+        applyLayoutZoom(webView);
         syncModifiers(webView);
     }
 
@@ -645,13 +679,6 @@ public final class MainActivity extends Activity {
         }
 
         switchToProjectUrl(normalized);
-    }
-
-    private int calculateDesktopScale() {
-        float density = getResources().getDisplayMetrics().density;
-        float availableCssWidth = getResources().getDisplayMetrics().widthPixels / density;
-        int scale = Math.round(availableCssWidth * 100f / DESKTOP_VIEWPORT_WIDTH);
-        return Math.max(20, Math.min(60, scale));
     }
 
     private void hideAddressBar() {
@@ -834,7 +861,10 @@ public final class MainActivity extends Activity {
     }
 
     private void installKeyboardBridge(WebView target) {
-        target.evaluateJavascript(KEYBOARD_BRIDGE, value -> syncModifiers(target));
+        target.evaluateJavascript(KEYBOARD_BRIDGE, value -> {
+            applyLayoutZoom(target);
+            syncModifiers(target);
+        });
     }
 
     private void syncModifiers() {
