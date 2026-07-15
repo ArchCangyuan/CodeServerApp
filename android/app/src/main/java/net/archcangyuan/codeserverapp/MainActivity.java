@@ -23,6 +23,7 @@ import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
 import android.webkit.CookieManager;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -51,7 +52,7 @@ public final class MainActivity extends Activity {
     private static final String PROJECTS_KEY = "saved_projects";
     private static final String LEGACY_NATIVE_ZOOM_PERCENT_KEY = "zoom_percent";
     private static final String LAYOUT_ZOOM_STEPS_KEY = "layout_zoom_steps";
-    private static final String CSS_LAYOUT_ZOOM_MIGRATED_KEY = "css_layout_zoom_migrated";
+    private static final String BODY_LAYOUT_ZOOM_MIGRATED_KEY = "body_layout_zoom_migrated";
     private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
     private static final int MIN_LAYOUT_ZOOM_STEPS = -6;
     private static final int MAX_LAYOUT_ZOOM_STEPS = 6;
@@ -83,13 +84,50 @@ public final class MainActivity extends Activity {
             const numericZoom = Number(requestedZoom) || 1;
             const zoom = Math.max(0.5, Math.min(2, numericZoom));
             ensureDesktopViewport();
-            document.documentElement.style.zoom = String(zoom);
+            document.documentElement.style.zoom = '1';
+            if (document.body) {
+              document.body.style.zoom = String(zoom);
+              document.body.style.width = '100%';
+              document.body.style.minWidth = '0';
+            }
             window.__codeServerAppLayoutZoom = zoom;
             requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
             return zoom;
           };
 
+          const forceKeyboard = () => {
+            let input = document.getElementById('__code_server_app_keyboard_proxy');
+            if (!input) {
+              input = document.createElement('input');
+              input.id = '__code_server_app_keyboard_proxy';
+              input.type = 'text';
+              input.inputMode = 'text';
+              input.autocomplete = 'off';
+              input.autocapitalize = 'off';
+              input.spellcheck = false;
+              input.setAttribute('aria-label', 'CodeServerApp keyboard proxy');
+              Object.assign(input.style, {
+                position: 'fixed',
+                left: '1px',
+                bottom: '1px',
+                width: '1px',
+                height: '1px',
+                padding: '0',
+                border: '0',
+                opacity: '0.01',
+                zIndex: '2147483647'
+              });
+              input.addEventListener('input', () => {
+                input.value = '';
+              });
+              (document.body || document.documentElement).appendChild(input);
+            }
+            input.focus({ preventScroll: true });
+            return document.activeElement === input;
+          };
+
           window.__codeServerAppSetLayoutZoom = setLayoutZoom;
+          window.__codeServerAppForceKeyboard = forceKeyboard;
           setLayoutZoom(window.__codeServerAppLayoutZoom || 1);
 
           if (window.__codeServerAppKeyboard) return;
@@ -197,10 +235,10 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
         preferences.edit().remove(LEGACY_NATIVE_ZOOM_PERCENT_KEY).apply();
-        if (!preferences.getBoolean(CSS_LAYOUT_ZOOM_MIGRATED_KEY, false)) {
+        if (!preferences.getBoolean(BODY_LAYOUT_ZOOM_MIGRATED_KEY, false)) {
             preferences.edit()
                 .putInt(LAYOUT_ZOOM_STEPS_KEY, 0)
-                .putBoolean(CSS_LAYOUT_ZOOM_MIGRATED_KEY, true)
+                .putBoolean(BODY_LAYOUT_ZOOM_MIGRATED_KEY, true)
                 .apply();
         }
         layoutZoomSteps = Math.max(
@@ -321,6 +359,11 @@ public final class MainActivity extends Activity {
         keyRow.setOrientation(LinearLayout.HORIZONTAL);
         keyRow.setGravity(Gravity.CENTER_VERTICAL);
         keyRow.setPadding(dp(8), dp(6), dp(8), dp(6));
+
+        Button keyboardButton = createKeyButton("KB");
+        keyboardButton.setContentDescription("Force show keyboard");
+        keyboardButton.setOnClickListener(view -> forceShowKeyboard());
+        keyRow.addView(keyboardButton, keyLayoutParams(dp(62)));
 
         controlButton = createKeyButton("Ctrl 🔓");
         controlButton.setOnClickListener(view -> {
@@ -552,7 +595,9 @@ public final class MainActivity extends Activity {
             + "window.__codeServerAppLayoutZoom=zoom;"
             + "if(window.__codeServerAppSetLayoutZoom){"
             + "return window.__codeServerAppSetLayoutZoom(zoom);}"
-            + "document.documentElement.style.zoom=String(zoom);"
+            + "document.documentElement.style.zoom='1';"
+            + "if(document.body){document.body.style.zoom=String(zoom);"
+            + "document.body.style.width='100%';document.body.style.minWidth='0';}"
             + "window.dispatchEvent(new Event('resize'));"
             + "return zoom;"
             + "})()";
@@ -560,6 +605,27 @@ public final class MainActivity extends Activity {
             target.requestLayout();
             target.invalidate();
         });
+    }
+
+    private void forceShowKeyboard() {
+        if (webView == null) {
+            return;
+        }
+        WebView target = webView;
+        target.requestFocus();
+        String script = "window.__codeServerAppForceKeyboard"
+            + " ? window.__codeServerAppForceKeyboard() : false";
+        target.evaluateJavascript(script, value -> target.postDelayed(() -> {
+            if (target != webView) {
+                return;
+            }
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.restartInput(target);
+                inputMethodManager.showSoftInput(target, InputMethodManager.SHOW_IMPLICIT);
+            }
+        }, 100L));
     }
 
     private void switchToProjectUrl(String address) {
