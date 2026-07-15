@@ -72,6 +72,7 @@ public final class MainActivity extends Activity {
 
     private static final String KEYBOARD_BRIDGE = """
         (() => {
+          const PROXY_ID = '__code_server_app_keyboard_proxy';
           const setViewportWidth = (requestedWidth) => {
             const numericWidth = Number(requestedWidth) || 1280;
             const width = Math.max(640, Math.min(2400, Math.round(numericWidth)));
@@ -96,69 +97,276 @@ public final class MainActivity extends Activity {
             return width;
           };
 
-          const forceKeyboard = () => {
-            let input = document.getElementById('__code_server_app_keyboard_proxy');
-            if (!input) {
-              input = document.createElement('input');
-              input.id = '__code_server_app_keyboard_proxy';
-              input.type = 'text';
-              input.inputMode = 'text';
-              input.autocomplete = 'off';
-              input.autocapitalize = 'off';
-              input.spellcheck = false;
-              input.setAttribute('aria-label', 'CodeServerApp keyboard proxy');
-              Object.assign(input.style, {
-                position: 'fixed',
-                left: '1px',
-                bottom: '1px',
-                width: '1px',
-                height: '1px',
-                padding: '0',
-                border: '0',
-                opacity: '0.01',
-                zIndex: '2147483647'
-              });
-              input.addEventListener('input', () => {
-                input.value = '';
-              });
-              (document.body || document.documentElement).appendChild(input);
-            }
-            input.focus({ preventScroll: true });
-            return document.activeElement === input;
-          };
-
           window.__codeServerAppSetViewportWidth = setViewportWidth;
-          window.__codeServerAppForceKeyboard = forceKeyboard;
           setViewportWidth(window.__codeServerAppViewportWidth || 1280);
 
-          if (window.__codeServerAppKeyboard) return;
+          const existingBridge = window.__codeServerAppKeyboard;
+          if (existingBridge && existingBridge.version >= 2) {
+            window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
+            return;
+          }
 
-          const state = { control: false, shift: false };
-          const activeTarget = () => document.activeElement || document.body;
+          const state = {
+            control: false,
+            shift: false,
+            target: null,
+            composing: false,
+            lastForwardedKey: '',
+            lastForwardedAt: 0,
+            lastCompositionText: '',
+            lastCompositionAt: 0
+          };
 
-          const defineLegacyKeyCodes = (event, keyCode) => {
+          const isProxy = (element) => Boolean(element && element.id === PROXY_ID);
+
+          const deepestActiveElement = (rootDocument) => {
+            let active = rootDocument.activeElement;
+            for (let depth = 0; active && depth < 6; depth += 1) {
+              if (active.tagName !== 'IFRAME') break;
+              try {
+                const childDocument = active.contentDocument;
+                if (!childDocument || !childDocument.activeElement) break;
+                active = childDocument.activeElement;
+              } catch (_) {
+                break;
+              }
+            }
+            return active;
+          };
+
+          const rememberTarget = (candidate) => {
+            if (!candidate || isProxy(candidate)) return;
+            const ownerDocument = candidate.ownerDocument;
+            const isGeneric = candidate.tagName === 'HTML'
+              || Boolean(ownerDocument && candidate === ownerDocument.body);
+            if (!isGeneric || !state.target) state.target = candidate;
+          };
+
+          const activeTarget = () => {
+            const current = deepestActiveElement(document);
+            if (current && !isProxy(current)) rememberTarget(current);
+            if (current && !isProxy(current)) return current;
+            if (state.target && state.target.isConnected) return state.target;
+            const fallback = document.querySelector(
+              'canvas, [role="application"], [tabindex="0"]'
+            ) || document.body || document.documentElement;
+            rememberTarget(fallback);
+            return fallback;
+          };
+
+          const defineLegacyKeyCodes = (event, keyCode, charCode = 0) => {
             try {
               Object.defineProperty(event, 'keyCode', { get: () => keyCode });
-              Object.defineProperty(event, 'which', { get: () => keyCode });
+              Object.defineProperty(event, 'which', {
+                get: () => charCode || keyCode
+              });
+              Object.defineProperty(event, 'charCode', { get: () => charCode });
             } catch (_) {}
           };
 
-          const dispatchModifier = (key, code, keyCode, isDown) => {
-            const target = activeTarget();
-            if (!target) return;
-            const event = new KeyboardEvent(isDown ? 'keydown' : 'keyup', {
+          const dispatchKeyPhase = (
+            target,
+            type,
+            key,
+            code,
+            keyCode,
+            source = null
+          ) => {
+            if (!target) return false;
+            const printable = typeof key === 'string' && Array.from(key).length === 1;
+            const event = new KeyboardEvent(type, {
               key,
-              code,
-              ctrlKey: state.control,
-              shiftKey: state.shift,
-              altKey: false,
-              metaKey: false,
+              code: code || '',
+              location: source ? source.location : 0,
+              repeat: source ? source.repeat : false,
+              ctrlKey: state.control || Boolean(source && source.ctrlKey),
+              shiftKey: state.shift || Boolean(source && source.shiftKey),
+              altKey: Boolean(source && source.altKey),
+              metaKey: Boolean(source && source.metaKey),
               bubbles: true,
               cancelable: true,
               composed: true
             });
-            defineLegacyKeyCodes(event, keyCode);
-            target.dispatchEvent(event);
+            const charCode = type === 'keypress' && printable
+              ? key.codePointAt(0)
+              : 0;
+            defineLegacyKeyCodes(event, keyCode || 0, charCode);
+            return target.dispatchEvent(event);
+          };
+
+          const keyInfoForText = (key) => {
+            if (/^[a-z]$/i.test(key)) {
+              const upper = key.toUpperCase();
+              return {
+                code: `Key${upper}`,
+                keyCode: upper.charCodeAt(0),
+                shift: key === upper
+              };
+            }
+            if (/^[0-9]$/.test(key)) {
+              return {
+                code: `Digit${key}`,
+                keyCode: key.charCodeAt(0),
+                shift: false
+              };
+            }
+            if (key === ' ') return { code: 'Space', keyCode: 32, shift: false };
+            const punctuation = {
+              '`': ['Backquote', 192, false], '~': ['Backquote', 192, true],
+              '-': ['Minus', 189, false], '_': ['Minus', 189, true],
+              '=': ['Equal', 187, false], '+': ['Equal', 187, true],
+              '[': ['BracketLeft', 219, false], '{': ['BracketLeft', 219, true],
+              ']': ['BracketRight', 221, false], '}': ['BracketRight', 221, true],
+              '\\\\': ['Backslash', 220, false], '|': ['Backslash', 220, true],
+              ';': ['Semicolon', 186, false], ':': ['Semicolon', 186, true],
+              "'": ['Quote', 222, false], '"': ['Quote', 222, true],
+              ',': ['Comma', 188, false], '<': ['Comma', 188, true],
+              '.': ['Period', 190, false], '>': ['Period', 190, true],
+              '/': ['Slash', 191, false], '?': ['Slash', 191, true],
+              '!': ['Digit1', 49, true], '@': ['Digit2', 50, true],
+              '#': ['Digit3', 51, true], '$': ['Digit4', 52, true],
+              '%': ['Digit5', 53, true], '^': ['Digit6', 54, true],
+              '&': ['Digit7', 55, true], '*': ['Digit8', 56, true],
+              '(': ['Digit9', 57, true], ')': ['Digit0', 48, true]
+            };
+            const mapped = punctuation[key];
+            if (mapped) {
+              return { code: mapped[0], keyCode: mapped[1], shift: mapped[2] };
+            }
+            return {
+              code: '',
+              keyCode: key.codePointAt(0) || 0,
+              shift: false
+            };
+          };
+
+          const dispatchCompleteKey = (key, code, keyCode, forceShift = false) => {
+            const target = activeTarget();
+            if (!target) return;
+            const source = forceShift ? { shiftKey: true } : null;
+            dispatchKeyPhase(target, 'keydown', key, code, keyCode, source);
+            if (Array.from(key).length === 1) {
+              dispatchKeyPhase(target, 'keypress', key, code, keyCode, source);
+            }
+            dispatchKeyPhase(target, 'keyup', key, code, keyCode, source);
+          };
+
+          const sendText = (text) => {
+            for (const key of Array.from(text || '')) {
+              const info = keyInfoForText(key);
+              dispatchCompleteKey(key, info.code, info.keyCode, info.shift);
+            }
+          };
+
+          const wasRecentlyForwarded = (key) =>
+            state.lastForwardedKey === key
+              && performance.now() - state.lastForwardedAt < 500;
+
+          const handleProxyInput = (event) => {
+            if (!isProxy(event.target)) return;
+            event.stopImmediatePropagation();
+            const input = event.target;
+            if (event.isComposing || state.composing) return;
+
+            const inputType = event.inputType || '';
+            if (inputType.startsWith('deleteContentBackward')) {
+              if (!wasRecentlyForwarded('Backspace')) {
+                dispatchCompleteKey('Backspace', 'Backspace', 8);
+              }
+            } else if (inputType === 'insertLineBreak'
+                || inputType === 'insertParagraph') {
+              if (!wasRecentlyForwarded('Enter')) {
+                dispatchCompleteKey('Enter', 'Enter', 13);
+              }
+            } else {
+              const text = event.data != null ? event.data : input.value;
+              const duplicateComposition = text
+                && text === state.lastCompositionText
+                && performance.now() - state.lastCompositionAt < 500;
+              const duplicateKey = text
+                && Array.from(text).length === 1
+                && wasRecentlyForwarded(text);
+              if (text && !duplicateComposition && !duplicateKey) sendText(text);
+            }
+            input.value = '';
+          };
+
+          const ensureProxy = () => {
+            let input = document.getElementById(PROXY_ID);
+            if (input) return input;
+            input = document.createElement('input');
+            input.id = PROXY_ID;
+            input.type = 'text';
+            input.inputMode = 'text';
+            input.autocomplete = 'off';
+            input.autocapitalize = 'off';
+            input.spellcheck = false;
+            input.setAttribute('enterkeyhint', 'enter');
+            input.setAttribute('aria-label', 'CodeServerApp keyboard proxy');
+            Object.assign(input.style, {
+              position: 'fixed',
+              left: '1px',
+              bottom: '1px',
+              width: '1px',
+              height: '1px',
+              padding: '0',
+              border: '0',
+              opacity: '0.01',
+              zIndex: '2147483647'
+            });
+            input.addEventListener('input', handleProxyInput);
+            input.addEventListener('compositionstart', (event) => {
+              event.stopImmediatePropagation();
+              state.composing = true;
+            });
+            input.addEventListener('compositionend', (event) => {
+              event.stopImmediatePropagation();
+              state.composing = false;
+              const text = event.data || input.value;
+              if (text) {
+                sendText(text);
+                state.lastCompositionText = text;
+                state.lastCompositionAt = performance.now();
+              }
+              input.value = '';
+            });
+            (document.body || document.documentElement).appendChild(input);
+            return input;
+          };
+
+          const forceKeyboard = () => {
+            rememberTarget(deepestActiveElement(document));
+            const input = ensureProxy();
+            input.value = '';
+            input.focus({ preventScroll: true });
+            input.setSelectionRange(0, 0);
+            return document.activeElement === input;
+          };
+
+          const forwardProxyKey = (event) => {
+            if (!event.isTrusted || !isProxy(event.target)) return;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            const keyCode = event.keyCode || event.which || 0;
+            if (event.isComposing || keyCode === 229
+                || event.key === 'Unidentified' || event.key === 'Process'
+                || event.key === 'Dead') {
+              return;
+            }
+            const target = activeTarget();
+            dispatchKeyPhase(target, event.type, event.key, event.code, keyCode, event);
+            state.lastForwardedKey = event.key;
+            state.lastForwardedAt = performance.now();
+          };
+
+          const dispatchModifier = (key, code, keyCode, isDown) => {
+            dispatchKeyPhase(
+              activeTarget(),
+              isDown ? 'keydown' : 'keyup',
+              key,
+              code,
+              keyCode
+            );
           };
 
           const redispatchWithLockedModifiers = (event) => {
@@ -174,27 +382,37 @@ public final class MainActivity extends Activity {
             const shiftedKey = state.shift && event.key.length === 1
               ? event.key.toUpperCase()
               : event.key;
-            const replacement = new KeyboardEvent(event.type, {
-              key: shiftedKey,
-              code: event.code,
-              location: event.location,
-              repeat: event.repeat,
-              ctrlKey: state.control || event.ctrlKey,
-              shiftKey: state.shift || event.shiftKey,
-              altKey: event.altKey,
-              metaKey: event.metaKey,
-              bubbles: true,
-              cancelable: true,
-              composed: true
-            });
-            defineLegacyKeyCodes(replacement, event.keyCode || event.which || 0);
-            target.dispatchEvent(replacement);
+            dispatchKeyPhase(
+              target,
+              event.type,
+              shiftedKey,
+              event.code,
+              event.keyCode || event.which || 0,
+              event
+            );
           };
 
+          document.addEventListener('pointerdown', (event) => {
+            const path = typeof event.composedPath === 'function'
+              ? event.composedPath()
+              : [];
+            rememberTarget(path[0] || event.target);
+          }, true);
+          document.addEventListener('focusin', (event) => {
+            rememberTarget(event.target);
+          }, true);
+          document.addEventListener('keydown', forwardProxyKey, true);
+          document.addEventListener('keyup', forwardProxyKey, true);
           document.addEventListener('keydown', redispatchWithLockedModifiers, true);
           document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
-          window.__codeServerAppKeyboard = {
+          const bridge = {
+            version: 2,
+            forceKeyboard,
+            sendKey(key, code, keyCode) {
+              dispatchCompleteKey(key, code, keyCode);
+              return true;
+            },
             setModifiers(control, shift) {
               const nextControl = Boolean(control);
               const nextShift = Boolean(shift);
@@ -211,6 +429,8 @@ public final class MainActivity extends Activity {
               }
             }
           };
+          window.__codeServerAppKeyboard = bridge;
+          window.__codeServerAppForceKeyboard = () => bridge.forceKeyboard();
         })();
         """;
 
@@ -1016,15 +1236,19 @@ public final class MainActivity extends Activity {
     private void sendKey(String key, String code, int keyCode) {
         String script = String.format(Locale.US, """
             (() => {
+              if (window.__codeServerAppKeyboard
+                  && typeof window.__codeServerAppKeyboard.sendKey === 'function') {
+                return window.__codeServerAppKeyboard.sendKey(%1$s, %2$s, %5$d);
+              }
               const target = document.activeElement || document.body;
               if (!target) return false;
               if (typeof target.focus === 'function') target.focus();
               const dispatch = (type) => {
                 const event = new KeyboardEvent(type, {
-                  key: %s,
-                  code: %s,
-                  ctrlKey: %s,
-                  shiftKey: %s,
+                  key: %1$s,
+                  code: %2$s,
+                  ctrlKey: %3$s,
+                  shiftKey: %4$s,
                   altKey: false,
                   metaKey: false,
                   bubbles: true,
@@ -1032,8 +1256,8 @@ public final class MainActivity extends Activity {
                   composed: true
                 });
                 try {
-                  Object.defineProperty(event, 'keyCode', { get: () => %d });
-                  Object.defineProperty(event, 'which', { get: () => %d });
+                  Object.defineProperty(event, 'keyCode', { get: () => %5$d });
+                  Object.defineProperty(event, 'which', { get: () => %5$d });
                 } catch (_) {}
                 target.dispatchEvent(event);
               };
@@ -1046,7 +1270,6 @@ public final class MainActivity extends Activity {
                 JSONObject.quote(code),
                 controlLocked,
                 shiftLocked,
-                keyCode,
                 keyCode
             );
         webView.evaluateJavascript(script, null);
