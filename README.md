@@ -12,6 +12,7 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
   on-screen keyboard, a hardware keyboard, or the supplemental keys
 - Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
 - Android safe-area handling with an optional immersive fullscreen toggle
+- Android desktop-site mode, pinch zoom, and an IME-aware supplemental key bar
 - GitHub Actions workflows that produce a TrollStore-ready IPA and an Android APK
 
 ## Build the iOS IPA

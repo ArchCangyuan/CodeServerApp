@@ -35,6 +35,9 @@ public final class MainActivity extends Activity {
     private static final String ADDRESS_KEY = "server_address";
     private static final int ACCENT = Color.rgb(103, 80, 164);
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
+    private static final String DESKTOP_USER_AGENT =
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            + "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
     private static final String KEYBOARD_BRIDGE = """
         (() => {
@@ -323,23 +326,35 @@ public final class MainActivity extends Activity {
     }
 
     private void applySafeAreaInsets(View view, WindowInsets insets) {
-        if (fullscreen) {
-            view.setPadding(0, 0, 0, 0);
-            return;
-        }
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Insets safeArea = insets.getInsets(
                 WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()
             );
-            view.setPadding(safeArea.left, safeArea.top, safeArea.right, safeArea.bottom);
+            Insets ime = insets.getInsets(WindowInsets.Type.ime());
+
+            if (fullscreen) {
+                view.setPadding(0, 0, 0, ime.bottom);
+            } else {
+                view.setPadding(
+                    safeArea.left,
+                    safeArea.top,
+                    safeArea.right,
+                    Math.max(safeArea.bottom, ime.bottom)
+                );
+            }
         } else {
-            view.setPadding(
-                insets.getSystemWindowInsetLeft(),
-                insets.getSystemWindowInsetTop(),
-                insets.getSystemWindowInsetRight(),
-                insets.getSystemWindowInsetBottom()
-            );
+            int bottomInset = insets.getSystemWindowInsetBottom();
+            int keyboardInset = bottomInset > dp(120) ? bottomInset : 0;
+            if (fullscreen) {
+                view.setPadding(0, 0, 0, keyboardInset);
+            } else {
+                view.setPadding(
+                    insets.getSystemWindowInsetLeft(),
+                    insets.getSystemWindowInsetTop(),
+                    insets.getSystemWindowInsetRight(),
+                    bottomInset
+                );
+            }
         }
     }
 
@@ -351,6 +366,11 @@ public final class MainActivity extends Activity {
         settings.setDatabaseEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+        settings.setUserAgentString(DESKTOP_USER_AGENT);
+        settings.setUseWideViewPort(true);
+        settings.setLoadWithOverviewMode(false);
+        settings.setBuiltInZoomControls(true);
+        settings.setDisplayZoomControls(false);
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
