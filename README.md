@@ -14,8 +14,8 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Android safe-area handling with an optional immersive fullscreen toggle; pull down from the top edge to exit fullscreen
 - Android desktop-site mode, pinch zoom, and an IME-aware supplemental key bar
 - Persistent Android virtual-viewport zoom controls that automatically reload once to apply a full-width, non-cropped layout
-- A force-keyboard button that forwards IME text, composition, Backspace, Enter,
-  and supplemental keys to the last focused canvas or same-origin iframe target
+- A force-keyboard button backed by a native Android input connection, keeping
+  focus on canvas-based web RDP clients while forwarding text and editing keys
 - Saved Android project profiles with bold titles and up to six hot WebView sessions retained for 30 minutes
 - GitHub Actions workflows that produce a TrollStore-ready IPA and an Android APK
 

@@ -18,12 +18,15 @@ import android.text.Spanned;
 import android.text.InputType;
 import android.text.style.StyleSpan;
 import android.view.Gravity;
+import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.CookieManager;
 import android.webkit.WebChromeClient;
@@ -101,7 +104,7 @@ public final class MainActivity extends Activity {
           setViewportWidth(window.__codeServerAppViewportWidth || 1280);
 
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 2) {
+          if (existingBridge && existingBridge.version >= 3) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
             return;
           }
@@ -144,8 +147,13 @@ public final class MainActivity extends Activity {
 
           const activeTarget = () => {
             const current = deepestActiveElement(document);
-            if (current && !isProxy(current)) rememberTarget(current);
-            if (current && !isProxy(current)) return current;
+            if (current && !isProxy(current)) {
+              rememberTarget(current);
+              const ownerDocument = current.ownerDocument;
+              const isGeneric = current.tagName === 'HTML'
+                || Boolean(ownerDocument && current === ownerDocument.body);
+              if (!isGeneric) return current;
+            }
             if (state.target && state.target.isConnected) return state.target;
             const fallback = document.querySelector(
               'canvas, [role="application"], [tabindex="0"]'
@@ -251,7 +259,7 @@ public final class MainActivity extends Activity {
             dispatchKeyPhase(target, 'keyup', key, code, keyCode, source);
           };
 
-          const sendText = (text) => {
+          const forwardText = (text) => {
             for (const key of Array.from(text || '')) {
               const info = keyInfoForText(key);
               dispatchCompleteKey(key, info.code, info.keyCode, info.shift);
@@ -286,7 +294,7 @@ public final class MainActivity extends Activity {
               const duplicateKey = text
                 && Array.from(text).length === 1
                 && wasRecentlyForwarded(text);
-              if (text && !duplicateComposition && !duplicateKey) sendText(text);
+              if (text && !duplicateComposition && !duplicateKey) forwardText(text);
             }
             input.value = '';
           };
@@ -324,7 +332,7 @@ public final class MainActivity extends Activity {
               state.composing = false;
               const text = event.data || input.value;
               if (text) {
-                sendText(text);
+                forwardText(text);
                 state.lastCompositionText = text;
                 state.lastCompositionAt = performance.now();
               }
@@ -336,11 +344,7 @@ public final class MainActivity extends Activity {
 
           const forceKeyboard = () => {
             rememberTarget(deepestActiveElement(document));
-            const input = ensureProxy();
-            input.value = '';
-            input.focus({ preventScroll: true });
-            input.setSelectionRange(0, 0);
-            return document.activeElement === input;
+            return Boolean(activeTarget());
           };
 
           const forwardProxyKey = (event) => {
@@ -407,10 +411,14 @@ public final class MainActivity extends Activity {
           document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
           const bridge = {
-            version: 2,
+            version: 3,
             forceKeyboard,
             sendKey(key, code, keyCode) {
               dispatchCompleteKey(key, code, keyCode);
+              return true;
+            },
+            sendText(text) {
+              forwardText(String(text || ''));
               return true;
             },
             setModifiers(control, shift) {
@@ -691,11 +699,13 @@ public final class MainActivity extends Activity {
     }
 
     private void applySafeAreaInsets(View view, WindowInsets insets) {
+        boolean imeVisible;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Insets safeArea = insets.getInsets(
                 WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()
             );
             Insets ime = insets.getInsets(WindowInsets.Type.ime());
+            imeVisible = insets.isVisible(WindowInsets.Type.ime()) || ime.bottom > 0;
 
             if (fullscreen) {
                 view.setPadding(0, 0, 0, ime.bottom);
@@ -710,6 +720,7 @@ public final class MainActivity extends Activity {
         } else {
             int bottomInset = insets.getSystemWindowInsetBottom();
             int keyboardInset = bottomInset > dp(120) ? bottomInset : 0;
+            imeVisible = keyboardInset > 0;
             if (fullscreen) {
                 view.setPadding(0, 0, 0, keyboardInset);
             } else {
@@ -720,6 +731,9 @@ public final class MainActivity extends Activity {
                     bottomInset
                 );
             }
+        }
+        if (webView instanceof RdpInputWebView) {
+            ((RdpInputWebView) webView).setImeVisible(imeVisible);
         }
     }
 
@@ -773,7 +787,7 @@ public final class MainActivity extends Activity {
     }
 
     private WebView createProjectWebView() {
-        WebView target = new WebView(this);
+        WebView target = new RdpInputWebView(this);
         target.setFocusable(true);
         target.setFocusableInTouchMode(true);
         target.setVisibility(View.GONE);
@@ -877,11 +891,8 @@ public final class MainActivity extends Activity {
             if (target != webView) {
                 return;
             }
-            InputMethodManager inputMethodManager =
-                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (inputMethodManager != null) {
-                inputMethodManager.restartInput(target);
-                inputMethodManager.showSoftInput(target, InputMethodManager.SHOW_IMPLICIT);
+            if (target instanceof RdpInputWebView) {
+                ((RdpInputWebView) target).showForcedIme();
             }
         }, 100L));
     }
@@ -1380,6 +1391,175 @@ public final class MainActivity extends Activity {
         }
         webView = null;
         super.onDestroy();
+    }
+
+    private final class RdpInputWebView extends WebView {
+        private final KeyCharacterMap virtualKeyboard =
+            KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD);
+        private boolean forcedImeEnabled;
+        private boolean imeVisible;
+        private long forcedImeRequestedAt;
+
+        RdpInputWebView(Context context) {
+            super(context);
+        }
+
+        void showForcedIme() {
+            forcedImeEnabled = true;
+            forcedImeRequestedAt = SystemClock.elapsedRealtime();
+            requestFocus();
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.restartInput(this);
+                inputMethodManager.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
+            }
+        }
+
+        void setImeVisible(boolean visible) {
+            boolean wasVisible = imeVisible;
+            imeVisible = visible;
+            if (wasVisible && !visible && forcedImeEnabled) {
+                disableForcedIme();
+            }
+        }
+
+        private void disableForcedIme() {
+            if (!forcedImeEnabled) {
+                return;
+            }
+            forcedImeEnabled = false;
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.restartInput(this);
+            }
+        }
+
+        @Override
+        public boolean onCheckIsTextEditor() {
+            return forcedImeEnabled || super.onCheckIsTextEditor();
+        }
+
+        @Override
+        public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+            if (!forcedImeEnabled) {
+                return super.onCreateInputConnection(outAttrs);
+            }
+            outAttrs.inputType = InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+            outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE
+                | EditorInfo.IME_FLAG_NO_EXTRACT_UI;
+            outAttrs.initialSelStart = 0;
+            outAttrs.initialSelEnd = 0;
+            return new ForcedImeInputConnection(this);
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN
+                && forcedImeEnabled
+                && !imeVisible
+                && SystemClock.elapsedRealtime() - forcedImeRequestedAt > 500L) {
+                disableForcedIme();
+            }
+            return super.onTouchEvent(event);
+        }
+
+        private boolean dispatchImeKeyEvent(KeyEvent event) {
+            return super.dispatchKeyEvent(event);
+        }
+
+        private void dispatchNativeKey(int keyCode) {
+            long now = SystemClock.uptimeMillis();
+            dispatchImeKeyEvent(new KeyEvent(
+                now,
+                now,
+                KeyEvent.ACTION_DOWN,
+                keyCode,
+                0
+            ));
+            dispatchImeKeyEvent(new KeyEvent(
+                now,
+                now,
+                KeyEvent.ACTION_UP,
+                keyCode,
+                0
+            ));
+        }
+
+        private void dispatchCommittedText(CharSequence text) {
+            if (text == null || text.length() == 0) {
+                return;
+            }
+            String value = text.toString();
+            for (int offset = 0; offset < value.length();) {
+                int codePoint = value.codePointAt(offset);
+                String character = new String(Character.toChars(codePoint));
+                KeyEvent[] events = virtualKeyboard.getEvents(character.toCharArray());
+                if (events != null && events.length > 0) {
+                    for (KeyEvent event : events) {
+                        dispatchImeKeyEvent(event);
+                    }
+                } else {
+                    String script = "window.__codeServerAppKeyboard"
+                        + " ? window.__codeServerAppKeyboard.sendText("
+                        + JSONObject.quote(character) + ") : false";
+                    evaluateJavascript(script, null);
+                }
+                offset += Character.charCount(codePoint);
+            }
+        }
+
+        private final class ForcedImeInputConnection extends BaseInputConnection {
+            ForcedImeInputConnection(View targetView) {
+                super(targetView, false);
+            }
+
+            @Override
+            public boolean commitText(CharSequence text, int newCursorPosition) {
+                super.commitText(text, newCursorPosition);
+                dispatchCommittedText(text);
+                return true;
+            }
+
+            @Override
+            public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+                super.deleteSurroundingText(beforeLength, afterLength);
+                if (beforeLength > 0) {
+                    dispatchNativeKey(KeyEvent.KEYCODE_DEL);
+                } else if (afterLength > 0) {
+                    dispatchNativeKey(KeyEvent.KEYCODE_FORWARD_DEL);
+                }
+                return true;
+            }
+
+            @Override
+            public boolean deleteSurroundingTextInCodePoints(
+                int beforeLength,
+                int afterLength
+            ) {
+                super.deleteSurroundingTextInCodePoints(beforeLength, afterLength);
+                if (beforeLength > 0) {
+                    dispatchNativeKey(KeyEvent.KEYCODE_DEL);
+                } else if (afterLength > 0) {
+                    dispatchNativeKey(KeyEvent.KEYCODE_FORWARD_DEL);
+                }
+                return true;
+            }
+
+            @Override
+            public boolean sendKeyEvent(KeyEvent event) {
+                return dispatchImeKeyEvent(event);
+            }
+
+            @Override
+            public boolean performEditorAction(int actionCode) {
+                dispatchNativeKey(KeyEvent.KEYCODE_ENTER);
+                return true;
+            }
+        }
     }
 
     private final class EdgeGestureLayout extends LinearLayout {
