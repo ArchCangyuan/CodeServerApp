@@ -16,7 +16,7 @@ jobs:
     env:
       PROJECT_PATH: CodeServerApp.xcodeproj
       SCHEME: CodeServerApp
-      DERIVED_DATA: ${{ runner.temp }}/DerivedData
+      DERIVED_DATA: DerivedData
 
     steps:
       - name: Check out repository
