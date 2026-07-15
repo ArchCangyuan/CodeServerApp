@@ -68,6 +68,7 @@ public final class MainActivity extends Activity {
           const setViewportWidth = (requestedWidth) => {
             const numericWidth = Number(requestedWidth) || 1280;
             const width = Math.max(640, Math.min(2400, Math.round(numericWidth)));
+            const previousWidth = Number(window.__codeServerAppViewportWidth) || 1280;
             let viewport = document.querySelector('meta[name="viewport"]');
             if (!viewport) {
               viewport = document.createElement('meta');
@@ -80,7 +81,7 @@ public final class MainActivity extends Activity {
             );
             window.__codeServerAppViewportWidth = width;
             requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
-            return width;
+            return { previousWidth, width };
           };
 
           window.__codeServerAppSetViewportWidth = setViewportWidth;
@@ -541,14 +542,33 @@ public final class MainActivity extends Activity {
             return;
         }
         int viewportWidth = calculateLayoutViewportWidth();
-        String script = "window.__codeServerAppViewportWidth=" + viewportWidth + ";"
+        String script = "(() => {"
             + "if(window.__codeServerAppSetViewportWidth){"
-            + "window.__codeServerAppSetViewportWidth(" + viewportWidth + ");}";
+            + "return window.__codeServerAppSetViewportWidth(" + viewportWidth + ");}"
+            + "window.__codeServerAppViewportWidth=" + viewportWidth + ";"
+            + "return {previousWidth:" + viewportWidth + ",width:" + viewportWidth + "};"
+            + "})()";
         target.evaluateJavascript(script, value -> {
-            target.setInitialScale(0);
+            applyZoomInCompensation(target, value);
             target.requestLayout();
             target.invalidate();
         });
+    }
+
+    private void applyZoomInCompensation(WebView target, String viewportResult) {
+        try {
+            JSONObject result = new JSONObject(viewportResult);
+            int previousWidth = result.optInt("previousWidth", 0);
+            int width = result.optInt("width", 0);
+            if (previousWidth <= 0 || width <= 0 || width >= previousWidth) {
+                return;
+            }
+
+            float zoomFactor = (float) previousWidth / (float) width;
+            target.post(() -> target.zoomBy(zoomFactor));
+        } catch (Exception ignored) {
+            // The bridge may not be installed yet while a new page is committing.
+        }
     }
 
     private void switchToProjectUrl(String address) {

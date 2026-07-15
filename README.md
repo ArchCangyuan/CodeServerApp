@@ -13,7 +13,7 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
 - Android safe-area handling with an optional immersive fullscreen toggle; pull down from the top edge to exit fullscreen
 - Android desktop-site mode, pinch zoom, and an IME-aware supplemental key bar
-- Persistent Android layout zoom controls that resize the virtual desktop viewport and refit it to full width without cropping
+- Persistent Android layout zoom controls that instantly resize the virtual desktop viewport in either direction and refit it to full width without cropping
 - Saved Android project profiles with bold titles and up to six hot WebView sessions retained for 30 minutes
 - GitHub Actions workflows that produce a TrollStore-ready IPA and an Android APK
 
