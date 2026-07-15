@@ -4,19 +4,12 @@ struct KeyboardStroke {
     let key: String
     let code: String
     let keyCode: Int
-    let control: Bool
 }
 
 enum CodeServerKey: String, CaseIterable, Identifiable {
     case escape
     case tab
-    case controlC
-    case controlX
-    case controlD
-    case controlZ
-    case controlA
-    case controlL
-    case controlR
+    case enter
     case arrowLeft
     case arrowUp
     case arrowDown
@@ -28,13 +21,7 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
         switch self {
         case .escape: return "Esc"
         case .tab: return "Tab"
-        case .controlC: return "Ctrl+C"
-        case .controlX: return "Ctrl+X"
-        case .controlD: return "Ctrl+D"
-        case .controlZ: return "Ctrl+Z"
-        case .controlA: return "Ctrl+A"
-        case .controlL: return "Ctrl+L"
-        case .controlR: return "Ctrl+R"
+        case .enter: return "Enter"
         case .arrowLeft: return "←"
         case .arrowUp: return "↑"
         case .arrowDown: return "↓"
@@ -45,50 +32,43 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
     var stroke: KeyboardStroke {
         switch self {
         case .escape:
-            return KeyboardStroke(key: "Escape", code: "Escape", keyCode: 27, control: false)
+            return KeyboardStroke(key: "Escape", code: "Escape", keyCode: 27)
         case .tab:
-            return KeyboardStroke(key: "Tab", code: "Tab", keyCode: 9, control: false)
-        case .controlC:
-            return controlStroke("c", keyCode: 67)
-        case .controlX:
-            return controlStroke("x", keyCode: 88)
-        case .controlD:
-            return controlStroke("d", keyCode: 68)
-        case .controlZ:
-            return controlStroke("z", keyCode: 90)
-        case .controlA:
-            return controlStroke("a", keyCode: 65)
-        case .controlL:
-            return controlStroke("l", keyCode: 76)
-        case .controlR:
-            return controlStroke("r", keyCode: 82)
+            return KeyboardStroke(key: "Tab", code: "Tab", keyCode: 9)
+        case .enter:
+            return KeyboardStroke(key: "Enter", code: "Enter", keyCode: 13)
         case .arrowLeft:
-            return KeyboardStroke(key: "ArrowLeft", code: "ArrowLeft", keyCode: 37, control: false)
+            return KeyboardStroke(key: "ArrowLeft", code: "ArrowLeft", keyCode: 37)
         case .arrowUp:
-            return KeyboardStroke(key: "ArrowUp", code: "ArrowUp", keyCode: 38, control: false)
+            return KeyboardStroke(key: "ArrowUp", code: "ArrowUp", keyCode: 38)
         case .arrowDown:
-            return KeyboardStroke(key: "ArrowDown", code: "ArrowDown", keyCode: 40, control: false)
+            return KeyboardStroke(key: "ArrowDown", code: "ArrowDown", keyCode: 40)
         case .arrowRight:
-            return KeyboardStroke(key: "ArrowRight", code: "ArrowRight", keyCode: 39, control: false)
+            return KeyboardStroke(key: "ArrowRight", code: "ArrowRight", keyCode: 39)
         }
-    }
-
-    private func controlStroke(_ character: String, keyCode: Int) -> KeyboardStroke {
-        KeyboardStroke(
-            key: character,
-            code: "Key\(character.uppercased())",
-            keyCode: keyCode,
-            control: true
-        )
     }
 }
 
 struct SpecialKeyBar: View {
+    @Binding var controlLocked: Bool
+    @Binding var shiftLocked: Bool
+
     let onKey: (CodeServerKey) -> Void
+    let onModifiersChanged: (_ control: Bool, _ shift: Bool) -> Void
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                modifierButton(label: "Ctrl", isLocked: controlLocked) {
+                    controlLocked.toggle()
+                    onModifiersChanged(controlLocked, shiftLocked)
+                }
+
+                modifierButton(label: "Shift", isLocked: shiftLocked) {
+                    shiftLocked.toggle()
+                    onModifiersChanged(controlLocked, shiftLocked)
+                }
+
                 ForEach(CodeServerKey.allCases) { key in
                     Button {
                         onKey(key)
@@ -108,5 +88,27 @@ struct SpecialKeyBar: View {
             .padding(.vertical, 8)
         }
         .background(Color(uiColor: .secondarySystemBackground))
+    }
+
+    private func modifierButton(
+        label: String,
+        isLocked: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Text(label)
+                Image(systemName: isLocked ? "lock.fill" : "lock.open")
+                    .font(.caption2)
+            }
+            .font(.system(.subheadline, design: .monospaced).weight(.semibold))
+            .frame(minWidth: 62, minHeight: 36)
+            .padding(.horizontal, 5)
+            .foregroundColor(isLocked ? .white : .primary)
+            .background(isLocked ? Color.accentColor : Color(uiColor: .tertiarySystemFill))
+            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(label) \(isLocked ? "locked" : "unlocked")")
     }
 }

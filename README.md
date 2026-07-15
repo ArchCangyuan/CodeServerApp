@@ -7,8 +7,9 @@ An iOS wrapper for [code-server](https://github.com/coder/code-server), built wi
 - Configurable code-server URL with persistent cookies and website data
 - Local HTTP server support
 - Reload and server-address controls
-- Supplemental keyboard for `Esc`, `Tab`, arrow keys, and common terminal shortcuts:
-  `Ctrl+C`, `Ctrl+X`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+A`, `Ctrl+L`, and `Ctrl+R`
+- Supplemental keyboard for `Esc`, `Tab`, `Enter`, and arrow keys
+- Lockable `Ctrl` and `Shift` modifiers for combinations entered with the
+  on-screen keyboard, a hardware keyboard, or the supplemental keys
 - GitHub Actions workflow that produces a TrollStore-ready IPA
 
 ## Build the IPA
@@ -30,6 +31,6 @@ The workflow builds without an Apple provisioning profile and applies an ad-hoc 
 
 ## Notes
 
-The supplemental keys are dispatched to the currently focused DOM element as keyboard events. code-server's editor and terminal normally handle these events, but browser-security restrictions can prevent synthetic events from performing privileged browser operations such as clipboard paste.
+The supplemental keys are dispatched to the currently focused DOM element as keyboard events. `Ctrl` and `Shift` stay locked until tapped again. While locked, native keyboard events are redispatched with the selected modifiers. code-server's editor and terminal normally handle these events, but browser-security restrictions can prevent synthetic events from performing privileged browser operations such as clipboard paste.
 
 TrollStore only works on specific iOS versions. Check the current compatibility list in the [official TrollStore repository](https://github.com/opa334/TrollStore).

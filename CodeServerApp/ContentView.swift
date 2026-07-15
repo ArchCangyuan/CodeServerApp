@@ -5,6 +5,8 @@ struct ContentView: View {
     @StateObject private var webViewStore = CodeServerWebViewStore()
     @State private var draftAddress = ""
     @State private var isShowingSettings = false
+    @State private var controlLocked = false
+    @State private var shiftLocked = false
 
     var body: some View {
         Group {
@@ -85,9 +87,16 @@ struct ContentView: View {
 
             CodeServerWebView(address: serverURL, store: webViewStore)
 
-            SpecialKeyBar { key in
-                webViewStore.send(key)
-            }
+            SpecialKeyBar(
+                controlLocked: $controlLocked,
+                shiftLocked: $shiftLocked,
+                onKey: { key in
+                    webViewStore.send(key)
+                },
+                onModifiersChanged: { control, shift in
+                    webViewStore.setModifiers(control: control, shift: shift)
+                }
+            )
         }
     }
 
