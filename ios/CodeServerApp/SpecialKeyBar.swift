@@ -63,7 +63,7 @@ struct SpecialKeyBar: View {
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 keyButton(label: "KB", accessibilityLabel: "Force show keyboard") {
                     onKeyboard()
                 }
@@ -84,8 +84,8 @@ struct SpecialKeyBar: View {
                     }
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 6)
         }
         .background(Color(uiColor: .secondarySystemBackground))
     }
@@ -98,8 +98,8 @@ struct SpecialKeyBar: View {
         Button(action: action) {
             Text(label)
                 .font(.system(.subheadline, design: .monospaced).weight(.semibold))
-                .frame(minWidth: label == "Enter" ? 58 : 44, minHeight: 36)
-                .padding(.horizontal, 5)
+                .frame(minWidth: label == "Enter" ? 52 : 38, minHeight: 34)
+                .padding(.horizontal, 3)
                 .background(Color(uiColor: .tertiarySystemFill))
                 .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
@@ -113,14 +113,14 @@ struct SpecialKeyBar: View {
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            HStack(spacing: 5) {
+            HStack(spacing: 3) {
                 Text(label)
                 Image(systemName: isLocked ? "lock.fill" : "lock.open")
                     .font(.caption2)
             }
             .font(.system(.subheadline, design: .monospaced).weight(.semibold))
-            .frame(minWidth: 62, minHeight: 36)
-            .padding(.horizontal, 5)
+            .frame(minWidth: 54, minHeight: 34)
+            .padding(.horizontal, 3)
             .foregroundColor(isLocked ? .white : .primary)
             .background(isLocked ? Color.accentColor : Color(uiColor: .tertiarySystemFill))
             .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))

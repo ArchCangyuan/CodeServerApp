@@ -140,8 +140,9 @@ public final class MainActivity extends Activity {
           };
 
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 4) {
+          if (existingBridge && existingBridge.version >= 5) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
+            existingBridge.installRdpGestures?.();
             return;
           }
 
@@ -154,8 +155,170 @@ public final class MainActivity extends Activity {
             lastForwardedAt: 0,
             lastCompositionText: '',
             lastCompositionAt: 0,
-            ironRdpCanvas: null
+            ironRdpCanvas: null,
+            gestureCanvas: null
           };
+
+          const pointFromTouch = (touch) => ({
+            clientX: touch.clientX,
+            clientY: touch.clientY,
+            screenX: touch.screenX,
+            screenY: touch.screenY
+          });
+
+          const dispatchPointer = (canvas, type, point, button, buttons, detail = 1) => {
+            const eventWindow = canvas.ownerDocument?.defaultView || window;
+            const event = new eventWindow.PointerEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+              pointerId: 1,
+              pointerType: 'mouse',
+              isPrimary: true,
+              clientX: point.clientX,
+              clientY: point.clientY,
+              screenX: point.screenX,
+              screenY: point.screenY,
+              button,
+              buttons,
+              detail
+            });
+            canvas.dispatchEvent(event);
+          };
+
+          const dispatchMouse = (canvas, type, point, button, buttons, detail = 1) => {
+            const eventWindow = canvas.ownerDocument?.defaultView || window;
+            canvas.dispatchEvent(new eventWindow.MouseEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+              view: eventWindow,
+              clientX: point.clientX,
+              clientY: point.clientY,
+              screenX: point.screenX,
+              screenY: point.screenY,
+              button,
+              buttons,
+              detail
+            }));
+          };
+
+          const installRdpGestures = () => {
+            const canvas = findIronRdpCanvas();
+            if (!canvas) return false;
+            state.ironRdpCanvas = canvas;
+            if (state.gestureCanvas === canvas) return true;
+            state.gestureCanvas = canvas;
+            canvas.style.touchAction = 'none';
+            canvas.style.webkitTouchCallout = 'none';
+
+            let gesture = null;
+            let lastTap = null;
+            let suppressNativeClickUntil = 0;
+
+            const stopNativeTouchPointer = (event) => {
+              if (event.pointerType !== 'touch') return;
+              event.preventDefault();
+              event.stopImmediatePropagation();
+            };
+            canvas.addEventListener('pointerdown', stopNativeTouchPointer, true);
+            canvas.addEventListener('pointermove', stopNativeTouchPointer, true);
+            canvas.addEventListener('pointerup', stopNativeTouchPointer, true);
+            canvas.addEventListener('pointercancel', stopNativeTouchPointer, true);
+            canvas.addEventListener('click', (event) => {
+              if (event.isTrusted && performance.now() < suppressNativeClickUntil) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+              }
+            }, true);
+            canvas.addEventListener('contextmenu', (event) => {
+              if (event.isTrusted) event.preventDefault();
+            }, true);
+
+            canvas.addEventListener('touchstart', (event) => {
+              if (event.touches.length !== 1) return;
+              event.preventDefault();
+              event.stopImmediatePropagation();
+              const start = pointFromTouch(event.touches[0]);
+              gesture = {
+                start,
+                last: start,
+                dragging: false,
+                longPressed: false,
+                timer: window.setTimeout(() => {
+                  if (!gesture || gesture.dragging) return;
+                  gesture.longPressed = true;
+                  dispatchPointer(canvas, 'pointerdown', gesture.last, 2, 2);
+                  dispatchPointer(canvas, 'pointerup', gesture.last, 2, 0);
+                  dispatchMouse(canvas, 'contextmenu', gesture.last, 2, 0);
+                  suppressNativeClickUntil = performance.now() + 800;
+                }, 550)
+              };
+            }, { capture: true, passive: false });
+
+            canvas.addEventListener('touchmove', (event) => {
+              if (!gesture || event.touches.length !== 1) return;
+              event.preventDefault();
+              event.stopImmediatePropagation();
+              const point = pointFromTouch(event.touches[0]);
+              gesture.last = point;
+              const distance = Math.hypot(
+                point.clientX - gesture.start.clientX,
+                point.clientY - gesture.start.clientY
+              );
+              if (!gesture.dragging && !gesture.longPressed && distance >= 7) {
+                window.clearTimeout(gesture.timer);
+                gesture.dragging = true;
+                dispatchPointer(canvas, 'pointerdown', gesture.start, 0, 1);
+              }
+              if (gesture.dragging) {
+                dispatchPointer(canvas, 'pointermove', point, -1, 1);
+              }
+            }, { capture: true, passive: false });
+
+            const finishGesture = (event, cancelled) => {
+              if (!gesture) return;
+              event.preventDefault();
+              event.stopImmediatePropagation();
+              window.clearTimeout(gesture.timer);
+              const touch = event.changedTouches?.[0];
+              const point = touch ? pointFromTouch(touch) : gesture.last;
+              if (gesture.dragging) {
+                dispatchPointer(canvas, 'pointermove', point, -1, 1);
+                dispatchPointer(canvas, 'pointerup', point, 0, 0);
+              } else if (!gesture.longPressed && !cancelled) {
+                const now = performance.now();
+                const isDouble = lastTap
+                  && now - lastTap.at < 350
+                  && Math.hypot(
+                    point.clientX - lastTap.point.clientX,
+                    point.clientY - lastTap.point.clientY
+                  ) < 24;
+                const detail = isDouble ? 2 : 1;
+                dispatchPointer(canvas, 'pointerdown', point, 0, 1, detail);
+                dispatchPointer(canvas, 'pointerup', point, 0, 0, detail);
+                dispatchMouse(canvas, 'click', point, 0, 0, detail);
+                if (isDouble) {
+                  dispatchMouse(canvas, 'dblclick', point, 0, 0, 2);
+                  lastTap = null;
+                } else {
+                  lastTap = { at: now, point };
+                }
+                suppressNativeClickUntil = now + 800;
+              }
+              gesture = null;
+            };
+            canvas.addEventListener('touchend', (event) => {
+              finishGesture(event, false);
+            }, { capture: true, passive: false });
+            canvas.addEventListener('touchcancel', (event) => {
+              finishGesture(event, true);
+            }, { capture: true, passive: false });
+            return true;
+          };
+
+          installRdpGestures();
+          window.setInterval(installRdpGestures, 1000);
 
           const isProxy = (element) => Boolean(element && element.id === PROXY_ID);
 
@@ -293,7 +456,7 @@ public final class MainActivity extends Activity {
             if (!target) return;
             const source = forceShift ? { shiftKey: true } : null;
             dispatchKeyPhase(target, 'keydown', key, code, keyCode, source);
-            if (Array.from(key).length === 1) {
+            if (Array.from(key).length === 1 && !state.control) {
               dispatchKeyPhase(target, 'keypress', key, code, keyCode, source);
             }
             dispatchKeyPhase(target, 'keyup', key, code, keyCode, source);
@@ -383,6 +546,7 @@ public final class MainActivity extends Activity {
           };
 
           const forceKeyboard = () => {
+            installRdpGestures();
             const ironRdpCanvas = findIronRdpCanvas();
             if (ironRdpCanvas) {
               state.ironRdpCanvas = ironRdpCanvas;
@@ -458,8 +622,9 @@ public final class MainActivity extends Activity {
           document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
           const bridge = {
-            version: 4,
+            version: 5,
             forceKeyboard,
+            installRdpGestures,
             sendKey(key, code, keyCode) {
               dispatchCompleteKey(key, code, keyCode);
               return true;
@@ -638,37 +803,39 @@ public final class MainActivity extends Activity {
         LinearLayout keyRow = new LinearLayout(this);
         keyRow.setOrientation(LinearLayout.HORIZONTAL);
         keyRow.setGravity(Gravity.CENTER_VERTICAL);
-        keyRow.setPadding(dp(8), dp(6), dp(8), dp(6));
+        keyRow.setPadding(dp(6), dp(6), dp(6), dp(6));
 
         Button keyboardButton = createKeyButton("KB");
         keyboardButton.setContentDescription("Force show keyboard");
         keyboardButton.setOnClickListener(view -> forceShowKeyboard());
-        keyRow.addView(keyboardButton, keyLayoutParams(dp(62)));
+        keyRow.addView(keyboardButton, keyLayoutParams(dp(54)));
 
         controlButton = createKeyButton("Ctrl 🔓");
         controlButton.setOnClickListener(view -> {
             controlLocked = !controlLocked;
             updateModifierButtons();
             syncModifiers();
+            syncModifierImeCapture();
         });
-        keyRow.addView(controlButton, keyLayoutParams(dp(82)));
+        keyRow.addView(controlButton, keyLayoutParams(dp(72)));
 
         shiftButton = createKeyButton("Shift 🔓");
         shiftButton.setOnClickListener(view -> {
             shiftLocked = !shiftLocked;
             updateModifierButtons();
             syncModifiers();
+            syncModifierImeCapture();
         });
-        keyRow.addView(shiftButton, keyLayoutParams(dp(88)));
+        keyRow.addView(shiftButton, keyLayoutParams(dp(76)));
 
-        addKey(keyRow, "Esc", "Escape", "Escape", 27, dp(62));
-        addKey(keyRow, "Tab", "Tab", "Tab", 9, dp(62));
-        addKey(keyRow, "Enter", "Enter", "Enter", 13, dp(76));
-        addKey(keyRow, "Bksp", "Backspace", "Backspace", 8, dp(72));
-        addKey(keyRow, "←", "ArrowLeft", "ArrowLeft", 37, dp(58));
-        addKey(keyRow, "↑", "ArrowUp", "ArrowUp", 38, dp(58));
-        addKey(keyRow, "↓", "ArrowDown", "ArrowDown", 40, dp(58));
-        addKey(keyRow, "→", "ArrowRight", "ArrowRight", 39, dp(58));
+        addKey(keyRow, "Esc", "Escape", "Escape", 27, dp(54));
+        addKey(keyRow, "Tab", "Tab", "Tab", 9, dp(54));
+        addKey(keyRow, "Enter", "Enter", "Enter", 13, dp(64));
+        addKey(keyRow, "Bksp", "Backspace", "Backspace", 8, dp(64));
+        addKey(keyRow, "←", "ArrowLeft", "ArrowLeft", 37, dp(50));
+        addKey(keyRow, "↑", "ArrowUp", "ArrowUp", 38, dp(50));
+        addKey(keyRow, "↓", "ArrowDown", "ArrowDown", 40, dp(50));
+        addKey(keyRow, "→", "ArrowRight", "ArrowRight", 39, dp(50));
 
         keyboardScroll.addView(keyRow);
         root.addView(
@@ -1334,6 +1501,14 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void syncModifierImeCapture() {
+        if (webView instanceof RdpInputWebView) {
+            ((RdpInputWebView) webView).syncModifierCapture(
+                controlLocked || shiftLocked
+            );
+        }
+    }
+
     private void syncModifiers(WebView target) {
         String script = "if (window.__codeServerAppKeyboard) { "
             + "window.__codeServerAppKeyboard.setModifiers("
@@ -1420,7 +1595,7 @@ public final class MainActivity extends Activity {
         button.setFocusableInTouchMode(false);
         button.setMinWidth(0);
         button.setMinimumWidth(0);
-        button.setPadding(dp(8), 0, dp(8), 0);
+        button.setPadding(dp(6), 0, dp(6), 0);
         button.setTextColor(Color.BLACK);
         button.setBackgroundTintList(ColorStateList.valueOf(KEY_BACKGROUND));
         return button;
@@ -1443,7 +1618,7 @@ public final class MainActivity extends Activity {
 
     private LinearLayout.LayoutParams keyLayoutParams(int width) {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, dp(46));
-        params.setMarginEnd(dp(6));
+        params.setMarginEnd(dp(4));
         return params;
     }
 
@@ -1528,6 +1703,27 @@ public final class MainActivity extends Activity {
             }
         }
 
+        void syncModifierCapture(boolean enabled) {
+            if (!enabled) {
+                if (forcedImeEnabled && !ironRdpMode) {
+                    disableForcedIme();
+                }
+                return;
+            }
+            if (!imeVisible && !forcedImeEnabled) {
+                return;
+            }
+            forcedImeEnabled = true;
+            forcedImeRequestedAt = SystemClock.elapsedRealtime();
+            requestFocus();
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.restartInput(this);
+                inputMethodManager.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
+            }
+        }
+
         private void disableForcedIme() {
             if (!forcedImeEnabled) {
                 return;
@@ -1584,7 +1780,25 @@ public final class MainActivity extends Activity {
         }
 
         private void dispatchImeKeyEvent(KeyEvent event) {
-            KeyEvent copiedEvent = new KeyEvent(event);
+            int metaState = event.getMetaState();
+            if (controlLocked) {
+                metaState |= KeyEvent.META_CTRL_ON | KeyEvent.META_CTRL_LEFT_ON;
+            }
+            if (shiftLocked) {
+                metaState |= KeyEvent.META_SHIFT_ON | KeyEvent.META_SHIFT_LEFT_ON;
+            }
+            KeyEvent copiedEvent = new KeyEvent(
+                event.getDownTime(),
+                event.getEventTime(),
+                event.getAction(),
+                event.getKeyCode(),
+                event.getRepeatCount(),
+                metaState,
+                event.getDeviceId(),
+                event.getScanCode(),
+                event.getFlags(),
+                event.getSource()
+            );
             post(() -> {
                 confirmImeInput();
                 RdpInputWebView.this.dispatchKeyEvent(copiedEvent);
