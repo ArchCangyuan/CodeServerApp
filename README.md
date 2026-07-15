@@ -16,6 +16,8 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Persistent Android virtual-viewport zoom controls that automatically reload once to apply a full-width, non-cropped layout
 - A force-keyboard button backed by a native Android input connection, keeping
   focus on canvas-based web RDP clients while forwarding text and editing keys
+- Cloudflare Access browser-RDP support that focuses IronRDP's Shadow DOM
+  renderer and sends text, Backspace, Delete, and Enter through its key handler
 - Saved Android project profiles with bold titles and up to six hot WebView sessions retained for 30 minutes
 - GitHub Actions workflows that produce a TrollStore-ready IPA and an Android APK
 

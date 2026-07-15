@@ -105,8 +105,41 @@ public final class MainActivity extends Activity {
           window.__codeServerAppSetViewportWidth = setViewportWidth;
           setViewportWidth(window.__codeServerAppViewportWidth || 1280);
 
+          const findIronRdpCanvas = () => {
+            const roots = [document];
+            const visited = new Set();
+            for (let index = 0; index < roots.length && index < 128; index += 1) {
+              const root = roots[index];
+              if (!root || visited.has(root) || !root.querySelectorAll) continue;
+              visited.add(root);
+
+              const directCanvas = root.querySelector('canvas#renderer');
+              if (directCanvas) return directCanvas;
+
+              const ironHosts = root.querySelectorAll(
+                'iron-remote-desktop, iron-remote-gui'
+              );
+              for (const host of ironHosts) {
+                const canvas = host.shadowRoot?.querySelector('canvas#renderer');
+                if (canvas) return canvas;
+              }
+
+              for (const element of root.querySelectorAll('*')) {
+                if (element.shadowRoot && !visited.has(element.shadowRoot)) {
+                  roots.push(element.shadowRoot);
+                }
+                if (element.tagName === 'IFRAME') {
+                  try {
+                    if (element.contentDocument) roots.push(element.contentDocument);
+                  } catch (_) {}
+                }
+              }
+            }
+            return null;
+          };
+
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 3) {
+          if (existingBridge && existingBridge.version >= 4) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
             return;
           }
@@ -119,7 +152,8 @@ public final class MainActivity extends Activity {
             lastForwardedKey: '',
             lastForwardedAt: 0,
             lastCompositionText: '',
-            lastCompositionAt: 0
+            lastCompositionAt: 0,
+            ironRdpCanvas: null
           };
 
           const isProxy = (element) => Boolean(element && element.id === PROXY_ID);
@@ -148,6 +182,9 @@ public final class MainActivity extends Activity {
           };
 
           const activeTarget = () => {
+            if (state.ironRdpCanvas && state.ironRdpCanvas.isConnected) {
+              return state.ironRdpCanvas;
+            }
             const current = deepestActiveElement(document);
             if (current && !isProxy(current)) {
               rememberTarget(current);
@@ -345,8 +382,15 @@ public final class MainActivity extends Activity {
           };
 
           const forceKeyboard = () => {
+            const ironRdpCanvas = findIronRdpCanvas();
+            if (ironRdpCanvas) {
+              state.ironRdpCanvas = ironRdpCanvas;
+              rememberTarget(ironRdpCanvas);
+              ironRdpCanvas.focus({ preventScroll: true });
+              return 'ironrdp';
+            }
             rememberTarget(deepestActiveElement(document));
-            return Boolean(activeTarget());
+            return activeTarget() ? 'generic' : 'missing';
           };
 
           const forwardProxyKey = (event) => {
@@ -413,7 +457,7 @@ public final class MainActivity extends Activity {
           document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
           const bridge = {
-            version: 3,
+            version: 4,
             forceKeyboard,
             sendKey(key, code, keyCode) {
               dispatchCompleteKey(key, code, keyCode);
@@ -893,8 +937,17 @@ public final class MainActivity extends Activity {
             if (target != webView) {
                 return;
             }
+            Toast.makeText(
+                this,
+                "\"ironrdp\"".equals(value)
+                    ? "IronRDP focused"
+                    : "RDP canvas not found",
+                Toast.LENGTH_SHORT
+            ).show();
             if (target instanceof RdpInputWebView) {
-                ((RdpInputWebView) target).showForcedIme();
+                ((RdpInputWebView) target).showForcedIme(
+                    "\"ironrdp\"".equals(value)
+                );
             }
         }, 100L));
     }
@@ -1399,6 +1452,7 @@ public final class MainActivity extends Activity {
         private final KeyCharacterMap virtualKeyboard =
             KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD);
         private boolean forcedImeEnabled;
+        private boolean ironRdpMode;
         private boolean imeVisible;
         private boolean imeInputConfirmed;
         private long forcedImeRequestedAt;
@@ -1407,8 +1461,9 @@ public final class MainActivity extends Activity {
             super(context);
         }
 
-        void showForcedIme() {
+        void showForcedIme(boolean useIronRdp) {
             forcedImeEnabled = true;
+            ironRdpMode = useIronRdp;
             imeInputConfirmed = false;
             forcedImeRequestedAt = SystemClock.elapsedRealtime();
             requestFocus();
@@ -1492,6 +1547,20 @@ public final class MainActivity extends Activity {
         }
 
         private void dispatchNativeKey(int keyCode) {
+            if (ironRdpMode) {
+                if (keyCode == KeyEvent.KEYCODE_DEL) {
+                    dispatchBridgeKey("Backspace", "Backspace", 8);
+                    return;
+                }
+                if (keyCode == KeyEvent.KEYCODE_FORWARD_DEL) {
+                    dispatchBridgeKey("Delete", "Delete", 46);
+                    return;
+                }
+                if (keyCode == KeyEvent.KEYCODE_ENTER) {
+                    dispatchBridgeKey("Enter", "Enter", 13);
+                    return;
+                }
+            }
             long now = SystemClock.uptimeMillis();
             dispatchImeKeyEvent(new KeyEvent(
                 now,
@@ -1509,11 +1578,37 @@ public final class MainActivity extends Activity {
             ));
         }
 
+        private void dispatchBridgeKey(String key, String code, int keyCode) {
+            String script = "window.__codeServerAppKeyboard"
+                + " ? window.__codeServerAppKeyboard.sendKey("
+                + JSONObject.quote(key) + ","
+                + JSONObject.quote(code) + ","
+                + keyCode + ") : false";
+            post(() -> {
+                confirmImeInput();
+                evaluateJavascript(script, null);
+            });
+        }
+
+        private void dispatchBridgeText(String text) {
+            String script = "window.__codeServerAppKeyboard"
+                + " ? window.__codeServerAppKeyboard.sendText("
+                + JSONObject.quote(text) + ") : false";
+            post(() -> {
+                confirmImeInput();
+                evaluateJavascript(script, null);
+            });
+        }
+
         private void dispatchCommittedText(CharSequence text) {
             if (text == null || text.length() == 0) {
                 return;
             }
             String value = text.toString();
+            if (ironRdpMode) {
+                dispatchBridgeText(value);
+                return;
+            }
             for (int offset = 0; offset < value.length();) {
                 int codePoint = value.codePointAt(offset);
                 String character = new String(Character.toChars(codePoint));
@@ -1523,13 +1618,7 @@ public final class MainActivity extends Activity {
                         dispatchImeKeyEvent(event);
                     }
                 } else {
-                    String script = "window.__codeServerAppKeyboard"
-                        + " ? window.__codeServerAppKeyboard.sendText("
-                        + JSONObject.quote(character) + ") : false";
-                    post(() -> {
-                        confirmImeInput();
-                        evaluateJavascript(script, null);
-                    });
+                    dispatchBridgeText(character);
                 }
                 offset += Character.charCount(codePoint);
             }
