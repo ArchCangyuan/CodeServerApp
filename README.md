@@ -1,6 +1,6 @@
 # CodeServerApp
 
-An iOS wrapper for [code-server](https://github.com/coder/code-server), built with SwiftUI and `WKWebView`.
+Native iOS and Android wrappers for [code-server](https://github.com/coder/code-server).
 
 ## Features
 
@@ -10,9 +10,10 @@ An iOS wrapper for [code-server](https://github.com/coder/code-server), built wi
 - Supplemental keyboard for `Esc`, `Tab`, `Enter`, and arrow keys
 - Lockable `Ctrl` and `Shift` modifiers for combinations entered with the
   on-screen keyboard, a hardware keyboard, or the supplemental keys
-- GitHub Actions workflow that produces a TrollStore-ready IPA
+- Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
+- GitHub Actions workflows that produce a TrollStore-ready IPA and an Android APK
 
-## Build the IPA
+## Build the iOS IPA
 
 1. Open the repository's **Actions** tab.
 2. Select **Build CodeServerApp IPA**.
@@ -22,12 +23,25 @@ An iOS wrapper for [code-server](https://github.com/coder/code-server), built wi
 
 The workflow builds without an Apple provisioning profile and applies an ad-hoc signature before packaging.
 
+## Build the Android APK
+
+1. Open the repository's **Actions** tab.
+2. Select **Build CodeServerApp Android APK**.
+3. Choose **Run workflow**.
+4. Download `CodeServerApp-android.apk` and open it on the Android device.
+5. Allow installation from the browser or file manager when Android asks.
+
+The Android workflow produces a debug-signed APK that needs no Play Store or signing secrets. Android 8.0 (API 26) or newer is supported. Because hosted runners create development signing keys, uninstall an older workflow build first if Android reports an incompatible update signature.
+
 ## Development
 
 - Open `CodeServerApp.xcodeproj` in Xcode.
 - Deployment target: iOS 15.0.
 - Bundle identifier: `net.archcangyuan.CodeServerApp`.
-- The initial server address is entered inside the app and saved with `AppStorage`.
+- Open `android/` in Android Studio for Android development.
+- Android application ID: `net.archcangyuan.codeserverapp.debug`.
+- The initial server address is saved with `AppStorage` on iOS and
+  `SharedPreferences` on Android.
 
 ## Notes
 

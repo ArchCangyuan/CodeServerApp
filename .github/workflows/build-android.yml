@@ -1,0 +1,48 @@
+name: Build CodeServerApp Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - ".github/workflows/build-android.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build installable Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 9.5
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "9.5.0"
+
+      - name: Build debug APK
+        run: gradle --no-daemon -p android clean assembleDebug
+
+      - name: Verify and stage APK
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk CodeServerApp-android.apk
+          unzip -t CodeServerApp-android.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: CodeServerApp-android.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 14

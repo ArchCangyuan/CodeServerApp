@@ -5,3 +5,6 @@ build/
 xcuserdata/
 Payload/
 *.ipa
+.gradle/
+local.properties
+*.apk
