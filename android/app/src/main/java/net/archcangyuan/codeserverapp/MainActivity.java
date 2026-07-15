@@ -2,6 +2,7 @@ package net.archcangyuan.codeserverapp;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
@@ -9,9 +10,12 @@ import android.graphics.Color;
 import android.graphics.Insets;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
@@ -25,14 +29,21 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
+import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 public final class MainActivity extends Activity {
     private static final String PREFERENCES = "code_server_app";
     private static final String ADDRESS_KEY = "server_address";
+    private static final String PROJECTS_KEY = "saved_projects";
+    private static final long TOOLBAR_HIDE_DELAY_MS = 4_000L;
+    private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
     private static final int ACCENT = Color.rgb(103, 80, 164);
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
     private static final String DESKTOP_USER_AGENT =
@@ -41,6 +52,17 @@ public final class MainActivity extends Activity {
 
     private static final String KEYBOARD_BRIDGE = """
         (() => {
+          let viewport = document.querySelector('meta[name="viewport"]');
+          if (!viewport) {
+            viewport = document.createElement('meta');
+            viewport.setAttribute('name', 'viewport');
+            (document.head || document.documentElement).appendChild(viewport);
+          }
+          viewport.setAttribute(
+            'content',
+            'width=1280, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes'
+          );
+
           if (window.__codeServerAppKeyboard) return;
 
           const state = { control: false, shift: false };
@@ -125,7 +147,10 @@ public final class MainActivity extends Activity {
         """;
 
     private SharedPreferences preferences;
+    private final Handler toolbarHandler = new Handler(Looper.getMainLooper());
+    private final List<ProjectProfile> projects = new ArrayList<>();
     private LinearLayout rootContainer;
+    private LinearLayout addressBar;
     private EditText addressField;
     private WebView webView;
     private Button controlButton;
@@ -134,11 +159,22 @@ public final class MainActivity extends Activity {
     private boolean controlLocked;
     private boolean shiftLocked;
     private boolean fullscreen;
+    private final Runnable hideAddressBarRunnable = () -> {
+        if (!fullscreen || addressBar == null) {
+            return;
+        }
+        if (addressField != null && addressField.hasFocus()) {
+            scheduleAddressBarHide();
+            return;
+        }
+        addressBar.setVisibility(View.GONE);
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
+        loadProjects();
         setContentView(createContentView());
         configureSystemUi();
         configureWebView();
@@ -153,7 +189,7 @@ public final class MainActivity extends Activity {
     }
 
     private View createContentView() {
-        LinearLayout root = new LinearLayout(this);
+        EdgeGestureLayout root = new EdgeGestureLayout(this);
         rootContainer = root;
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.WHITE);
@@ -162,11 +198,16 @@ public final class MainActivity extends Activity {
             return insets;
         });
 
-        LinearLayout addressBar = new LinearLayout(this);
+        addressBar = new LinearLayout(this);
         addressBar.setOrientation(LinearLayout.HORIZONTAL);
         addressBar.setGravity(Gravity.CENTER_VERTICAL);
         addressBar.setPadding(dp(8), dp(5), dp(8), dp(5));
         addressBar.setBackgroundColor(Color.rgb(243, 243, 243));
+
+        Button projectsButton = createToolbarButton("☰");
+        projectsButton.setContentDescription("Switch code-server project");
+        projectsButton.setOnClickListener(view -> showProjectSwitcher());
+        addressBar.addView(projectsButton);
 
         addressField = new EditText(this);
         addressField.setSingleLine(true);
@@ -323,6 +364,15 @@ public final class MainActivity extends Activity {
             }
             rootContainer.requestApplyInsets();
         }
+
+        if (addressBar != null) {
+            if (fullscreen) {
+                hideAddressBar();
+            } else {
+                toolbarHandler.removeCallbacks(hideAddressBarRunnable);
+                addressBar.setVisibility(View.VISIBLE);
+            }
+        }
     }
 
     private void applySafeAreaInsets(View view, WindowInsets insets) {
@@ -368,9 +418,11 @@ public final class MainActivity extends Activity {
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         settings.setUserAgentString(DESKTOP_USER_AGENT);
         settings.setUseWideViewPort(true);
-        settings.setLoadWithOverviewMode(false);
+        settings.setLoadWithOverviewMode(true);
         settings.setBuiltInZoomControls(true);
         settings.setDisplayZoomControls(false);
+        settings.setTextZoom(90);
+        webView.setInitialScale(calculateDesktopScale());
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
@@ -378,6 +430,12 @@ public final class MainActivity extends Activity {
 
         webView.setWebChromeClient(new WebChromeClient());
         webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageCommitVisible(WebView view, String url) {
+                super.onPageCommitVisible(view, url);
+                installKeyboardBridge();
+            }
+
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
@@ -397,6 +455,162 @@ public final class MainActivity extends Activity {
         webView.loadUrl(normalized);
         addressField.clearFocus();
         webView.requestFocus();
+    }
+
+    private int calculateDesktopScale() {
+        float density = getResources().getDisplayMetrics().density;
+        float availableCssWidth = getResources().getDisplayMetrics().widthPixels / density;
+        int scale = Math.round(availableCssWidth * 100f / DESKTOP_VIEWPORT_WIDTH);
+        return Math.max(20, Math.min(60, scale));
+    }
+
+    private void showAddressBarTemporarily() {
+        if (addressBar == null) {
+            return;
+        }
+        addressBar.setVisibility(View.VISIBLE);
+        scheduleAddressBarHide();
+    }
+
+    private void scheduleAddressBarHide() {
+        toolbarHandler.removeCallbacks(hideAddressBarRunnable);
+        toolbarHandler.postDelayed(hideAddressBarRunnable, TOOLBAR_HIDE_DELAY_MS);
+    }
+
+    private void hideAddressBar() {
+        toolbarHandler.removeCallbacks(hideAddressBarRunnable);
+        if (addressBar != null) {
+            addressBar.setVisibility(View.GONE);
+        }
+    }
+
+    private void loadProjects() {
+        projects.clear();
+        String serialized = preferences.getString(PROJECTS_KEY, "[]");
+        try {
+            JSONArray array = new JSONArray(serialized == null ? "[]" : serialized);
+            for (int index = 0; index < array.length(); index++) {
+                JSONObject item = array.optJSONObject(index);
+                if (item == null) {
+                    continue;
+                }
+                String name = item.optString("name", "").trim();
+                String url = item.optString("url", "").trim();
+                if (!name.isEmpty() && !url.isEmpty()) {
+                    projects.add(new ProjectProfile(name, url));
+                }
+            }
+        } catch (Exception ignored) {
+            projects.clear();
+        }
+    }
+
+    private void persistProjects() {
+        JSONArray array = new JSONArray();
+        for (ProjectProfile project : projects) {
+            JSONObject item = new JSONObject();
+            try {
+                item.put("name", project.name);
+                item.put("url", project.url);
+                array.put(item);
+            } catch (Exception ignored) {}
+        }
+        preferences.edit().putString(PROJECTS_KEY, array.toString()).apply();
+    }
+
+    private void showProjectSwitcher() {
+        List<String> choices = new ArrayList<>();
+        choices.add("+ Save current address");
+        for (ProjectProfile project : projects) {
+            choices.add(project.name);
+        }
+        choices.add("Manage saved projects");
+
+        new AlertDialog.Builder(this)
+            .setTitle("Projects")
+            .setItems(choices.toArray(new String[0]), (dialog, which) -> {
+                if (which == 0) {
+                    saveCurrentAsProject();
+                } else if (which <= projects.size()) {
+                    openProject(projects.get(which - 1));
+                } else {
+                    showProjectManager();
+                }
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void saveCurrentAsProject() {
+        String url = normalizeAddress(addressField.getText().toString());
+        if (url.isEmpty()) {
+            Toast.makeText(this, "Enter a code-server address first", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        EditText nameField = new EditText(this);
+        nameField.setSingleLine(true);
+        nameField.setHint("Project name");
+        nameField.setText("Project " + (projects.size() + 1));
+        nameField.selectAll();
+
+        new AlertDialog.Builder(this)
+            .setTitle("Save project")
+            .setMessage(url)
+            .setView(nameField)
+            .setPositiveButton("Save", (dialog, which) -> {
+                String name = nameField.getText().toString().trim();
+                if (name.isEmpty()) {
+                    name = "Project " + (projects.size() + 1);
+                }
+                projects.add(new ProjectProfile(name, url));
+                persistProjects();
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void openProject(ProjectProfile project) {
+        addressField.setText(project.url);
+        preferences.edit().putString(ADDRESS_KEY, project.url).apply();
+        webView.loadUrl(project.url);
+        addressField.clearFocus();
+        webView.requestFocus();
+        if (fullscreen) {
+            hideAddressBar();
+        }
+    }
+
+    private void showProjectManager() {
+        if (projects.isEmpty()) {
+            Toast.makeText(this, "No saved projects", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        String[] labels = new String[projects.size()];
+        for (int index = 0; index < projects.size(); index++) {
+            ProjectProfile project = projects.get(index);
+            labels[index] = project.name + "\n" + project.url;
+        }
+
+        new AlertDialog.Builder(this)
+            .setTitle("Tap a project to delete")
+            .setItems(labels, (dialog, which) -> confirmProjectDeletion(which))
+            .setNegativeButton("Done", null)
+            .show();
+    }
+
+    private void confirmProjectDeletion(int index) {
+        ProjectProfile project = projects.get(index);
+        new AlertDialog.Builder(this)
+            .setTitle("Delete " + project.name + "?")
+            .setMessage(project.url)
+            .setPositiveButton("Delete", (dialog, which) -> {
+                projects.remove(index);
+                persistProjects();
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
     }
 
     private static String normalizeAddress(String address) {
@@ -528,7 +742,10 @@ public final class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (webView != null && webView.canGoBack()) {
+        if (fullscreen) {
+            fullscreen = false;
+            applyFullscreenState();
+        } else if (webView != null && webView.canGoBack()) {
             webView.goBack();
         } else {
             super.onBackPressed();
@@ -537,9 +754,65 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        toolbarHandler.removeCallbacks(hideAddressBarRunnable);
         if (webView != null) {
             webView.destroy();
         }
         super.onDestroy();
+    }
+
+    private final class EdgeGestureLayout extends LinearLayout {
+        private float edgePullStartY;
+        private boolean trackingEdgePull;
+
+        EdgeGestureLayout(Context context) {
+            super(context);
+        }
+
+        @Override
+        public boolean dispatchTouchEvent(MotionEvent event) {
+            if (fullscreen && addressBar != null && addressBar.getVisibility() != View.VISIBLE) {
+                switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    if (event.getY() <= dp(32)) {
+                        edgePullStartY = event.getY();
+                        trackingEdgePull = true;
+                        return true;
+                    }
+                    break;
+                case MotionEvent.ACTION_MOVE:
+                    if (trackingEdgePull) {
+                        if (event.getY() - edgePullStartY >= dp(48)) {
+                            trackingEdgePull = false;
+                            showAddressBarTemporarily();
+                        }
+                        return true;
+                    }
+                    break;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    if (trackingEdgePull) {
+                        trackingEdgePull = false;
+                        return true;
+                    }
+                    break;
+                default:
+                    break;
+                }
+            } else if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                trackingEdgePull = false;
+            }
+            return super.dispatchTouchEvent(event);
+        }
+    }
+
+    private static final class ProjectProfile {
+        final String name;
+        final String url;
+
+        ProjectProfile(String name, String url) {
+            this.name = name;
+            this.url = url;
+        }
     }
 }
