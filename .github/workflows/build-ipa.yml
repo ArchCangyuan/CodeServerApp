@@ -1,0 +1,71 @@
+name: Build CodeServerApp IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build TrollStore IPA
+    runs-on: macos-latest
+
+    env:
+      PROJECT_PATH: CodeServerApp.xcodeproj
+      SCHEME: CodeServerApp
+      DERIVED_DATA: ${{ runner.temp }}/DerivedData
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Show build environment
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: Build device app without Apple signing
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            'CODE_SIGN_IDENTITY=' \
+            clean build
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$(find "$DERIVED_DATA/Build/Products/Release-iphoneos" \
+            -maxdepth 1 -name '*.app' -print -quit)"
+
+          if [[ -z "$APP_PATH" ]]; then
+            echo "No .app bundle was produced"
+            exit 1
+          fi
+
+          /usr/bin/codesign --force --deep --sign - "$APP_PATH"
+
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          /usr/bin/ditto -c -k --keepParent Payload "$SCHEME.ipa"
+          /usr/bin/unzip -t "$SCHEME.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeServerApp-${{ github.run_number }}
+          path: CodeServerApp.ipa
+          if-no-files-found: error
+          retention-days: 14
