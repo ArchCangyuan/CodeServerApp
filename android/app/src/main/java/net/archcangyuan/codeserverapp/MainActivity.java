@@ -243,11 +243,15 @@ public final class MainActivity extends Activity {
 
         Button zoomOutButton = createToolbarButton("−");
         zoomOutButton.setContentDescription("Zoom out");
+        zoomOutButton.setFocusable(false);
+        zoomOutButton.setFocusableInTouchMode(false);
         zoomOutButton.setOnClickListener(view -> changeZoom(-1));
         addressBar.addView(zoomOutButton);
 
         Button zoomInButton = createToolbarButton("+");
         zoomInButton.setContentDescription("Zoom in");
+        zoomInButton.setFocusable(false);
+        zoomInButton.setFocusableInTouchMode(false);
         zoomInButton.setOnClickListener(view -> changeZoom(1));
         addressBar.addView(zoomInButton);
 
@@ -482,43 +486,36 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        String key = direction > 0 ? "=" : "-";
-        String code = direction > 0 ? "Equal" : "Minus";
-        int keyCode = direction > 0 ? 187 : 189;
-        String script = String.format(Locale.US, """
-            (() => {
-              const target = document.activeElement || document.body;
-              if (!target) return false;
-              const dispatch = (type) => {
-                const event = new KeyboardEvent(type, {
-                  key: %s,
-                  code: %s,
-                  ctrlKey: true,
-                  shiftKey: false,
-                  altKey: false,
-                  metaKey: false,
-                  bubbles: true,
-                  cancelable: true,
-                  composed: true
-                });
-                try {
-                  Object.defineProperty(event, 'keyCode', { get: () => %d });
-                  Object.defineProperty(event, 'which', { get: () => %d });
-                } catch (_) {}
-                target.dispatchEvent(event);
-              };
-              dispatch('keydown');
-              dispatch('keyup');
-              return true;
-            })();
-            """,
-            JSONObject.quote(key),
-            JSONObject.quote(code),
-            keyCode,
-            keyCode
-        );
-        webView.evaluateJavascript(script, null);
-        webView.requestFocus();
+        WebView target = webView;
+        int keyCode = direction > 0 ? KeyEvent.KEYCODE_EQUALS : KeyEvent.KEYCODE_MINUS;
+        int metaState = KeyEvent.META_CTRL_ON | KeyEvent.META_CTRL_LEFT_ON;
+        target.requestFocus();
+        target.post(() -> {
+            if (target != webView) {
+                return;
+            }
+            long eventTime = SystemClock.uptimeMillis();
+            target.dispatchKeyEvent(
+                new KeyEvent(
+                    eventTime,
+                    eventTime,
+                    KeyEvent.ACTION_DOWN,
+                    keyCode,
+                    0,
+                    metaState
+                )
+            );
+            target.dispatchKeyEvent(
+                new KeyEvent(
+                    eventTime,
+                    eventTime + 1L,
+                    KeyEvent.ACTION_UP,
+                    keyCode,
+                    0,
+                    metaState
+                )
+            );
+        });
     }
 
     private void switchToProjectUrl(String address) {
