@@ -5,8 +5,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "CodeServerApp/**"
-      - "CodeServerApp.xcodeproj/**"
+      - "ios/**"
       - ".github/workflows/build-ipa.yml"
 
 permissions:
@@ -18,7 +17,7 @@ jobs:
     runs-on: macos-latest
 
     env:
-      PROJECT_PATH: CodeServerApp.xcodeproj
+      PROJECT_PATH: ios/CodeServerApp.xcodeproj
       SCHEME: CodeServerApp
       DERIVED_DATA: DerivedData
 

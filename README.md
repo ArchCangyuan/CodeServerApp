@@ -11,15 +11,28 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Lockable `Ctrl` and `Shift` modifiers for combinations entered with the
   on-screen keyboard, a hardware keyboard, or the supplemental keys
 - Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
-- Android safe-area handling with an optional immersive fullscreen toggle; pull down from the top edge to exit fullscreen
-- Android desktop-site mode, pinch zoom, and an IME-aware supplemental key bar
-- Persistent Android virtual-viewport zoom controls that automatically reload once to apply a full-width, non-cropped layout
-- A force-keyboard button backed by a native Android input connection, keeping
+- Safe-area handling with an optional immersive fullscreen toggle; pull down from the top edge to exit fullscreen
+- Desktop-site mode and an IME-aware supplemental key bar on both platforms
+- Persistent virtual-viewport zoom controls that automatically reload once to apply a full-width, non-cropped layout
+- A force-keyboard button backed by native Android and iOS input capture, keeping
   focus on canvas-based web RDP clients while forwarding text and editing keys
 - Cloudflare Access browser-RDP support that focuses IronRDP's Shadow DOM
   renderer and sends text, Backspace, Delete, and Enter through its key handler
-- Saved Android project profiles with bold titles and up to six hot WebView sessions retained for 30 minutes
+- Saved project profiles with bold titles and up to six hot WebView sessions retained for 30 minutes on both platforms
 - GitHub Actions workflows that produce a TrollStore-ready IPA and an Android APK
+
+## Repository layout
+
+```text
+CodeServerApp/
+├── ios/          # SwiftUI and WKWebView application
+├── android/      # Java and Android WebView application
+├── branding/     # Shared source artwork
+├── tools/        # Shared asset-generation utilities
+└── .github/      # Independent IPA and APK workflows
+```
+
+The two applications are peers in one repository. They share branding and release history, but each has its own native project and build workflow.
 
 ## Build the iOS IPA
 
@@ -43,7 +56,7 @@ The Android workflow produces a debug-signed APK that needs no Play Store or sig
 
 ## Development
 
-- Open `CodeServerApp.xcodeproj` in Xcode.
+- Open `ios/CodeServerApp.xcodeproj` in Xcode.
 - Deployment target: iOS 15.0.
 - Bundle identifier: `net.archcangyuan.CodeServerApp`.
 - Open `android/` in Android Studio for Android development.

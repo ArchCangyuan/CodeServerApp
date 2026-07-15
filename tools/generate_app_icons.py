@@ -7,7 +7,10 @@ from PIL import Image
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-IOS_ICON_DIR = REPO_ROOT / "CodeServerApp" / "Assets.xcassets" / "AppIcon.appiconset"
+IOS_ICON_DIR = (
+    REPO_ROOT / "ios" / "CodeServerApp" / "Assets.xcassets" / "AppIcon.appiconset"
+)
+IOS_LOGO_DIR = REPO_ROOT / "ios" / "CodeServerApp" / "Assets.xcassets" / "AppLogo.imageset"
 ANDROID_RES_DIR = REPO_ROOT / "android" / "app" / "src" / "main" / "res"
 BRANDING_DIR = REPO_ROOT / "branding"
 
@@ -22,18 +25,23 @@ def main() -> None:
         raise SystemExit("usage: generate_app_icons.py <gpt-image-logo.png>")
 
     source = Image.open(sys.argv[1]).convert("RGB")
-    side = min(source.size)
-    left = (source.width - side) // 2
-    top = (source.height - side) // 2
-    square = source.crop((left, top, left + side, top + side))
+    if source.size == (1024, 1024):
+        # The checked-in branding image is already the normalized master.
+        master = source.copy()
+    else:
+        side = min(source.size)
+        left = (source.width - side) // 2
+        top = (source.height - side) // 2
+        square = source.crop((left, top, left + side, top + side))
 
-    # The generated concept includes a rounded presentation canvas. Trim its
-    # outer corners so platform launchers can apply their own icon masks cleanly.
-    trim = round(side * 96 / 1254)
-    square = square.crop((trim, trim, side - trim, side - trim))
-    master = square.resize((1024, 1024), Image.Resampling.LANCZOS)
+        # The GPT Image concept includes a rounded presentation canvas. Trim its
+        # outer corners so platform launchers can apply their own masks cleanly.
+        trim = round(side * 96 / 1254)
+        square = square.crop((trim, trim, side - trim, side - trim))
+        master = square.resize((1024, 1024), Image.Resampling.LANCZOS)
 
     save_png(master, BRANDING_DIR / "CodeServerApp-logo-gpt.png")
+    save_png(master, IOS_LOGO_DIR / "AppLogo.png")
 
     ios_icons = {
         "AppIcon-20x20@1x-ipad.png": 20,
