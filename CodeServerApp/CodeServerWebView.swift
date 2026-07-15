@@ -1,100 +1,337 @@
 import SwiftUI
+import UIKit
 import WebKit
 
-private let keyboardBridgeSource = """
+private let desktopViewportWidth = 1280
+private let minimumLayoutZoomSteps = -6
+private let maximumLayoutZoomSteps = 6
+private let layoutZoomFactor = 1.1
+private let projectSessionTTL: TimeInterval = 30 * 60
+private let maximumHotProjectSessions = 6
+private let layoutZoomStepsKey = "layoutZoomSteps"
+
+private let desktopUserAgent = """
+Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36
+""".replacingOccurrences(of: "\n", with: "")
+
+private let keyboardBridgeSource = #"""
 (() => {
-  if (window.__codeServerAppKeyboard) return;
+  const setViewportWidth = (requestedWidth) => {
+    const numericWidth = Number(requestedWidth) || 1280;
+    const width = Math.max(640, Math.min(2400, Math.round(numericWidth)));
+    let viewport = document.querySelector('meta[name="viewport"]');
+    if (!viewport) {
+      viewport = document.createElement('meta');
+      viewport.setAttribute('name', 'viewport');
+      (document.head || document.documentElement).appendChild(viewport);
+    }
+    viewport.setAttribute(
+      'content',
+      `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`
+    );
+    document.documentElement.style.zoom = '1';
+    if (document.body) {
+      document.body.style.zoom = '1';
+      document.body.style.width = '';
+      document.body.style.minWidth = '';
+    }
+    window.__codeServerAppViewportWidth = width;
+    requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+    return width;
+  };
 
-  const state = { control: false, shift: false };
+  window.__codeServerAppSetViewportWidth = setViewportWidth;
+  setViewportWidth(window.__codeServerAppViewportWidth || 1280);
 
-  const activeTarget = () => document.activeElement || document.body;
+  const findIronRdpCanvas = () => {
+    const roots = [document];
+    const visited = new Set();
+    for (let index = 0; index < roots.length && index < 128; index += 1) {
+      const root = roots[index];
+      if (!root || visited.has(root) || !root.querySelectorAll) continue;
+      visited.add(root);
 
-  const defineLegacyKeyCodes = (event, keyCode) => {
+      const directCanvas = root.querySelector('canvas#renderer');
+      if (directCanvas) return directCanvas;
+
+      const ironHosts = root.querySelectorAll(
+        'iron-remote-desktop, iron-remote-gui'
+      );
+      for (const host of ironHosts) {
+        const canvas = host.shadowRoot?.querySelector('canvas#renderer');
+        if (canvas) return canvas;
+      }
+
+      for (const element of root.querySelectorAll('*')) {
+        if (element.shadowRoot && !visited.has(element.shadowRoot)) {
+          roots.push(element.shadowRoot);
+        }
+        if (element.tagName === 'IFRAME') {
+          try {
+            if (element.contentDocument) roots.push(element.contentDocument);
+          } catch (_) {}
+        }
+      }
+    }
+    return null;
+  };
+
+  const existingBridge = window.__codeServerAppKeyboard;
+  if (existingBridge && existingBridge.version >= 4) {
+    window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
+    return;
+  }
+
+  const state = {
+    control: false,
+    shift: false,
+    target: null,
+    ironRdpCanvas: null
+  };
+
+  const deepestActiveElement = (rootDocument) => {
+    let active = rootDocument.activeElement;
+    for (let depth = 0; active && depth < 6; depth += 1) {
+      if (active.tagName !== 'IFRAME') break;
+      try {
+        const childDocument = active.contentDocument;
+        if (!childDocument || !childDocument.activeElement) break;
+        active = childDocument.activeElement;
+      } catch (_) {
+        break;
+      }
+    }
+    return active;
+  };
+
+  const rememberTarget = (candidate) => {
+    if (!candidate) return;
+    const ownerDocument = candidate.ownerDocument;
+    const isGeneric = candidate.tagName === 'HTML'
+      || Boolean(ownerDocument && candidate === ownerDocument.body);
+    if (!isGeneric || !state.target) state.target = candidate;
+  };
+
+  const activeTarget = () => {
+    if (state.ironRdpCanvas && state.ironRdpCanvas.isConnected) {
+      return state.ironRdpCanvas;
+    }
+    const current = deepestActiveElement(document);
+    if (current) {
+      rememberTarget(current);
+      const ownerDocument = current.ownerDocument;
+      const isGeneric = current.tagName === 'HTML'
+        || Boolean(ownerDocument && current === ownerDocument.body);
+      if (!isGeneric) return current;
+    }
+    if (state.target && state.target.isConnected) return state.target;
+    const fallback = document.querySelector(
+      'canvas, [role="application"], [tabindex="0"]'
+    ) || document.body || document.documentElement;
+    rememberTarget(fallback);
+    return fallback;
+  };
+
+  const defineLegacyKeyCodes = (event, keyCode, charCode = 0) => {
     try {
       Object.defineProperty(event, 'keyCode', { get: () => keyCode });
-      Object.defineProperty(event, 'which', { get: () => keyCode });
+      Object.defineProperty(event, 'which', {
+        get: () => charCode || keyCode
+      });
+      Object.defineProperty(event, 'charCode', { get: () => charCode });
     } catch (_) {}
   };
 
-  const dispatchModifier = (key, code, keyCode, isDown) => {
-    const target = activeTarget();
-    if (!target) return;
-
-    const event = new KeyboardEvent(isDown ? 'keydown' : 'keyup', {
+  const dispatchKeyPhase = (target, type, key, code, keyCode, source = null) => {
+    if (!target) return false;
+    const printable = typeof key === 'string' && Array.from(key).length === 1;
+    const event = new KeyboardEvent(type, {
       key,
-      code,
-      ctrlKey: state.control,
-      shiftKey: state.shift,
-      altKey: false,
-      metaKey: false,
+      code: code || '',
+      location: source ? source.location : 0,
+      repeat: source ? source.repeat : false,
+      ctrlKey: state.control || Boolean(source && source.ctrlKey),
+      shiftKey: state.shift || Boolean(source && source.shiftKey),
+      altKey: Boolean(source && source.altKey),
+      metaKey: Boolean(source && source.metaKey),
       bubbles: true,
       cancelable: true,
       composed: true
     });
-    defineLegacyKeyCodes(event, keyCode);
-    target.dispatchEvent(event);
+    const charCode = type === 'keypress' && printable ? key.codePointAt(0) : 0;
+    defineLegacyKeyCodes(event, keyCode || 0, charCode);
+    return target.dispatchEvent(event);
+  };
+
+  const keyInfoForText = (key) => {
+    if (/^[a-z]$/i.test(key)) {
+      const upper = key.toUpperCase();
+      return {
+        code: `Key${upper}`,
+        keyCode: upper.charCodeAt(0),
+        shift: key === upper
+      };
+    }
+    if (/^[0-9]$/.test(key)) {
+      return { code: `Digit${key}`, keyCode: key.charCodeAt(0), shift: false };
+    }
+    if (key === ' ') return { code: 'Space', keyCode: 32, shift: false };
+    const punctuation = {
+      '`': ['Backquote', 192, false], '~': ['Backquote', 192, true],
+      '-': ['Minus', 189, false], '_': ['Minus', 189, true],
+      '=': ['Equal', 187, false], '+': ['Equal', 187, true],
+      '[': ['BracketLeft', 219, false], '{': ['BracketLeft', 219, true],
+      ']': ['BracketRight', 221, false], '}': ['BracketRight', 221, true],
+      '\\': ['Backslash', 220, false], '|': ['Backslash', 220, true],
+      ';': ['Semicolon', 186, false], ':': ['Semicolon', 186, true],
+      "'": ['Quote', 222, false], '"': ['Quote', 222, true],
+      ',': ['Comma', 188, false], '<': ['Comma', 188, true],
+      '.': ['Period', 190, false], '>': ['Period', 190, true],
+      '/': ['Slash', 191, false], '?': ['Slash', 191, true],
+      '!': ['Digit1', 49, true], '@': ['Digit2', 50, true],
+      '#': ['Digit3', 51, true], '$': ['Digit4', 52, true],
+      '%': ['Digit5', 53, true], '^': ['Digit6', 54, true],
+      '&': ['Digit7', 55, true], '*': ['Digit8', 56, true],
+      '(': ['Digit9', 57, true], ')': ['Digit0', 48, true]
+    };
+    const mapped = punctuation[key];
+    if (mapped) {
+      return { code: mapped[0], keyCode: mapped[1], shift: mapped[2] };
+    }
+    return { code: '', keyCode: key.codePointAt(0) || 0, shift: false };
+  };
+
+  const dispatchCompleteKey = (key, code, keyCode, forceShift = false) => {
+    const target = activeTarget();
+    if (!target) return false;
+    const source = forceShift ? { shiftKey: true } : null;
+    dispatchKeyPhase(target, 'keydown', key, code, keyCode, source);
+    if (Array.from(key).length === 1) {
+      dispatchKeyPhase(target, 'keypress', key, code, keyCode, source);
+    }
+    dispatchKeyPhase(target, 'keyup', key, code, keyCode, source);
+    return true;
+  };
+
+  const forwardText = (text) => {
+    for (const key of Array.from(text || '')) {
+      const info = keyInfoForText(key);
+      dispatchCompleteKey(key, info.code, info.keyCode, info.shift);
+    }
+    return true;
+  };
+
+  const dispatchModifier = (key, code, keyCode, isDown) => {
+    dispatchKeyPhase(
+      activeTarget(),
+      isDown ? 'keydown' : 'keyup',
+      key,
+      code,
+      keyCode
+    );
   };
 
   const redispatchWithLockedModifiers = (event) => {
     if (!event.isTrusted || (!state.control && !state.shift)) return;
     if (event.key === 'Control' || event.key === 'Shift') return;
-
     const target = event.target || activeTarget();
     if (!target) return;
-
     event.preventDefault();
     event.stopImmediatePropagation();
-
     const shiftedKey = state.shift && event.key.length === 1
       ? event.key.toUpperCase()
       : event.key;
-
-    const replacement = new KeyboardEvent(event.type, {
-      key: shiftedKey,
-      code: event.code,
-      location: event.location,
-      repeat: event.repeat,
-      ctrlKey: state.control || event.ctrlKey,
-      shiftKey: state.shift || event.shiftKey,
-      altKey: event.altKey,
-      metaKey: event.metaKey,
-      bubbles: true,
-      cancelable: true,
-      composed: true
-    });
-    defineLegacyKeyCodes(replacement, event.keyCode || event.which || 0);
-    target.dispatchEvent(replacement);
+    dispatchKeyPhase(
+      target,
+      event.type,
+      shiftedKey,
+      event.code,
+      event.keyCode || event.which || 0,
+      event
+    );
   };
 
+  document.addEventListener('pointerdown', (event) => {
+    const path = typeof event.composedPath === 'function'
+      ? event.composedPath()
+      : [];
+    rememberTarget(path[0] || event.target);
+  }, true);
+  document.addEventListener('focusin', (event) => rememberTarget(event.target), true);
   document.addEventListener('keydown', redispatchWithLockedModifiers, true);
   document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
-  window.__codeServerAppKeyboard = {
+  const bridge = {
+    version: 4,
+    forceKeyboard() {
+      const canvas = findIronRdpCanvas();
+      if (canvas) {
+        state.ironRdpCanvas = canvas;
+        rememberTarget(canvas);
+        canvas.focus({ preventScroll: true });
+        return 'ironrdp';
+      }
+      rememberTarget(deepestActiveElement(document));
+      return activeTarget() ? 'generic' : 'missing';
+    },
+    sendKey(key, code, keyCode) {
+      return dispatchCompleteKey(key, code, keyCode);
+    },
+    sendText(text) {
+      return forwardText(String(text || ''));
+    },
     setModifiers(control, shift) {
       const nextControl = Boolean(control);
       const nextShift = Boolean(shift);
       const controlChanged = state.control !== nextControl;
       const shiftChanged = state.shift !== nextShift;
-
       state.control = nextControl;
       state.shift = nextShift;
-
-      if (controlChanged) {
-        dispatchModifier('Control', 'ControlLeft', 17, nextControl);
-      }
-      if (shiftChanged) {
-        dispatchModifier('Shift', 'ShiftLeft', 16, nextShift);
-      }
+      if (controlChanged) dispatchModifier('Control', 'ControlLeft', 17, nextControl);
+      if (shiftChanged) dispatchModifier('Shift', 'ShiftLeft', 16, nextShift);
     }
   };
+
+  window.__codeServerAppKeyboard = bridge;
+  window.__codeServerAppForceKeyboard = () => bridge.forceKeyboard();
 })();
-"""
+"""#
 
 @MainActor
-final class CodeServerWebViewStore: ObservableObject {
-    weak var webView: WKWebView?
+final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDelegate {
+    @Published private(set) var zoomPercent: Int
+    @Published private(set) var statusMessage: String?
+
+    private final class ProjectSession {
+        let key: String
+        let webView: WKWebView
+        var lastInactiveAt: TimeInterval?
+        var lastFinishedURL: String?
+        var appliedZoomSteps: Int?
+        var zoomReloadInProgress = false
+
+        init(key: String, webView: WKWebView) {
+            self.key = key
+            self.webView = webView
+        }
+    }
+
+    private var sessions: [String: ProjectSession] = [:]
+    private weak var hostView: WebViewSessionContainerView?
+    private var requestedAddress = ""
+    private var activeSessionKey: String?
     private var controlLocked = false
     private var shiftLocked = false
+    private var layoutZoomSteps: Int
+    private var statusToken = UUID()
+
+    override init() {
+        let savedSteps = UserDefaults.standard.integer(forKey: layoutZoomStepsKey)
+        layoutZoomSteps = min(max(savedSteps, minimumLayoutZoomSteps), maximumLayoutZoomSteps)
+        zoomPercent = Int(round(pow(layoutZoomFactor, Double(layoutZoomSteps)) * 100))
+        super.init()
+    }
 
     static func normalizedAddress(_ address: String) -> String {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -107,78 +344,159 @@ final class CodeServerWebViewStore: ObservableObject {
         return "http://\(trimmed)"
     }
 
+    func attach(to view: WebViewSessionContainerView) {
+        hostView = view
+        view.onCommittedText = { [weak self] text in
+            self?.sendText(text)
+        }
+        view.onDeleteBackward = { [weak self] in
+            self?.send(.backspace)
+        }
+        view.onEnter = { [weak self] in
+            self?.send(.enter)
+        }
+        for session in sessions.values {
+            view.install(session.webView)
+        }
+        if !requestedAddress.isEmpty {
+            activate(address: requestedAddress)
+        }
+    }
+
+    func activate(address: String) {
+        let normalized = Self.normalizedAddress(address)
+        guard !normalized.isEmpty else { return }
+        requestedAddress = normalized
+        guard let hostView else { return }
+
+        let now = Date.timeIntervalSinceReferenceDate
+        cleanupExpiredSessions(now: now)
+
+        let target: ProjectSession
+        let created: Bool
+        if let existing = sessions[normalized] {
+            target = existing
+            created = false
+        } else {
+            let webView = makeWebView()
+            target = ProjectSession(key: normalized, webView: webView)
+            sessions[normalized] = target
+            hostView.install(webView)
+            created = true
+        }
+
+        if let activeSessionKey,
+           activeSessionKey != normalized,
+           let current = sessions[activeSessionKey] {
+            current.lastInactiveAt = now
+            current.webView.isHidden = true
+        }
+
+        activeSessionKey = normalized
+        target.lastInactiveAt = nil
+        target.webView.isHidden = false
+        hostView.bringWebViewToFront(target.webView)
+
+        if created, let url = URL(string: normalized) {
+            target.webView.load(URLRequest(url: url))
+        } else if target.appliedZoomSteps != layoutZoomSteps {
+            applyLayoutZoom(to: target, reloadAfterApply: target.webView.url != nil)
+        }
+        syncModifiers(on: target.webView)
+        evictExcessSessions()
+    }
+
     func reload() {
-        webView?.reload()
+        activeSession?.webView.reload()
+    }
+
+    func changeZoom(by direction: Int) {
+        guard direction != 0 else { return }
+        let nextSteps = min(
+            max(layoutZoomSteps + direction, minimumLayoutZoomSteps),
+            maximumLayoutZoomSteps
+        )
+        guard nextSteps != layoutZoomSteps else { return }
+
+        layoutZoomSteps = nextSteps
+        UserDefaults.standard.set(layoutZoomSteps, forKey: layoutZoomStepsKey)
+        zoomPercent = Int(round(pow(layoutZoomFactor, Double(layoutZoomSteps)) * 100))
+        if let activeSession {
+            applyLayoutZoom(to: activeSession, reloadAfterApply: activeSession.webView.url != nil)
+        }
+        showStatus("UI zoom \(zoomPercent)% – reloading to fit")
+    }
+
+    func isSessionHot(_ address: String) -> Bool {
+        let normalized = Self.normalizedAddress(address)
+        let now = Date.timeIntervalSinceReferenceDate
+        cleanupExpiredSessions(now: now)
+        guard let session = sessions[normalized] else { return false }
+        if normalized == activeSessionKey { return true }
+        guard let inactiveAt = session.lastInactiveAt else { return false }
+        return now - inactiveAt < projectSessionTTL
     }
 
     func setModifiers(control: Bool, shift: Bool) {
         controlLocked = control
         shiftLocked = shift
-        syncModifiers()
-    }
-
-    func syncModifiers() {
-        let script = """
-        window.__codeServerAppKeyboard?.setModifiers(
-          \(controlLocked ? "true" : "false"),
-          \(shiftLocked ? "true" : "false")
-        );
-        """
-        webView?.evaluateJavaScript(script)
+        if let webView = activeSession?.webView {
+            syncModifiers(on: webView)
+        }
     }
 
     func send(_ key: CodeServerKey) {
-        guard let webView else { return }
+        guard let webView = activeSession?.webView else { return }
         let stroke = key.stroke
-
         let script = """
-        (() => {
-          const target = document.activeElement || document.body;
-          if (!target) return false;
-          if (typeof target.focus === 'function') target.focus();
-
-          const dispatch = (type) => {
-            const event = new KeyboardEvent(type, {
-              key: '\(stroke.key)',
-              code: '\(stroke.code)',
-              ctrlKey: \(controlLocked ? "true" : "false"),
-              altKey: false,
-              shiftKey: \(shiftLocked ? "true" : "false"),
-              metaKey: false,
-              bubbles: true,
-              cancelable: true,
-              composed: true
-            });
-
-            try {
-              Object.defineProperty(event, 'keyCode', { get: () => \(stroke.keyCode) });
-              Object.defineProperty(event, 'which', { get: () => \(stroke.keyCode) });
-            } catch (_) {}
-
-            target.dispatchEvent(event);
-          };
-
-          dispatch('keydown');
-          dispatch('keyup');
-          return true;
-        })();
+        window.__codeServerAppKeyboard?.sendKey(
+          \(Self.javaScriptString(stroke.key)),
+          \(Self.javaScriptString(stroke.code)),
+          \(stroke.keyCode)
+        ) ?? false;
         """
-
         webView.evaluateJavaScript(script)
     }
-}
 
-struct CodeServerWebView: UIViewRepresentable {
-    let address: String
-    let store: CodeServerWebViewStore
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(store: store)
+    func sendText(_ text: String) {
+        guard !text.isEmpty, let webView = activeSession?.webView else { return }
+        let script = """
+        window.__codeServerAppKeyboard?.sendText(
+          \(Self.javaScriptString(text))
+        ) ?? false;
+        """
+        webView.evaluateJavaScript(script)
     }
 
-    func makeUIView(context: Context) -> WKWebView {
+    func forceKeyboard() {
+        guard let session = activeSession else { return }
+        session.webView.evaluateJavaScript(
+            "window.__codeServerAppForceKeyboard ? window.__codeServerAppForceKeyboard() : false"
+        ) { [weak self] value, _ in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.activeSessionKey == session.key else { return }
+                self.hostView?.activateKeyboardCapture()
+                if let mode = value as? String, mode == "ironrdp" {
+                    self.showStatus("IronRDP focused – IME connected")
+                } else {
+                    self.showStatus("Keyboard connected")
+                }
+            }
+        }
+    }
+
+    private var activeSession: ProjectSession? {
+        guard let activeSessionKey else { return nil }
+        return sessions[activeSessionKey]
+    }
+
+    private func makeWebView() -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
+        configuration.allowsInlineMediaPlayback = true
+        configuration.mediaTypesRequiringUserActionForPlayback = []
+        configuration.defaultWebpagePreferences.preferredContentMode = .desktop
         configuration.userContentController.addUserScript(
             WKUserScript(
                 source: keyboardBridgeSource,
@@ -188,39 +506,282 @@ struct CodeServerWebView: UIViewRepresentable {
         )
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.navigationDelegate = context.coordinator
+        webView.navigationDelegate = self
+        webView.customUserAgent = desktopUserAgent
         webView.allowsBackForwardNavigationGestures = true
         webView.allowsLinkPreview = false
         webView.scrollView.keyboardDismissMode = .interactive
-        store.webView = webView
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
+        webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        webView.isHidden = true
         return webView
     }
 
-    func updateUIView(_ webView: WKWebView, context: Context) {
-        store.webView = webView
-
-        let normalized = CodeServerWebViewStore.normalizedAddress(address)
-        guard context.coordinator.loadedAddress != normalized,
-              let url = URL(string: normalized) else {
-            return
-        }
-
-        context.coordinator.loadedAddress = normalized
-        webView.load(URLRequest(url: url))
+    private func syncModifiers(on webView: WKWebView) {
+        let script = """
+        window.__codeServerAppKeyboard?.setModifiers(
+          \(controlLocked ? "true" : "false"),
+          \(shiftLocked ? "true" : "false")
+        );
+        """
+        webView.evaluateJavaScript(script)
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        var loadedAddress: String?
-        weak var store: CodeServerWebViewStore?
+    private func viewportWidth() -> Int {
+        Int(round(Double(desktopViewportWidth) / pow(layoutZoomFactor, Double(layoutZoomSteps))))
+    }
 
-        init(store: CodeServerWebViewStore) {
-            self.store = store
-        }
-
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            Task { @MainActor [weak store] in
-                store?.syncModifiers()
+    private func applyLayoutZoom(to session: ProjectSession, reloadAfterApply: Bool) {
+        let requestedSteps = layoutZoomSteps
+        let requestedWidth = viewportWidth()
+        let script = """
+        (() => {
+          const width = \(requestedWidth);
+          if (window.__codeServerAppSetViewportWidth) {
+            return window.__codeServerAppSetViewportWidth(width);
+          }
+          let viewport = document.querySelector('meta[name="viewport"]');
+          if (!viewport) {
+            viewport = document.createElement('meta');
+            viewport.name = 'viewport';
+            (document.head || document.documentElement).appendChild(viewport);
+          }
+          viewport.content = `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`;
+          window.__codeServerAppViewportWidth = width;
+          window.dispatchEvent(new Event('resize'));
+          return width;
+        })();
+        """
+        session.webView.evaluateJavaScript(script) { [weak self, weak session] _, _ in
+            Task { @MainActor [weak self, weak session] in
+                guard let self,
+                      let session,
+                      self.sessions[session.key] === session,
+                      requestedSteps == self.layoutZoomSteps else { return }
+                session.appliedZoomSteps = requestedSteps
+                if reloadAfterApply,
+                   session.webView.url != nil,
+                   !session.zoomReloadInProgress {
+                    session.zoomReloadInProgress = true
+                    session.webView.reload()
+                }
             }
+        }
+    }
+
+    private func cleanupExpiredSessions(now: TimeInterval) {
+        let expiredKeys = sessions.compactMap { key, session -> String? in
+            guard key != activeSessionKey,
+                  let inactiveAt = session.lastInactiveAt,
+                  now - inactiveAt >= projectSessionTTL else { return nil }
+            return key
+        }
+        for key in expiredKeys {
+            destroySession(key: key)
+        }
+    }
+
+    private func evictExcessSessions() {
+        while sessions.count > maximumHotProjectSessions {
+            let candidate = sessions.values
+                .filter { $0.key != activeSessionKey }
+                .min { ($0.lastInactiveAt ?? 0) < ($1.lastInactiveAt ?? 0) }
+            guard let candidate else { return }
+            destroySession(key: candidate.key)
+        }
+    }
+
+    private func destroySession(key: String) {
+        guard let session = sessions.removeValue(forKey: key) else { return }
+        session.webView.stopLoading()
+        session.webView.navigationDelegate = nil
+        session.webView.removeFromSuperview()
+    }
+
+    private func showStatus(_ message: String) {
+        let token = UUID()
+        statusToken = token
+        statusMessage = message
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            guard let self, self.statusToken == token else { return }
+            self.statusMessage = nil
+        }
+    }
+
+    private static func javaScriptString(_ value: String) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: [value]),
+              let encoded = String(data: data, encoding: .utf8),
+              encoded.count >= 2 else { return "\"\"" }
+        return String(encoded.dropFirst().dropLast())
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        if let session = sessions.values.first(where: { $0.webView === webView }),
+           !session.zoomReloadInProgress,
+           session.lastFinishedURL != navigationAction.request.url?.absoluteString {
+            session.appliedZoomSteps = nil
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let session = sessions.values.first(where: { $0.webView === webView }) else {
+            return
+        }
+        session.lastFinishedURL = webView.url?.absoluteString
+        let completedZoomReload = session.zoomReloadInProgress
+        session.zoomReloadInProgress = false
+        let needsReload = !completedZoomReload
+            && ((session.appliedZoomSteps == nil && layoutZoomSteps != 0)
+                || (session.appliedZoomSteps != nil
+                    && session.appliedZoomSteps != layoutZoomSteps))
+        applyLayoutZoom(to: session, reloadAfterApply: needsReload)
+        syncModifiers(on: webView)
+    }
+}
+
+struct CodeServerWebView: UIViewRepresentable {
+    let address: String
+    let store: CodeServerWebViewStore
+
+    func makeUIView(context: Context) -> WebViewSessionContainerView {
+        let view = WebViewSessionContainerView()
+        store.attach(to: view)
+        return view
+    }
+
+    func updateUIView(_ view: WebViewSessionContainerView, context: Context) {
+        store.attach(to: view)
+        store.activate(address: address)
+    }
+}
+
+final class WebViewSessionContainerView: UIView {
+    var onCommittedText: ((String) -> Void)? {
+        didSet { keyboardCapture.onCommittedText = onCommittedText }
+    }
+    var onDeleteBackward: (() -> Void)? {
+        didSet { keyboardCapture.onDeleteBackward = onDeleteBackward }
+    }
+    var onEnter: (() -> Void)? {
+        didSet { keyboardCapture.onEnter = onEnter }
+    }
+
+    private let keyboardCapture = KeyboardCaptureTextView()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .systemBackground
+        addSubview(keyboardCapture)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func install(_ webView: WKWebView) {
+        if webView.superview !== self {
+            addSubview(webView)
+        }
+        webView.frame = bounds
+        bringSubviewToFront(keyboardCapture)
+    }
+
+    func bringWebViewToFront(_ webView: WKWebView) {
+        bringSubviewToFront(webView)
+        bringSubviewToFront(keyboardCapture)
+    }
+
+    func activateKeyboardCapture() {
+        bringSubviewToFront(keyboardCapture)
+        keyboardCapture.activate()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        for subview in subviews where subview !== keyboardCapture {
+            subview.frame = bounds
+        }
+        keyboardCapture.frame = CGRect(
+            x: 1,
+            y: max(bounds.height - 2, 1),
+            width: 1,
+            height: 1
+        )
+    }
+}
+
+private final class KeyboardCaptureTextView: UITextView, UITextViewDelegate {
+    var onCommittedText: ((String) -> Void)?
+    var onDeleteBackward: (() -> Void)?
+    var onEnter: (() -> Void)?
+    private var isFlushing = false
+
+    init() {
+        super.init(frame: .zero, textContainer: nil)
+        delegate = self
+        backgroundColor = .clear
+        textColor = .clear
+        tintColor = .clear
+        alpha = 0.01
+        isScrollEnabled = false
+        autocorrectionType = .no
+        autocapitalizationType = .none
+        spellCheckingType = .no
+        smartDashesType = .no
+        smartQuotesType = .no
+        smartInsertDeleteType = .no
+        keyboardType = .default
+        returnKeyType = .default
+        accessibilityElementsHidden = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func activate() {
+        text = ""
+        becomeFirstResponder()
+    }
+
+    override func deleteBackward() {
+        if markedTextRange == nil && text.isEmpty {
+            onDeleteBackward?()
+            return
+        }
+        super.deleteBackward()
+    }
+
+    func textViewDidChange(_ textView: UITextView) {
+        guard !isFlushing,
+              markedTextRange == nil,
+              !text.isEmpty else { return }
+
+        let committed = text ?? ""
+        isFlushing = true
+        text = ""
+        isFlushing = false
+
+        var buffer = ""
+        for character in committed {
+            if character == "\n" || character == "\r" {
+                if !buffer.isEmpty {
+                    onCommittedText?(buffer)
+                    buffer = ""
+                }
+                onEnter?()
+            } else {
+                buffer.append(character)
+            }
+        }
+        if !buffer.isEmpty {
+            onCommittedText?(buffer)
         }
     }
 }

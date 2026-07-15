@@ -10,6 +10,7 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
     case escape
     case tab
     case enter
+    case backspace
     case arrowLeft
     case arrowUp
     case arrowDown
@@ -22,6 +23,7 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
         case .escape: return "Esc"
         case .tab: return "Tab"
         case .enter: return "Enter"
+        case .backspace: return "Bksp"
         case .arrowLeft: return "←"
         case .arrowUp: return "↑"
         case .arrowDown: return "↓"
@@ -37,6 +39,8 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
             return KeyboardStroke(key: "Tab", code: "Tab", keyCode: 9)
         case .enter:
             return KeyboardStroke(key: "Enter", code: "Enter", keyCode: 13)
+        case .backspace:
+            return KeyboardStroke(key: "Backspace", code: "Backspace", keyCode: 8)
         case .arrowLeft:
             return KeyboardStroke(key: "ArrowLeft", code: "ArrowLeft", keyCode: 37)
         case .arrowUp:
@@ -53,12 +57,17 @@ struct SpecialKeyBar: View {
     @Binding var controlLocked: Bool
     @Binding var shiftLocked: Bool
 
+    let onKeyboard: () -> Void
     let onKey: (CodeServerKey) -> Void
     let onModifiersChanged: (_ control: Bool, _ shift: Bool) -> Void
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                keyButton(label: "KB", accessibilityLabel: "Force show keyboard") {
+                    onKeyboard()
+                }
+
                 modifierButton(label: "Ctrl", isLocked: controlLocked) {
                     controlLocked.toggle()
                     onModifiersChanged(controlLocked, shiftLocked)
@@ -70,24 +79,32 @@ struct SpecialKeyBar: View {
                 }
 
                 ForEach(CodeServerKey.allCases) { key in
-                    Button {
+                    keyButton(label: key.label, accessibilityLabel: key.label) {
                         onKey(key)
-                    } label: {
-                        Text(key.label)
-                            .font(.system(.subheadline, design: .monospaced).weight(.semibold))
-                            .frame(minWidth: 44, minHeight: 36)
-                            .padding(.horizontal, 5)
-                            .background(Color(uiColor: .tertiarySystemFill))
-                            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(key.label)
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
         }
         .background(Color(uiColor: .secondarySystemBackground))
+    }
+
+    private func keyButton(
+        label: String,
+        accessibilityLabel: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(.subheadline, design: .monospaced).weight(.semibold))
+                .frame(minWidth: label == "Enter" ? 58 : 44, minHeight: 36)
+                .padding(.horizontal, 5)
+                .background(Color(uiColor: .tertiarySystemFill))
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private func modifierButton(
