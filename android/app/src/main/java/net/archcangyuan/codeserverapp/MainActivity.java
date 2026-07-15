@@ -49,7 +49,7 @@ public final class MainActivity extends Activity {
     private static final String PREFERENCES = "code_server_app";
     private static final String ADDRESS_KEY = "server_address";
     private static final String PROJECTS_KEY = "saved_projects";
-    private static final String ZOOM_PERCENT_KEY = "zoom_percent";
+    private static final String LEGACY_NATIVE_ZOOM_PERCENT_KEY = "zoom_percent";
     private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
     private static final long PROJECT_SESSION_TTL_MS = 30L * 60L * 1_000L;
     private static final int MAX_HOT_PROJECT_SESSIONS = 6;
@@ -175,6 +175,7 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
+        preferences.edit().remove(LEGACY_NATIVE_ZOOM_PERCENT_KEY).apply();
         loadProjects();
         setContentView(createContentView());
         configureSystemUi();
@@ -430,10 +431,7 @@ public final class MainActivity extends Activity {
         settings.setBuiltInZoomControls(true);
         settings.setDisplayZoomControls(false);
         settings.setTextZoom(90);
-        int savedZoomPercent = preferences.getInt(ZOOM_PERCENT_KEY, 0);
-        target.setInitialScale(
-            savedZoomPercent > 0 ? savedZoomPercent : calculateDesktopScale()
-        );
+        target.setInitialScale(calculateDesktopScale());
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
@@ -453,14 +451,6 @@ public final class MainActivity extends Activity {
                 installKeyboardBridge(view);
             }
 
-            @Override
-            public void onScaleChanged(WebView view, float oldScale, float newScale) {
-                super.onScaleChanged(view, oldScale, newScale);
-                int zoomPercent = Math.round(newScale * 100f);
-                if (zoomPercent > 0) {
-                    preferences.edit().putInt(ZOOM_PERCENT_KEY, zoomPercent).apply();
-                }
-            }
         });
     }
 
@@ -492,11 +482,43 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        if (direction > 0) {
-            webView.zoomIn();
-        } else {
-            webView.zoomOut();
-        }
+        String key = direction > 0 ? "=" : "-";
+        String code = direction > 0 ? "Equal" : "Minus";
+        int keyCode = direction > 0 ? 187 : 189;
+        String script = String.format(Locale.US, """
+            (() => {
+              const target = document.activeElement || document.body;
+              if (!target) return false;
+              const dispatch = (type) => {
+                const event = new KeyboardEvent(type, {
+                  key: %s,
+                  code: %s,
+                  ctrlKey: true,
+                  shiftKey: false,
+                  altKey: false,
+                  metaKey: false,
+                  bubbles: true,
+                  cancelable: true,
+                  composed: true
+                });
+                try {
+                  Object.defineProperty(event, 'keyCode', { get: () => %d });
+                  Object.defineProperty(event, 'which', { get: () => %d });
+                } catch (_) {}
+                target.dispatchEvent(event);
+              };
+              dispatch('keydown');
+              dispatch('keyup');
+              return true;
+            })();
+            """,
+            JSONObject.quote(key),
+            JSONObject.quote(code),
+            keyCode,
+            keyCode
+        );
+        webView.evaluateJavascript(script, null);
+        webView.requestFocus();
     }
 
     private void switchToProjectUrl(String address) {
