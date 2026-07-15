@@ -10,8 +10,6 @@ import android.graphics.Color;
 import android.graphics.Insets;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -42,7 +40,6 @@ public final class MainActivity extends Activity {
     private static final String PREFERENCES = "code_server_app";
     private static final String ADDRESS_KEY = "server_address";
     private static final String PROJECTS_KEY = "saved_projects";
-    private static final long TOOLBAR_HIDE_DELAY_MS = 4_000L;
     private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
     private static final int ACCENT = Color.rgb(103, 80, 164);
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
@@ -147,7 +144,6 @@ public final class MainActivity extends Activity {
         """;
 
     private SharedPreferences preferences;
-    private final Handler toolbarHandler = new Handler(Looper.getMainLooper());
     private final List<ProjectProfile> projects = new ArrayList<>();
     private LinearLayout rootContainer;
     private LinearLayout addressBar;
@@ -159,16 +155,6 @@ public final class MainActivity extends Activity {
     private boolean controlLocked;
     private boolean shiftLocked;
     private boolean fullscreen;
-    private final Runnable hideAddressBarRunnable = () -> {
-        if (!fullscreen || addressBar == null) {
-            return;
-        }
-        if (addressField != null && addressField.hasFocus()) {
-            scheduleAddressBarHide();
-            return;
-        }
-        addressBar.setVisibility(View.GONE);
-    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -369,7 +355,6 @@ public final class MainActivity extends Activity {
             if (fullscreen) {
                 hideAddressBar();
             } else {
-                toolbarHandler.removeCallbacks(hideAddressBarRunnable);
                 addressBar.setVisibility(View.VISIBLE);
             }
         }
@@ -464,21 +449,7 @@ public final class MainActivity extends Activity {
         return Math.max(20, Math.min(60, scale));
     }
 
-    private void showAddressBarTemporarily() {
-        if (addressBar == null) {
-            return;
-        }
-        addressBar.setVisibility(View.VISIBLE);
-        scheduleAddressBarHide();
-    }
-
-    private void scheduleAddressBarHide() {
-        toolbarHandler.removeCallbacks(hideAddressBarRunnable);
-        toolbarHandler.postDelayed(hideAddressBarRunnable, TOOLBAR_HIDE_DELAY_MS);
-    }
-
     private void hideAddressBar() {
-        toolbarHandler.removeCallbacks(hideAddressBarRunnable);
         if (addressBar != null) {
             addressBar.setVisibility(View.GONE);
         }
@@ -754,7 +725,6 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        toolbarHandler.removeCallbacks(hideAddressBarRunnable);
         if (webView != null) {
             webView.destroy();
         }
@@ -784,7 +754,8 @@ public final class MainActivity extends Activity {
                     if (trackingEdgePull) {
                         if (event.getY() - edgePullStartY >= dp(48)) {
                             trackingEdgePull = false;
-                            showAddressBarTemporarily();
+                            fullscreen = false;
+                            applyFullscreenState();
                         }
                         return true;
                     }

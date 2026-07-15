@@ -11,7 +11,7 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Lockable `Ctrl` and `Shift` modifiers for combinations entered with the
   on-screen keyboard, a hardware keyboard, or the supplemental keys
 - Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
-- Android safe-area handling with an optional immersive fullscreen toggle
+- Android safe-area handling with an optional immersive fullscreen toggle; pull down from the top edge to exit fullscreen
 - Android desktop-site mode, pinch zoom, and an IME-aware supplemental key bar
 - Saved Android project profiles for quickly switching between folder/workspace URLs
 - GitHub Actions workflows that produce a TrollStore-ready IPA and an Android APK
