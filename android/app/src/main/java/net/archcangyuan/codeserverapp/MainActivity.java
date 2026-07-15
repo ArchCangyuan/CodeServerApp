@@ -45,6 +45,7 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
@@ -817,6 +818,12 @@ public final class MainActivity extends Activity {
             }
 
             @Override
+            public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
+                super.doUpdateVisitedHistory(view, url, isReload);
+                updateAddressFromWebView(view, url);
+            }
+
+            @Override
             public void onPageCommitVisible(WebView view, String url) {
                 super.onPageCommitVisible(view, url);
                 installKeyboardBridge(view, false, false);
@@ -826,6 +833,7 @@ public final class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 lastFinishedUrls.put(view, url);
+                updateAddressFromWebView(view, url);
                 boolean completedZoomReload = zoomReloadInProgress.remove(view);
                 installKeyboardBridge(view, true, !completedZoomReload);
             }
@@ -962,23 +970,59 @@ public final class MainActivity extends Activity {
         long now = SystemClock.elapsedRealtime();
         cleanupExpiredProjectSessions(now);
 
-        ProjectSession targetSession = projectSessions.get(normalized);
+        Map.Entry<String, ProjectSession> existingEntry = findProjectSession(normalized);
+        ProjectSession targetSession = existingEntry == null ? null : existingEntry.getValue();
+        String targetSessionKey = existingEntry == null ? normalized : existingEntry.getKey();
         boolean created = targetSession == null;
         if (created) {
             targetSession = new ProjectSession(createProjectWebView());
             projectSessions.put(normalized, targetSession);
+            targetSessionKey = normalized;
         }
 
-        activateProjectSession(normalized, targetSession, now);
+        activateProjectSession(targetSessionKey, targetSession, now);
         if (created) {
             targetSession.webView.loadUrl(normalized);
         }
         evictExcessProjectSessions();
 
-        addressField.setText(normalized);
-        preferences.edit().putString(ADDRESS_KEY, normalized).apply();
+        String currentUrl = targetSession.webView.getUrl();
+        String displayedAddress = currentUrl == null || currentUrl.trim().isEmpty()
+            ? normalized
+            : currentUrl;
+        addressField.setText(displayedAddress);
+        preferences.edit().putString(ADDRESS_KEY, displayedAddress).apply();
         addressField.clearFocus();
         targetSession.webView.requestFocus();
+    }
+
+    private Map.Entry<String, ProjectSession> findProjectSession(String address) {
+        String normalized = normalizeAddress(address);
+        ProjectSession exact = projectSessions.get(normalized);
+        if (exact != null) {
+            return new AbstractMap.SimpleImmutableEntry<>(normalized, exact);
+        }
+        for (Map.Entry<String, ProjectSession> entry : projectSessions.entrySet()) {
+            String currentUrl = entry.getValue().webView.getUrl();
+            if (currentUrl != null && normalizeAddress(currentUrl).equals(normalized)) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    private void updateAddressFromWebView(WebView source, String url) {
+        if (source != webView || url == null) {
+            return;
+        }
+        String normalized = normalizeAddress(url);
+        if (!normalized.startsWith("http://") && !normalized.startsWith("https://")) {
+            return;
+        }
+        if (addressField != null && !addressField.hasFocus()) {
+            addressField.setText(normalized);
+        }
+        preferences.edit().putString(ADDRESS_KEY, normalized).apply();
     }
 
     private void activateProjectSession(
@@ -1058,12 +1102,12 @@ public final class MainActivity extends Activity {
     }
 
     private boolean isProjectSessionHot(String address, long now) {
-        String normalized = normalizeAddress(address);
-        ProjectSession session = projectSessions.get(normalized);
-        if (session == null) {
+        Map.Entry<String, ProjectSession> entry = findProjectSession(address);
+        if (entry == null) {
             return false;
         }
-        return normalized.equals(activeSessionKey)
+        ProjectSession session = entry.getValue();
+        return entry.getKey().equals(activeSessionKey)
             || (session.lastInactiveAt > 0L
                 && now - session.lastInactiveAt < PROJECT_SESSION_TTL_MS);
     }

@@ -302,6 +302,7 @@ private let keyboardBridgeSource = #"""
 final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDelegate {
     @Published private(set) var zoomPercent: Int
     @Published private(set) var statusMessage: String?
+    @Published private(set) var currentPageAddress = ""
 
     private final class ProjectSession {
         let key: String
@@ -310,6 +311,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         var lastFinishedURL: String?
         var appliedZoomSteps: Int?
         var zoomReloadInProgress = false
+        var urlObservation: NSKeyValueObservation?
 
         init(key: String, webView: WKWebView) {
             self.key = key
@@ -374,28 +376,30 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
 
         let target: ProjectSession
         let created: Bool
-        if let existing = sessions[normalized] {
+        if let existing = session(matching: normalized) {
             target = existing
             created = false
         } else {
             let webView = makeWebView()
             target = ProjectSession(key: normalized, webView: webView)
             sessions[normalized] = target
+            observeURLChanges(for: target)
             hostView.install(webView)
             created = true
         }
 
         if let activeSessionKey,
-           activeSessionKey != normalized,
+           activeSessionKey != target.key,
            let current = sessions[activeSessionKey] {
             current.lastInactiveAt = now
             current.webView.isHidden = true
         }
 
-        activeSessionKey = normalized
+        activeSessionKey = target.key
         target.lastInactiveAt = nil
         target.webView.isHidden = false
         hostView.bringWebViewToFront(target.webView)
+        publishAddress(for: target, fallback: normalized)
 
         if created, let url = URL(string: normalized) {
             target.webView.load(URLRequest(url: url))
@@ -431,8 +435,8 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         let normalized = Self.normalizedAddress(address)
         let now = Date.timeIntervalSinceReferenceDate
         cleanupExpiredSessions(now: now)
-        guard let session = sessions[normalized] else { return false }
-        if normalized == activeSessionKey { return true }
+        guard let session = session(matching: normalized) else { return false }
+        if session.key == activeSessionKey { return true }
         guard let inactiveAt = session.lastInactiveAt else { return false }
         return now - inactiveAt < projectSessionTTL
     }
@@ -489,6 +493,41 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
     private var activeSession: ProjectSession? {
         guard let activeSessionKey else { return nil }
         return sessions[activeSessionKey]
+    }
+
+    private func session(matching normalizedAddress: String) -> ProjectSession? {
+        if let exact = sessions[normalizedAddress] {
+            return exact
+        }
+        return sessions.values.first { session in
+            guard let currentURL = session.webView.url?.absoluteString else { return false }
+            return Self.normalizedAddress(currentURL) == normalizedAddress
+        }
+    }
+
+    private func observeURLChanges(for session: ProjectSession) {
+        session.urlObservation = session.webView.observe(\.url, options: [.initial, .new]) {
+            [weak self, weak session] webView, _ in
+            let address = webView.url?.absoluteString ?? ""
+            Task { @MainActor [weak self, weak session] in
+                guard let self,
+                      let session,
+                      self.sessions[session.key] === session else { return }
+                self.publishAddress(for: session, fallback: address)
+            }
+        }
+    }
+
+    private func publishAddress(for session: ProjectSession, fallback: String = "") {
+        guard session.key == activeSessionKey else { return }
+        let address = session.webView.url?.absoluteString ?? fallback
+        let normalized = Self.normalizedAddress(address)
+        guard normalized.hasPrefix("http://") || normalized.hasPrefix("https://") else {
+            return
+        }
+        if currentPageAddress != normalized {
+            currentPageAddress = normalized
+        }
     }
 
     private func makeWebView() -> WKWebView {
@@ -593,6 +632,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
 
     private func destroySession(key: String) {
         guard let session = sessions.removeValue(forKey: key) else { return }
+        session.urlObservation = nil
         session.webView.stopLoading()
         session.webView.navigationDelegate = nil
         session.webView.removeFromSuperview()
@@ -634,6 +674,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
             return
         }
         session.lastFinishedURL = webView.url?.absoluteString
+        publishAddress(for: session)
         let completedZoomReload = session.zoomReloadInProgress
         session.zoomReloadInProgress = false
         let needsReload = !completedZoomReload

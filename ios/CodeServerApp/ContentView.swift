@@ -25,11 +25,13 @@ struct ContentView: View {
     @AppStorage("codeServerURL") private var serverURL = ""
     @StateObject private var webViewStore = CodeServerWebViewStore()
     @State private var draftAddress = ""
+    @State private var activeSessionAddress = ""
     @State private var savedProjects = ProjectProfile.loadSaved()
     @State private var isShowingProjects = false
     @State private var controlLocked = false
     @State private var shiftLocked = false
     @State private var isFullscreen = false
+    @FocusState private var addressFieldFocused: Bool
 
     var body: some View {
         Group {
@@ -44,9 +46,21 @@ struct ContentView: View {
             if draftAddress.isEmpty {
                 draftAddress = serverURL
             }
+            if activeSessionAddress.isEmpty {
+                activeSessionAddress = serverURL
+            }
         }
         .onChange(of: serverURL) { newAddress in
-            draftAddress = newAddress
+            if !addressFieldFocused {
+                draftAddress = newAddress
+            }
+        }
+        .onChange(of: webViewStore.currentPageAddress) { newAddress in
+            guard !newAddress.isEmpty else { return }
+            serverURL = newAddress
+            if !addressFieldFocused {
+                draftAddress = newAddress
+            }
         }
     }
 
@@ -67,6 +81,7 @@ struct ContentView: View {
             }
 
             TextField("http://192.168.1.10:8080", text: $draftAddress)
+                .focused($addressFieldFocused)
                 .keyboardType(.URL)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled(true)
@@ -87,7 +102,10 @@ struct ContentView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
 
-            CodeServerWebView(address: serverURL, store: webViewStore)
+            CodeServerWebView(
+                address: activeSessionAddress.isEmpty ? serverURL : activeSessionAddress,
+                store: webViewStore
+            )
 
             SpecialKeyBar(
                 controlLocked: $controlLocked,
@@ -143,6 +161,7 @@ struct ContentView: View {
             }
 
             TextField("http://192.168.1.10:8080", text: $draftAddress)
+                .focused($addressFieldFocused)
                 .font(.system(.caption, design: .monospaced))
                 .keyboardType(.URL)
                 .textInputAutocapitalization(.never)
@@ -218,12 +237,14 @@ struct ContentView: View {
         let normalized = CodeServerWebViewStore.normalizedAddress(draftAddress)
         guard !normalized.isEmpty else { return }
         draftAddress = normalized
+        activeSessionAddress = normalized
         serverURL = normalized
         webViewStore.activate(address: normalized)
     }
 
     private func openProject(_ project: ProjectProfile) {
         draftAddress = project.url
+        activeSessionAddress = project.url
         serverURL = project.url
         webViewStore.activate(address: project.url)
         isShowingProjects = false
