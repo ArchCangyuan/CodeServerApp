@@ -13,7 +13,9 @@ import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.text.Editable;
 import android.text.SpannableString;
+import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.InputType;
 import android.text.style.StyleSpan;
@@ -1398,6 +1400,7 @@ public final class MainActivity extends Activity {
             KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD);
         private boolean forcedImeEnabled;
         private boolean imeVisible;
+        private boolean imeInputConfirmed;
         private long forcedImeRequestedAt;
 
         RdpInputWebView(Context context) {
@@ -1406,6 +1409,7 @@ public final class MainActivity extends Activity {
 
         void showForcedIme() {
             forcedImeEnabled = true;
+            imeInputConfirmed = false;
             forcedImeRequestedAt = SystemClock.elapsedRealtime();
             requestFocus();
             InputMethodManager inputMethodManager =
@@ -1467,8 +1471,24 @@ public final class MainActivity extends Activity {
             return super.onTouchEvent(event);
         }
 
-        private boolean dispatchImeKeyEvent(KeyEvent event) {
-            return super.dispatchKeyEvent(event);
+        private void confirmImeInput() {
+            if (imeInputConfirmed) {
+                return;
+            }
+            imeInputConfirmed = true;
+            Toast.makeText(
+                MainActivity.this,
+                "IME connected",
+                Toast.LENGTH_SHORT
+            ).show();
+        }
+
+        private void dispatchImeKeyEvent(KeyEvent event) {
+            KeyEvent copiedEvent = new KeyEvent(event);
+            post(() -> {
+                confirmImeInput();
+                RdpInputWebView.this.dispatchKeyEvent(copiedEvent);
+            });
         }
 
         private void dispatchNativeKey(int keyCode) {
@@ -1506,21 +1526,93 @@ public final class MainActivity extends Activity {
                     String script = "window.__codeServerAppKeyboard"
                         + " ? window.__codeServerAppKeyboard.sendText("
                         + JSONObject.quote(character) + ") : false";
-                    evaluateJavascript(script, null);
+                    post(() -> {
+                        confirmImeInput();
+                        evaluateJavascript(script, null);
+                    });
                 }
                 offset += Character.charCount(codePoint);
             }
         }
 
         private final class ForcedImeInputConnection extends BaseInputConnection {
+            private final Editable editable = new SpannableStringBuilder();
+            private String mirroredComposition = "";
+
             ForcedImeInputConnection(View targetView) {
-                super(targetView, false);
+                super(targetView, true);
+            }
+
+            @Override
+            public Editable getEditable() {
+                return editable;
+            }
+
+            private int commonPrefixLength(String left, String right) {
+                int offset = 0;
+                int limit = Math.min(left.length(), right.length());
+                while (offset < limit) {
+                    int leftCodePoint = left.codePointAt(offset);
+                    int rightCodePoint = right.codePointAt(offset);
+                    if (leftCodePoint != rightCodePoint) {
+                        break;
+                    }
+                    offset += Character.charCount(leftCodePoint);
+                }
+                return offset;
+            }
+
+            private void syncComposingText(String nextText) {
+                int commonLength = commonPrefixLength(mirroredComposition, nextText);
+                int deleteCount = mirroredComposition.codePointCount(
+                    commonLength,
+                    mirroredComposition.length()
+                );
+                for (int index = 0; index < deleteCount; index += 1) {
+                    dispatchNativeKey(KeyEvent.KEYCODE_DEL);
+                }
+                if (commonLength < nextText.length()) {
+                    dispatchCommittedText(nextText.substring(commonLength));
+                }
+                mirroredComposition = nextText;
+            }
+
+            private void trimMirroredComposition(int count) {
+                for (int index = 0;
+                    index < count && !mirroredComposition.isEmpty();
+                    index += 1) {
+                    int end = mirroredComposition.offsetByCodePoints(
+                        mirroredComposition.length(),
+                        -1
+                    );
+                    mirroredComposition = mirroredComposition.substring(0, end);
+                }
+            }
+
+            @Override
+            public boolean setComposingText(CharSequence text, int newCursorPosition) {
+                super.setComposingText(text, newCursorPosition);
+                syncComposingText(text == null ? "" : text.toString());
+                return true;
             }
 
             @Override
             public boolean commitText(CharSequence text, int newCursorPosition) {
                 super.commitText(text, newCursorPosition);
-                dispatchCommittedText(text);
+                String committed = text == null ? "" : text.toString();
+                if (mirroredComposition.isEmpty()) {
+                    dispatchCommittedText(committed);
+                } else {
+                    syncComposingText(committed);
+                    mirroredComposition = "";
+                }
+                return true;
+            }
+
+            @Override
+            public boolean finishComposingText() {
+                super.finishComposingText();
+                mirroredComposition = "";
                 return true;
             }
 
@@ -1528,9 +1620,14 @@ public final class MainActivity extends Activity {
             public boolean deleteSurroundingText(int beforeLength, int afterLength) {
                 super.deleteSurroundingText(beforeLength, afterLength);
                 if (beforeLength > 0) {
-                    dispatchNativeKey(KeyEvent.KEYCODE_DEL);
+                    for (int index = 0; index < beforeLength; index += 1) {
+                        dispatchNativeKey(KeyEvent.KEYCODE_DEL);
+                    }
+                    trimMirroredComposition(beforeLength);
                 } else if (afterLength > 0) {
-                    dispatchNativeKey(KeyEvent.KEYCODE_FORWARD_DEL);
+                    for (int index = 0; index < afterLength; index += 1) {
+                        dispatchNativeKey(KeyEvent.KEYCODE_FORWARD_DEL);
+                    }
                 }
                 return true;
             }
@@ -1542,16 +1639,22 @@ public final class MainActivity extends Activity {
             ) {
                 super.deleteSurroundingTextInCodePoints(beforeLength, afterLength);
                 if (beforeLength > 0) {
-                    dispatchNativeKey(KeyEvent.KEYCODE_DEL);
+                    for (int index = 0; index < beforeLength; index += 1) {
+                        dispatchNativeKey(KeyEvent.KEYCODE_DEL);
+                    }
+                    trimMirroredComposition(beforeLength);
                 } else if (afterLength > 0) {
-                    dispatchNativeKey(KeyEvent.KEYCODE_FORWARD_DEL);
+                    for (int index = 0; index < afterLength; index += 1) {
+                        dispatchNativeKey(KeyEvent.KEYCODE_FORWARD_DEL);
+                    }
                 }
                 return true;
             }
 
             @Override
             public boolean sendKeyEvent(KeyEvent event) {
-                return dispatchImeKeyEvent(event);
+                dispatchImeKeyEvent(event);
+                return true;
             }
 
             @Override
