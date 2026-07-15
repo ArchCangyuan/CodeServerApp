@@ -40,6 +40,7 @@ public final class MainActivity extends Activity {
     private static final String PREFERENCES = "code_server_app";
     private static final String ADDRESS_KEY = "server_address";
     private static final String PROJECTS_KEY = "saved_projects";
+    private static final String ZOOM_PERCENT_KEY = "zoom_percent";
     private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
     private static final int ACCENT = Color.rgb(103, 80, 164);
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
@@ -225,6 +226,16 @@ public final class MainActivity extends Activity {
         reloadButton.setOnClickListener(view -> webView.reload());
         addressBar.addView(reloadButton);
 
+        Button zoomOutButton = createToolbarButton("−");
+        zoomOutButton.setContentDescription("Zoom out");
+        zoomOutButton.setOnClickListener(view -> changeZoom(-1));
+        addressBar.addView(zoomOutButton);
+
+        Button zoomInButton = createToolbarButton("+");
+        zoomInButton.setContentDescription("Zoom in");
+        zoomInButton.setOnClickListener(view -> changeZoom(1));
+        addressBar.addView(zoomInButton);
+
         fullscreenButton = createToolbarButton("⛶");
         fullscreenButton.setContentDescription("Enter fullscreen");
         fullscreenButton.setOnClickListener(view -> toggleFullscreen());
@@ -407,7 +418,10 @@ public final class MainActivity extends Activity {
         settings.setBuiltInZoomControls(true);
         settings.setDisplayZoomControls(false);
         settings.setTextZoom(90);
-        webView.setInitialScale(calculateDesktopScale());
+        int savedZoomPercent = preferences.getInt(ZOOM_PERCENT_KEY, 0);
+        webView.setInitialScale(
+            savedZoomPercent > 0 ? savedZoomPercent : calculateDesktopScale()
+        );
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
@@ -426,7 +440,28 @@ public final class MainActivity extends Activity {
                 super.onPageFinished(view, url);
                 installKeyboardBridge();
             }
+
+            @Override
+            public void onScaleChanged(WebView view, float oldScale, float newScale) {
+                super.onScaleChanged(view, oldScale, newScale);
+                int zoomPercent = Math.round(newScale * 100f);
+                if (zoomPercent > 0) {
+                    preferences.edit().putInt(ZOOM_PERCENT_KEY, zoomPercent).apply();
+                }
+            }
         });
+    }
+
+    private void changeZoom(int direction) {
+        if (webView == null || direction == 0) {
+            return;
+        }
+
+        if (direction > 0) {
+            webView.zoomIn();
+        } else {
+            webView.zoomOut();
+        }
     }
 
     private void loadEnteredAddress() {
