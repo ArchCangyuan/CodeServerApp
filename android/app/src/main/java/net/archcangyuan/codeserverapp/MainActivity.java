@@ -6,11 +6,15 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.Insets;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.inputmethod.EditorInfo;
 import android.webkit.CookieManager;
 import android.webkit.WebChromeClient;
@@ -118,18 +122,22 @@ public final class MainActivity extends Activity {
         """;
 
     private SharedPreferences preferences;
+    private LinearLayout rootContainer;
     private EditText addressField;
     private WebView webView;
     private Button controlButton;
     private Button shiftButton;
+    private Button fullscreenButton;
     private boolean controlLocked;
     private boolean shiftLocked;
+    private boolean fullscreen;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
         setContentView(createContentView());
+        configureSystemUi();
         configureWebView();
 
         String savedAddress = preferences.getString(ADDRESS_KEY, "");
@@ -143,8 +151,13 @@ public final class MainActivity extends Activity {
 
     private View createContentView() {
         LinearLayout root = new LinearLayout(this);
+        rootContainer = root;
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.WHITE);
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            applySafeAreaInsets(view, insets);
+            return insets;
+        });
 
         LinearLayout addressBar = new LinearLayout(this);
         addressBar.setOrientation(LinearLayout.HORIZONTAL);
@@ -181,6 +194,11 @@ public final class MainActivity extends Activity {
         reloadButton.setContentDescription("Reload code-server");
         reloadButton.setOnClickListener(view -> webView.reload());
         addressBar.addView(reloadButton);
+
+        fullscreenButton = createToolbarButton("⛶");
+        fullscreenButton.setContentDescription("Enter fullscreen");
+        fullscreenButton.setOnClickListener(view -> toggleFullscreen());
+        addressBar.addView(fullscreenButton);
 
         root.addView(
             addressBar,
@@ -247,6 +265,82 @@ public final class MainActivity extends Activity {
 
         updateModifierButtons();
         return root;
+    }
+
+    private void configureSystemUi() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            getWindow().setDecorFitsSystemWindows(false);
+        }
+        applyFullscreenState();
+    }
+
+    private void toggleFullscreen() {
+        fullscreen = !fullscreen;
+        applyFullscreenState();
+    }
+
+    private void applyFullscreenState() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                if (fullscreen) {
+                    controller.hide(WindowInsets.Type.systemBars());
+                    controller.setSystemBarsBehavior(
+                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    );
+                } else {
+                    controller.show(WindowInsets.Type.systemBars());
+                }
+            }
+        } else {
+            int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
+            if (fullscreen) {
+                flags |= View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
+            }
+            getWindow().getDecorView().setSystemUiVisibility(flags);
+        }
+
+        if (fullscreenButton != null) {
+            fullscreenButton.setContentDescription(
+                fullscreen ? "Exit fullscreen" : "Enter fullscreen"
+            );
+            fullscreenButton.setTextColor(fullscreen ? Color.WHITE : Color.BLACK);
+            fullscreenButton.setBackgroundTintList(
+                ColorStateList.valueOf(fullscreen ? ACCENT : KEY_BACKGROUND)
+            );
+        }
+
+        if (rootContainer != null) {
+            if (fullscreen) {
+                rootContainer.setPadding(0, 0, 0, 0);
+            }
+            rootContainer.requestApplyInsets();
+        }
+    }
+
+    private void applySafeAreaInsets(View view, WindowInsets insets) {
+        if (fullscreen) {
+            view.setPadding(0, 0, 0, 0);
+            return;
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Insets safeArea = insets.getInsets(
+                WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()
+            );
+            view.setPadding(safeArea.left, safeArea.top, safeArea.right, safeArea.bottom);
+        } else {
+            view.setPadding(
+                insets.getSystemWindowInsetLeft(),
+                insets.getSystemWindowInsetTop(),
+                insets.getSystemWindowInsetRight(),
+                insets.getSystemWindowInsetBottom()
+            );
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
