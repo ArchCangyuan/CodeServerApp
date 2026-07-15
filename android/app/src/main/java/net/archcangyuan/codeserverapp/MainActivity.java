@@ -51,6 +51,7 @@ public final class MainActivity extends Activity {
     private static final String PROJECTS_KEY = "saved_projects";
     private static final String LEGACY_NATIVE_ZOOM_PERCENT_KEY = "zoom_percent";
     private static final String LAYOUT_ZOOM_STEPS_KEY = "layout_zoom_steps";
+    private static final String CSS_LAYOUT_ZOOM_MIGRATED_KEY = "css_layout_zoom_migrated";
     private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
     private static final int MIN_LAYOUT_ZOOM_STEPS = -6;
     private static final int MAX_LAYOUT_ZOOM_STEPS = 6;
@@ -65,10 +66,7 @@ public final class MainActivity extends Activity {
 
     private static final String KEYBOARD_BRIDGE = """
         (() => {
-          const setViewportWidth = (requestedWidth) => {
-            const numericWidth = Number(requestedWidth) || 1280;
-            const width = Math.max(640, Math.min(2400, Math.round(numericWidth)));
-            const previousWidth = Number(window.__codeServerAppViewportWidth) || 1280;
+          const ensureDesktopViewport = () => {
             let viewport = document.querySelector('meta[name="viewport"]');
             if (!viewport) {
               viewport = document.createElement('meta');
@@ -77,15 +75,22 @@ public final class MainActivity extends Activity {
             }
             viewport.setAttribute(
               'content',
-              `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`
+              'width=1280, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes'
             );
-            window.__codeServerAppViewportWidth = width;
-            requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
-            return { previousWidth, width };
           };
 
-          window.__codeServerAppSetViewportWidth = setViewportWidth;
-          setViewportWidth(window.__codeServerAppViewportWidth || 1280);
+          const setLayoutZoom = (requestedZoom) => {
+            const numericZoom = Number(requestedZoom) || 1;
+            const zoom = Math.max(0.5, Math.min(2, numericZoom));
+            ensureDesktopViewport();
+            document.documentElement.style.zoom = String(zoom);
+            window.__codeServerAppLayoutZoom = zoom;
+            requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+            return zoom;
+          };
+
+          window.__codeServerAppSetLayoutZoom = setLayoutZoom;
+          setLayoutZoom(window.__codeServerAppLayoutZoom || 1);
 
           if (window.__codeServerAppKeyboard) return;
 
@@ -192,6 +197,12 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
         preferences.edit().remove(LEGACY_NATIVE_ZOOM_PERCENT_KEY).apply();
+        if (!preferences.getBoolean(CSS_LAYOUT_ZOOM_MIGRATED_KEY, false)) {
+            preferences.edit()
+                .putInt(LAYOUT_ZOOM_STEPS_KEY, 0)
+                .putBoolean(CSS_LAYOUT_ZOOM_MIGRATED_KEY, true)
+                .apply();
+        }
         layoutZoomSteps = Math.max(
             MIN_LAYOUT_ZOOM_STEPS,
             Math.min(
@@ -526,49 +537,29 @@ public final class MainActivity extends Activity {
         );
         Toast.makeText(
             this,
-            "Layout zoom " + zoomPercent + "% · full width",
+            "UI zoom " + zoomPercent + "% - full width",
             Toast.LENGTH_SHORT
         ).show();
-    }
-
-    private int calculateLayoutViewportWidth() {
-        return (int) Math.round(
-            DESKTOP_VIEWPORT_WIDTH / Math.pow(LAYOUT_ZOOM_FACTOR, layoutZoomSteps)
-        );
     }
 
     private void applyLayoutZoom(WebView target) {
         if (target == null) {
             return;
         }
-        int viewportWidth = calculateLayoutViewportWidth();
+        double zoom = Math.pow(LAYOUT_ZOOM_FACTOR, layoutZoomSteps);
         String script = "(() => {"
-            + "if(window.__codeServerAppSetViewportWidth){"
-            + "return window.__codeServerAppSetViewportWidth(" + viewportWidth + ");}"
-            + "window.__codeServerAppViewportWidth=" + viewportWidth + ";"
-            + "return {previousWidth:" + viewportWidth + ",width:" + viewportWidth + "};"
+            + "const zoom=" + String.format(Locale.US, "%.6f", zoom) + ";"
+            + "window.__codeServerAppLayoutZoom=zoom;"
+            + "if(window.__codeServerAppSetLayoutZoom){"
+            + "return window.__codeServerAppSetLayoutZoom(zoom);}"
+            + "document.documentElement.style.zoom=String(zoom);"
+            + "window.dispatchEvent(new Event('resize'));"
+            + "return zoom;"
             + "})()";
         target.evaluateJavascript(script, value -> {
-            applyZoomInCompensation(target, value);
             target.requestLayout();
             target.invalidate();
         });
-    }
-
-    private void applyZoomInCompensation(WebView target, String viewportResult) {
-        try {
-            JSONObject result = new JSONObject(viewportResult);
-            int previousWidth = result.optInt("previousWidth", 0);
-            int width = result.optInt("width", 0);
-            if (previousWidth <= 0 || width <= 0 || width >= previousWidth) {
-                return;
-            }
-
-            float zoomFactor = (float) previousWidth / (float) width;
-            target.post(() -> target.zoomBy(zoomFactor));
-        } catch (Exception ignored) {
-            // The bridge may not be installed yet while a new page is committing.
-        }
     }
 
     private void switchToProjectUrl(String address) {
