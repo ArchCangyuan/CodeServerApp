@@ -78,7 +78,7 @@ private let keyboardBridgeSource = #"""
   };
 
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 5) {
+  if (existingBridge && existingBridge.version >= 6) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
     return;
@@ -99,26 +99,7 @@ private let keyboardBridgeSource = #"""
     screenY: touch.screenY
   });
 
-  const dispatchPointer = (canvas, type, point, button, buttons, detail = 1) => {
-    const eventWindow = canvas.ownerDocument?.defaultView || window;
-    canvas.dispatchEvent(new eventWindow.PointerEvent(type, {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      pointerId: 1,
-      pointerType: 'mouse',
-      isPrimary: true,
-      clientX: point.clientX,
-      clientY: point.clientY,
-      screenX: point.screenX,
-      screenY: point.screenY,
-      button,
-      buttons,
-      detail
-    }));
-  };
-
-  const dispatchMouse = (canvas, type, point, button, buttons, detail = 1) => {
+  const dispatchMouse = (canvas, type, point, button, buttons) => {
     const eventWindow = canvas.ownerDocument?.defaultView || window;
     canvas.dispatchEvent(new eventWindow.MouseEvent(type, {
       bubbles: true,
@@ -130,8 +111,7 @@ private let keyboardBridgeSource = #"""
       screenX: point.screenX,
       screenY: point.screenY,
       button,
-      buttons,
-      detail
+      buttons
     }));
   };
 
@@ -141,105 +121,95 @@ private let keyboardBridgeSource = #"""
     state.ironRdpCanvas = canvas;
     if (state.gestureCanvas === canvas) return true;
     state.gestureCanvas = canvas;
-    canvas.style.touchAction = 'none';
+
+    // Preserve WebView panning and IronRDP's native coordinate mapping.
+    canvas.style.touchAction = '';
     canvas.style.webkitTouchCallout = 'none';
 
     let gesture = null;
-    let lastTap = null;
-    let suppressNativeClickUntil = 0;
 
-    const stopNativeTouchPointer = (event) => {
-      if (event.pointerType !== 'touch') return;
+    const releaseGesture = () => {
+      if (gesture?.timer) window.clearTimeout(gesture.timer);
+    };
+
+    const sendButton = (point, button) => {
+      const downButtons = button === 2 ? 2 : 1;
+      dispatchMouse(canvas, 'mousemove', point, 0, 0);
+      dispatchMouse(canvas, 'mousedown', point, button, downButtons);
+      dispatchMouse(canvas, 'mouseup', point, button, 0);
+    };
+
+    canvas.addEventListener('contextmenu', (event) => {
+      if (!gesture) return;
       event.preventDefault();
       event.stopImmediatePropagation();
-    };
-    canvas.addEventListener('pointerdown', stopNativeTouchPointer, true);
-    canvas.addEventListener('pointermove', stopNativeTouchPointer, true);
-    canvas.addEventListener('pointerup', stopNativeTouchPointer, true);
-    canvas.addEventListener('pointercancel', stopNativeTouchPointer, true);
-    canvas.addEventListener('click', (event) => {
-      if (event.isTrusted && performance.now() < suppressNativeClickUntil) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-      }
-    }, true);
-    canvas.addEventListener('contextmenu', (event) => {
-      if (event.isTrusted) event.preventDefault();
     }, true);
 
     canvas.addEventListener('touchstart', (event) => {
       if (event.touches.length !== 1) return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
       const start = pointFromTouch(event.touches[0]);
       gesture = {
         start,
         last: start,
+        armed: false,
         dragging: false,
-        longPressed: false,
+        cancelled: false,
         timer: window.setTimeout(() => {
-          if (!gesture || gesture.dragging) return;
-          gesture.longPressed = true;
-          dispatchPointer(canvas, 'pointerdown', gesture.last, 2, 2);
-          dispatchPointer(canvas, 'pointerup', gesture.last, 2, 0);
-          dispatchMouse(canvas, 'contextmenu', gesture.last, 2, 0);
-          suppressNativeClickUntil = performance.now() + 800;
+          if (gesture && !gesture.cancelled) gesture.armed = true;
         }, 550)
       };
-    }, { capture: true, passive: false });
+    }, { capture: true, passive: true });
 
     canvas.addEventListener('touchmove', (event) => {
       if (!gesture || event.touches.length !== 1) return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
       const point = pointFromTouch(event.touches[0]);
       gesture.last = point;
       const distance = Math.hypot(
         point.clientX - gesture.start.clientX,
         point.clientY - gesture.start.clientY
       );
-      if (!gesture.dragging && !gesture.longPressed && distance >= 7) {
-        window.clearTimeout(gesture.timer);
+
+      if (!gesture.armed) {
+        if (distance >= 7) {
+          releaseGesture();
+          gesture.cancelled = true;
+        }
+        return;
+      }
+
+      if (!gesture.dragging && distance < 7) return;
+
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (!gesture.dragging) {
         gesture.dragging = true;
-        dispatchPointer(canvas, 'pointerdown', gesture.start, 0, 1);
+        dispatchMouse(canvas, 'mousemove', gesture.start, 0, 0);
+        dispatchMouse(canvas, 'mousedown', gesture.start, 0, 1);
       }
-      if (gesture.dragging) {
-        dispatchPointer(canvas, 'pointermove', point, -1, 1);
-      }
+      dispatchMouse(canvas, 'mousemove', point, 0, 1);
     }, { capture: true, passive: false });
 
     const finishGesture = (event, cancelled) => {
       if (!gesture) return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      window.clearTimeout(gesture.timer);
+      releaseGesture();
       const touch = event.changedTouches?.[0];
       const point = touch ? pointFromTouch(touch) : gesture.last;
+
       if (gesture.dragging) {
-        dispatchPointer(canvas, 'pointermove', point, -1, 1);
-        dispatchPointer(canvas, 'pointerup', point, 0, 0);
-      } else if (!gesture.longPressed && !cancelled) {
-        const now = performance.now();
-        const isDouble = lastTap
-          && now - lastTap.at < 350
-          && Math.hypot(
-            point.clientX - lastTap.point.clientX,
-            point.clientY - lastTap.point.clientY
-          ) < 24;
-        const detail = isDouble ? 2 : 1;
-        dispatchPointer(canvas, 'pointerdown', point, 0, 1, detail);
-        dispatchPointer(canvas, 'pointerup', point, 0, 0, detail);
-        dispatchMouse(canvas, 'click', point, 0, 0, detail);
-        if (isDouble) {
-          dispatchMouse(canvas, 'dblclick', point, 0, 0, 2);
-          lastTap = null;
-        } else {
-          lastTap = { at: now, point };
-        }
-        suppressNativeClickUntil = now + 800;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        dispatchMouse(canvas, 'mousemove', point, 0, 1);
+        dispatchMouse(canvas, 'mouseup', point, 0, 0);
+      } else if (gesture.armed && !gesture.cancelled) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        sendButton(point, 2);
+      } else if (cancelled) {
+        gesture.cancelled = true;
       }
       gesture = null;
     };
+
     canvas.addEventListener('touchend', (event) => {
       finishGesture(event, false);
     }, { capture: true, passive: false });
@@ -251,7 +221,6 @@ private let keyboardBridgeSource = #"""
 
   installRdpGestures();
   window.setInterval(installRdpGestures, 1000);
-
   const deepestActiveElement = (rootDocument) => {
     let active = rootDocument.activeElement;
     for (let depth = 0; active && depth < 6; depth += 1) {
@@ -425,7 +394,7 @@ private let keyboardBridgeSource = #"""
   document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
   const bridge = {
-    version: 5,
+    version: 6,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();
@@ -712,6 +681,11 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         )
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
+        disableDoubleTapZoom(in: webView)
+        DispatchQueue.main.async { [weak self, weak webView] in
+            guard let self, let webView else { return }
+            self.disableDoubleTapZoom(in: webView)
+        }
         webView.navigationDelegate = self
         webView.customUserAgent = desktopUserAgent
         webView.allowsBackForwardNavigationGestures = true
@@ -721,6 +695,17 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         webView.isHidden = true
         return webView
+    }
+
+    private func disableDoubleTapZoom(in view: UIView) {
+        for recognizer in view.gestureRecognizers ?? [] {
+            guard let tap = recognizer as? UITapGestureRecognizer,
+                  tap.numberOfTapsRequired == 2 else { continue }
+            tap.isEnabled = false
+        }
+        for subview in view.subviews {
+            disableDoubleTapZoom(in: subview)
+        }
     }
 
     private func syncModifiers(on webView: WKWebView) {
@@ -837,6 +822,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        disableDoubleTapZoom(in: webView)
         guard let session = sessions.values.first(where: { $0.webView === webView }) else {
             return
         }
