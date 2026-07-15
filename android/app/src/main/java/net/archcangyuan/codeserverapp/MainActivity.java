@@ -6,6 +6,7 @@ import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Typeface;
@@ -40,11 +41,14 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.WeakHashMap;
 
 public final class MainActivity extends Activity {
     private static final String PREFERENCES = "code_server_app";
@@ -52,7 +56,8 @@ public final class MainActivity extends Activity {
     private static final String PROJECTS_KEY = "saved_projects";
     private static final String LEGACY_NATIVE_ZOOM_PERCENT_KEY = "zoom_percent";
     private static final String LAYOUT_ZOOM_STEPS_KEY = "layout_zoom_steps";
-    private static final String BODY_LAYOUT_ZOOM_MIGRATED_KEY = "body_layout_zoom_migrated";
+    private static final String VIEWPORT_RELOAD_ZOOM_MIGRATED_KEY =
+        "viewport_reload_zoom_migrated";
     private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
     private static final int MIN_LAYOUT_ZOOM_STEPS = -6;
     private static final int MAX_LAYOUT_ZOOM_STEPS = 6;
@@ -67,7 +72,9 @@ public final class MainActivity extends Activity {
 
     private static final String KEYBOARD_BRIDGE = """
         (() => {
-          const ensureDesktopViewport = () => {
+          const setViewportWidth = (requestedWidth) => {
+            const numericWidth = Number(requestedWidth) || 1280;
+            const width = Math.max(640, Math.min(2400, Math.round(numericWidth)));
             let viewport = document.querySelector('meta[name="viewport"]');
             if (!viewport) {
               viewport = document.createElement('meta');
@@ -76,23 +83,17 @@ public final class MainActivity extends Activity {
             }
             viewport.setAttribute(
               'content',
-              'width=1280, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes'
+              `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`
             );
-          };
-
-          const setLayoutZoom = (requestedZoom) => {
-            const numericZoom = Number(requestedZoom) || 1;
-            const zoom = Math.max(0.5, Math.min(2, numericZoom));
-            ensureDesktopViewport();
             document.documentElement.style.zoom = '1';
             if (document.body) {
-              document.body.style.zoom = String(zoom);
-              document.body.style.width = '100%';
-              document.body.style.minWidth = '0';
+              document.body.style.zoom = '1';
+              document.body.style.width = '';
+              document.body.style.minWidth = '';
             }
-            window.__codeServerAppLayoutZoom = zoom;
+            window.__codeServerAppViewportWidth = width;
             requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
-            return zoom;
+            return width;
           };
 
           const forceKeyboard = () => {
@@ -126,9 +127,9 @@ public final class MainActivity extends Activity {
             return document.activeElement === input;
           };
 
-          window.__codeServerAppSetLayoutZoom = setLayoutZoom;
+          window.__codeServerAppSetViewportWidth = setViewportWidth;
           window.__codeServerAppForceKeyboard = forceKeyboard;
-          setLayoutZoom(window.__codeServerAppLayoutZoom || 1);
+          setViewportWidth(window.__codeServerAppViewportWidth || 1280);
 
           if (window.__codeServerAppKeyboard) return;
 
@@ -216,6 +217,10 @@ public final class MainActivity extends Activity {
     private SharedPreferences preferences;
     private final List<ProjectProfile> projects = new ArrayList<>();
     private final Map<String, ProjectSession> projectSessions = new LinkedHashMap<>();
+    private final Map<WebView, Integer> appliedLayoutZoomSteps = new WeakHashMap<>();
+    private final Map<WebView, String> lastFinishedUrls = new WeakHashMap<>();
+    private final Set<WebView> zoomReloadInProgress =
+        Collections.newSetFromMap(new WeakHashMap<>());
     private LinearLayout rootContainer;
     private LinearLayout addressBar;
     private EditText addressField;
@@ -235,10 +240,10 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
         preferences.edit().remove(LEGACY_NATIVE_ZOOM_PERCENT_KEY).apply();
-        if (!preferences.getBoolean(BODY_LAYOUT_ZOOM_MIGRATED_KEY, false)) {
+        if (!preferences.getBoolean(VIEWPORT_RELOAD_ZOOM_MIGRATED_KEY, false)) {
             preferences.edit()
                 .putInt(LAYOUT_ZOOM_STEPS_KEY, 0)
-                .putBoolean(BODY_LAYOUT_ZOOM_MIGRATED_KEY, true)
+                .putBoolean(VIEWPORT_RELOAD_ZOOM_MIGRATED_KEY, true)
                 .apply();
         }
         layoutZoomSteps = Math.max(
@@ -521,15 +526,27 @@ public final class MainActivity extends Activity {
         target.setWebChromeClient(new WebChromeClient());
         target.setWebViewClient(new WebViewClient() {
             @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                super.onPageStarted(view, url, favicon);
+                String lastFinishedUrl = lastFinishedUrls.get(view);
+                if (!zoomReloadInProgress.contains(view)
+                    && (lastFinishedUrl == null || !lastFinishedUrl.equals(url))) {
+                    appliedLayoutZoomSteps.remove(view);
+                }
+            }
+
+            @Override
             public void onPageCommitVisible(WebView view, String url) {
                 super.onPageCommitVisible(view, url);
-                installKeyboardBridge(view);
+                installKeyboardBridge(view, false, false);
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                installKeyboardBridge(view);
+                lastFinishedUrls.put(view, url);
+                boolean completedZoomReload = zoomReloadInProgress.remove(view);
+                installKeyboardBridge(view, true, !completedZoomReload);
             }
 
         });
@@ -573,37 +590,58 @@ public final class MainActivity extends Activity {
 
         layoutZoomSteps = nextSteps;
         preferences.edit().putInt(LAYOUT_ZOOM_STEPS_KEY, layoutZoomSteps).apply();
-        applyLayoutZoom(webView);
+        applyLayoutZoom(webView, true);
 
         int zoomPercent = (int) Math.round(
             Math.pow(LAYOUT_ZOOM_FACTOR, layoutZoomSteps) * 100.0
         );
         Toast.makeText(
             this,
-            "UI zoom " + zoomPercent + "% - full width",
+            "UI zoom " + zoomPercent + "% - reloading to fit",
             Toast.LENGTH_SHORT
         ).show();
     }
 
-    private void applyLayoutZoom(WebView target) {
+    private int calculateLayoutViewportWidth() {
+        return (int) Math.round(
+            DESKTOP_VIEWPORT_WIDTH / Math.pow(LAYOUT_ZOOM_FACTOR, layoutZoomSteps)
+        );
+    }
+
+    private void applyLayoutZoom(WebView target, boolean reloadAfterApply) {
         if (target == null) {
             return;
         }
-        double zoom = Math.pow(LAYOUT_ZOOM_FACTOR, layoutZoomSteps);
+        int requestedSteps = layoutZoomSteps;
+        int viewportWidth = calculateLayoutViewportWidth();
         String script = "(() => {"
-            + "const zoom=" + String.format(Locale.US, "%.6f", zoom) + ";"
-            + "window.__codeServerAppLayoutZoom=zoom;"
-            + "if(window.__codeServerAppSetLayoutZoom){"
-            + "return window.__codeServerAppSetLayoutZoom(zoom);}"
+            + "const width=" + viewportWidth + ";"
+            + "if(window.__codeServerAppSetViewportWidth){"
+            + "return window.__codeServerAppSetViewportWidth(width);}"
+            + "let viewport=document.querySelector('meta[name=viewport]');"
+            + "if(!viewport){viewport=document.createElement('meta');"
+            + "viewport.name='viewport';"
+            + "(document.head||document.documentElement).appendChild(viewport);}"
+            + "viewport.content='width='+width+','"
+            + "+' minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes';"
             + "document.documentElement.style.zoom='1';"
-            + "if(document.body){document.body.style.zoom=String(zoom);"
-            + "document.body.style.width='100%';document.body.style.minWidth='0';}"
+            + "if(document.body){document.body.style.zoom='1';"
+            + "document.body.style.width='';document.body.style.minWidth='';}"
+            + "window.__codeServerAppViewportWidth=width;"
             + "window.dispatchEvent(new Event('resize'));"
-            + "return zoom;"
+            + "return width;"
             + "})()";
         target.evaluateJavascript(script, value -> {
+            if (requestedSteps != layoutZoomSteps) {
+                return;
+            }
+            appliedLayoutZoomSteps.put(target, requestedSteps);
             target.requestLayout();
             target.invalidate();
+            if (reloadAfterApply && target.getUrl() != null) {
+                zoomReloadInProgress.add(target);
+                target.reload();
+            }
         });
     }
 
@@ -686,7 +724,9 @@ public final class MainActivity extends Activity {
         webView.setVisibility(View.VISIBLE);
         webView.bringToFront();
         webView.onResume();
-        applyLayoutZoom(webView);
+        Integer appliedSteps = appliedLayoutZoomSteps.get(webView);
+        boolean needsReload = appliedSteps != null && appliedSteps != layoutZoomSteps;
+        applyLayoutZoom(webView, needsReload);
         syncModifiers(webView);
     }
 
@@ -742,6 +782,9 @@ public final class MainActivity extends Activity {
     }
 
     private void destroyWebView(WebView target) {
+        appliedLayoutZoomSteps.remove(target);
+        lastFinishedUrls.remove(target);
+        zoomReloadInProgress.remove(target);
         if (webContainer != null) {
             webContainer.removeView(target);
         }
@@ -937,9 +980,19 @@ public final class MainActivity extends Activity {
         return "http://" + trimmed;
     }
 
-    private void installKeyboardBridge(WebView target) {
+    private void installKeyboardBridge(
+        WebView target,
+        boolean applyZoom,
+        boolean allowZoomReload
+    ) {
         target.evaluateJavascript(KEYBOARD_BRIDGE, value -> {
-            applyLayoutZoom(target);
+            if (applyZoom) {
+                Integer appliedSteps = appliedLayoutZoomSteps.get(target);
+                boolean needsReload = allowZoomReload
+                    && ((appliedSteps == null && layoutZoomSteps != 0)
+                        || (appliedSteps != null && appliedSteps != layoutZoomSteps));
+                applyLayoutZoom(target, needsReload);
+            }
             syncModifiers(target);
         });
     }
