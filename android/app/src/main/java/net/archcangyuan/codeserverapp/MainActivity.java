@@ -8,9 +8,14 @@ import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Insets;
+import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
+import android.text.SpannableString;
+import android.text.Spanned;
 import android.text.InputType;
+import android.text.style.StyleSpan;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -25,6 +30,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.Toast;
@@ -33,8 +39,11 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 public final class MainActivity extends Activity {
     private static final String PREFERENCES = "code_server_app";
@@ -42,6 +51,8 @@ public final class MainActivity extends Activity {
     private static final String PROJECTS_KEY = "saved_projects";
     private static final String ZOOM_PERCENT_KEY = "zoom_percent";
     private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
+    private static final long PROJECT_SESSION_TTL_MS = 30L * 60L * 1_000L;
+    private static final int MAX_HOT_PROJECT_SESSIONS = 6;
     private static final int ACCENT = Color.rgb(103, 80, 164);
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
     private static final String DESKTOP_USER_AGENT =
@@ -146,10 +157,13 @@ public final class MainActivity extends Activity {
 
     private SharedPreferences preferences;
     private final List<ProjectProfile> projects = new ArrayList<>();
+    private final Map<String, ProjectSession> projectSessions = new LinkedHashMap<>();
     private LinearLayout rootContainer;
     private LinearLayout addressBar;
     private EditText addressField;
+    private FrameLayout webContainer;
     private WebView webView;
+    private String activeSessionKey;
     private Button controlButton;
     private Button shiftButton;
     private Button fullscreenButton;
@@ -164,14 +178,14 @@ public final class MainActivity extends Activity {
         loadProjects();
         setContentView(createContentView());
         configureSystemUi();
-        configureWebView();
 
         String savedAddress = preferences.getString(ADDRESS_KEY, "");
         addressField.setText(savedAddress);
         if (savedAddress == null || savedAddress.trim().isEmpty()) {
+            showBlankWebView();
             addressField.requestFocus();
         } else {
-            webView.loadUrl(savedAddress);
+            switchToProjectUrl(savedAddress);
         }
     }
 
@@ -249,11 +263,9 @@ public final class MainActivity extends Activity {
             )
         );
 
-        webView = new WebView(this);
-        webView.setFocusable(true);
-        webView.setFocusableInTouchMode(true);
+        webContainer = new FrameLayout(this);
         root.addView(
-            webView,
+            webContainer,
             new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
@@ -405,8 +417,8 @@ public final class MainActivity extends Activity {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private void configureWebView() {
-        WebSettings settings = webView.getSettings();
+    private void configureWebView(WebView target) {
+        WebSettings settings = target.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
@@ -419,26 +431,26 @@ public final class MainActivity extends Activity {
         settings.setDisplayZoomControls(false);
         settings.setTextZoom(90);
         int savedZoomPercent = preferences.getInt(ZOOM_PERCENT_KEY, 0);
-        webView.setInitialScale(
+        target.setInitialScale(
             savedZoomPercent > 0 ? savedZoomPercent : calculateDesktopScale()
         );
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
-        cookieManager.setAcceptThirdPartyCookies(webView, true);
+        cookieManager.setAcceptThirdPartyCookies(target, true);
 
-        webView.setWebChromeClient(new WebChromeClient());
-        webView.setWebViewClient(new WebViewClient() {
+        target.setWebChromeClient(new WebChromeClient());
+        target.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageCommitVisible(WebView view, String url) {
                 super.onPageCommitVisible(view, url);
-                installKeyboardBridge();
+                installKeyboardBridge(view);
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                installKeyboardBridge();
+                installKeyboardBridge(view);
             }
 
             @Override
@@ -450,6 +462,29 @@ public final class MainActivity extends Activity {
                 }
             }
         });
+    }
+
+    private WebView createProjectWebView() {
+        WebView target = new WebView(this);
+        target.setFocusable(true);
+        target.setFocusableInTouchMode(true);
+        target.setVisibility(View.GONE);
+        configureWebView(target);
+        webContainer.addView(
+            target,
+            new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        );
+        return target;
+    }
+
+    private void showBlankWebView() {
+        webView = createProjectWebView();
+        webView.setVisibility(View.VISIBLE);
+        webView.onResume();
+        activeSessionKey = null;
     }
 
     private void changeZoom(int direction) {
@@ -464,17 +499,133 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void switchToProjectUrl(String address) {
+        String normalized = normalizeAddress(address);
+        if (normalized.isEmpty()) {
+            return;
+        }
+
+        long now = SystemClock.elapsedRealtime();
+        cleanupExpiredProjectSessions(now);
+
+        ProjectSession targetSession = projectSessions.get(normalized);
+        boolean created = targetSession == null;
+        if (created) {
+            targetSession = new ProjectSession(createProjectWebView());
+            projectSessions.put(normalized, targetSession);
+        }
+
+        activateProjectSession(normalized, targetSession, now);
+        if (created) {
+            targetSession.webView.loadUrl(normalized);
+        }
+        evictExcessProjectSessions();
+
+        addressField.setText(normalized);
+        preferences.edit().putString(ADDRESS_KEY, normalized).apply();
+        addressField.clearFocus();
+        targetSession.webView.requestFocus();
+    }
+
+    private void activateProjectSession(
+        String sessionKey,
+        ProjectSession targetSession,
+        long now
+    ) {
+        if (webView == targetSession.webView) {
+            activeSessionKey = sessionKey;
+            targetSession.webView.requestFocus();
+            return;
+        }
+
+        if (webView != null) {
+            if (activeSessionKey == null) {
+                destroyWebView(webView);
+            } else {
+                ProjectSession currentSession = projectSessions.get(activeSessionKey);
+                if (currentSession != null) {
+                    currentSession.lastInactiveAt = now;
+                }
+                webView.onPause();
+                webView.setVisibility(View.GONE);
+            }
+        }
+
+        webView = targetSession.webView;
+        activeSessionKey = sessionKey;
+        targetSession.lastInactiveAt = 0L;
+        webView.setVisibility(View.VISIBLE);
+        webView.bringToFront();
+        webView.onResume();
+        syncModifiers(webView);
+    }
+
+    private void cleanupExpiredProjectSessions(long now) {
+        Iterator<Map.Entry<String, ProjectSession>> iterator =
+            projectSessions.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, ProjectSession> entry = iterator.next();
+            if (entry.getKey().equals(activeSessionKey)) {
+                continue;
+            }
+            ProjectSession session = entry.getValue();
+            if (session.lastInactiveAt > 0L
+                && now - session.lastInactiveAt >= PROJECT_SESSION_TTL_MS) {
+                iterator.remove();
+                destroyWebView(session.webView);
+            }
+        }
+    }
+
+    private void evictExcessProjectSessions() {
+        while (projectSessions.size() > MAX_HOT_PROJECT_SESSIONS) {
+            String oldestKey = null;
+            long oldestInactiveAt = Long.MAX_VALUE;
+            for (Map.Entry<String, ProjectSession> entry : projectSessions.entrySet()) {
+                if (entry.getKey().equals(activeSessionKey)) {
+                    continue;
+                }
+                if (entry.getValue().lastInactiveAt < oldestInactiveAt) {
+                    oldestKey = entry.getKey();
+                    oldestInactiveAt = entry.getValue().lastInactiveAt;
+                }
+            }
+            if (oldestKey == null) {
+                return;
+            }
+            ProjectSession removed = projectSessions.remove(oldestKey);
+            if (removed != null) {
+                destroyWebView(removed.webView);
+            }
+        }
+    }
+
+    private boolean isProjectSessionHot(String address, long now) {
+        String normalized = normalizeAddress(address);
+        ProjectSession session = projectSessions.get(normalized);
+        if (session == null) {
+            return false;
+        }
+        return normalized.equals(activeSessionKey)
+            || (session.lastInactiveAt > 0L
+                && now - session.lastInactiveAt < PROJECT_SESSION_TTL_MS);
+    }
+
+    private void destroyWebView(WebView target) {
+        if (webContainer != null) {
+            webContainer.removeView(target);
+        }
+        target.stopLoading();
+        target.destroy();
+    }
+
     private void loadEnteredAddress() {
         String normalized = normalizeAddress(addressField.getText().toString());
         if (normalized.isEmpty()) {
             return;
         }
 
-        addressField.setText(normalized);
-        preferences.edit().putString(ADDRESS_KEY, normalized).apply();
-        webView.loadUrl(normalized);
-        addressField.clearFocus();
-        webView.requestFocus();
+        switchToProjectUrl(normalized);
     }
 
     private int calculateDesktopScale() {
@@ -525,16 +676,19 @@ public final class MainActivity extends Activity {
     }
 
     private void showProjectSwitcher() {
-        List<String> choices = new ArrayList<>();
+        long now = SystemClock.elapsedRealtime();
+        cleanupExpiredProjectSessions(now);
+
+        List<CharSequence> choices = new ArrayList<>();
         choices.add("+ Save current address");
         for (ProjectProfile project : projects) {
-            choices.add(project.name);
+            choices.add(styledProjectLabel(project, false, isProjectSessionHot(project.url, now)));
         }
         choices.add("Manage saved projects");
 
         new AlertDialog.Builder(this)
-            .setTitle("Projects")
-            .setItems(choices.toArray(new String[0]), (dialog, which) -> {
+            .setTitle(boldText("Projects"))
+            .setItems(choices.toArray(new CharSequence[0]), (dialog, which) -> {
                 if (which == 0) {
                     saveCurrentAsProject();
                 } else if (which <= projects.size()) {
@@ -561,7 +715,7 @@ public final class MainActivity extends Activity {
         nameField.selectAll();
 
         new AlertDialog.Builder(this)
-            .setTitle("Save project")
+            .setTitle(boldText("Save project"))
             .setMessage(url)
             .setView(nameField)
             .setPositiveButton("Save", (dialog, which) -> {
@@ -577,11 +731,7 @@ public final class MainActivity extends Activity {
     }
 
     private void openProject(ProjectProfile project) {
-        addressField.setText(project.url);
-        preferences.edit().putString(ADDRESS_KEY, project.url).apply();
-        webView.loadUrl(project.url);
-        addressField.clearFocus();
-        webView.requestFocus();
+        switchToProjectUrl(project.url);
         if (fullscreen) {
             hideAddressBar();
         }
@@ -593,14 +743,20 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        String[] labels = new String[projects.size()];
+        long now = SystemClock.elapsedRealtime();
+        cleanupExpiredProjectSessions(now);
+        CharSequence[] labels = new CharSequence[projects.size()];
         for (int index = 0; index < projects.size(); index++) {
             ProjectProfile project = projects.get(index);
-            labels[index] = project.name + "\n" + project.url;
+            labels[index] = styledProjectLabel(
+                project,
+                true,
+                isProjectSessionHot(project.url, now)
+            );
         }
 
         new AlertDialog.Builder(this)
-            .setTitle("Tap a project to delete")
+            .setTitle(boldText("Tap a project to delete"))
             .setItems(labels, (dialog, which) -> confirmProjectDeletion(which))
             .setNegativeButton("Done", null)
             .show();
@@ -609,7 +765,7 @@ public final class MainActivity extends Activity {
     private void confirmProjectDeletion(int index) {
         ProjectProfile project = projects.get(index);
         new AlertDialog.Builder(this)
-            .setTitle("Delete " + project.name + "?")
+            .setTitle(boldText("Delete " + project.name + "?"))
             .setMessage(project.url)
             .setPositiveButton("Delete", (dialog, which) -> {
                 projects.remove(index);
@@ -617,6 +773,34 @@ public final class MainActivity extends Activity {
             })
             .setNegativeButton("Cancel", null)
             .show();
+    }
+
+    private static CharSequence boldText(String text) {
+        SpannableString styled = new SpannableString(text);
+        styled.setSpan(
+            new StyleSpan(Typeface.BOLD),
+            0,
+            text.length(),
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        );
+        return styled;
+    }
+
+    private static CharSequence styledProjectLabel(
+        ProjectProfile project,
+        boolean includeUrl,
+        boolean hot
+    ) {
+        String suffix = hot ? "  • HOT" : "";
+        String text = project.name + suffix + (includeUrl ? "\n" + project.url : "");
+        SpannableString styled = new SpannableString(text);
+        styled.setSpan(
+            new StyleSpan(Typeface.BOLD),
+            0,
+            project.name.length(),
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        );
+        return styled;
     }
 
     private static String normalizeAddress(String address) {
@@ -630,16 +814,24 @@ public final class MainActivity extends Activity {
         return "http://" + trimmed;
     }
 
-    private void installKeyboardBridge() {
-        webView.evaluateJavascript(KEYBOARD_BRIDGE, value -> syncModifiers());
+    private void installKeyboardBridge(WebView target) {
+        target.evaluateJavascript(KEYBOARD_BRIDGE, value -> syncModifiers(target));
     }
 
     private void syncModifiers() {
+        if (webView != null) {
+            syncModifiers(webView);
+        }
+    }
+
+    private void syncModifiers(WebView target) {
         String script = "if (window.__codeServerAppKeyboard) { "
             + "window.__codeServerAppKeyboard.setModifiers("
             + controlLocked + "," + shiftLocked + "); }";
-        webView.evaluateJavascript(script, null);
-        webView.requestFocus();
+        target.evaluateJavascript(script, null);
+        if (target == webView) {
+            target.requestFocus();
+        }
     }
 
     private void sendKey(String key, String code, int keyCode) {
@@ -759,10 +951,32 @@ public final class MainActivity extends Activity {
     }
 
     @Override
-    protected void onDestroy() {
+    protected void onPause() {
         if (webView != null) {
-            webView.destroy();
+            webView.onPause();
         }
+        super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (webView != null) {
+            webView.onResume();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        boolean activeViewIsCached = activeSessionKey != null;
+        for (ProjectSession session : new ArrayList<>(projectSessions.values())) {
+            destroyWebView(session.webView);
+        }
+        projectSessions.clear();
+        if (!activeViewIsCached && webView != null) {
+            destroyWebView(webView);
+        }
+        webView = null;
         super.onDestroy();
     }
 
@@ -819,6 +1033,15 @@ public final class MainActivity extends Activity {
         ProjectProfile(String name, String url) {
             this.name = name;
             this.url = url;
+        }
+    }
+
+    private static final class ProjectSession {
+        final WebView webView;
+        long lastInactiveAt;
+
+        ProjectSession(WebView webView) {
+            this.webView = webView;
         }
     }
 }
