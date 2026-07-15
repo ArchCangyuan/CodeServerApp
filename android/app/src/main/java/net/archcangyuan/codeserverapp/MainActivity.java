@@ -663,6 +663,7 @@ public final class MainActivity extends Activity {
         addKey(keyRow, "Esc", "Escape", "Escape", 27, dp(62));
         addKey(keyRow, "Tab", "Tab", "Tab", 9, dp(62));
         addKey(keyRow, "Enter", "Enter", "Enter", 13, dp(76));
+        addKey(keyRow, "Bksp", "Backspace", "Backspace", 8, dp(72));
         addKey(keyRow, "←", "ArrowLeft", "ArrowLeft", 37, dp(58));
         addKey(keyRow, "↑", "ArrowUp", "ArrowUp", 38, dp(58));
         addKey(keyRow, "↓", "ArrowDown", "ArrowDown", 40, dp(58));
@@ -1742,6 +1743,18 @@ public final class MainActivity extends Activity {
 
             @Override
             public boolean sendKeyEvent(KeyEvent event) {
+                if (ironRdpMode) {
+                    int keyCode = event.getKeyCode();
+                    boolean supportedKey = keyCode == KeyEvent.KEYCODE_DEL
+                        || keyCode == KeyEvent.KEYCODE_FORWARD_DEL
+                        || keyCode == KeyEvent.KEYCODE_ENTER;
+                    if (supportedKey) {
+                        if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                            dispatchNativeKey(keyCode);
+                        }
+                        return true;
+                    }
+                }
                 dispatchImeKeyEvent(event);
                 return true;
             }

@@ -7,7 +7,7 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Configurable code-server URL with persistent cookies and website data
 - Local HTTP server support
 - Reload and server-address controls
-- Supplemental keyboard for `Esc`, `Tab`, `Enter`, and arrow keys
+- Supplemental keyboard for `Esc`, `Tab`, `Enter`, `Backspace`, and arrow keys
 - Lockable `Ctrl` and `Shift` modifiers for combinations entered with the
   on-screen keyboard, a hardware keyboard, or the supplemental keys
 - Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
