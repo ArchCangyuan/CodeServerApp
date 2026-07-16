@@ -1,4 +1,4 @@
-name: Build CodeServerApp Android APK
+name: Build YourWorkspace Android APK
 
 on:
   workflow_dispatch:
@@ -36,13 +36,13 @@ jobs:
 
       - name: Verify and stage APK
         run: |
-          cp android/app/build/outputs/apk/debug/app-debug.apk CodeServerApp-android.apk
-          unzip -t CodeServerApp-android.apk
+          cp android/app/build/outputs/apk/debug/app-debug.apk YourWorkspace.apk
+          unzip -t YourWorkspace.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
-          path: CodeServerApp-android.apk
+          path: YourWorkspace.apk
           archive: false
           if-no-files-found: error
           retention-days: 14

@@ -1,4 +1,4 @@
-name: Build CodeServerApp IPA
+name: Build YourWorkspace IPA
 
 on:
   workflow_dispatch:
@@ -62,13 +62,13 @@ jobs:
           rm -rf Payload
           mkdir Payload
           cp -R "$APP_PATH" Payload/
-          /usr/bin/ditto -c -k --keepParent Payload "$SCHEME.ipa"
-          /usr/bin/unzip -t "$SCHEME.ipa"
+          /usr/bin/ditto -c -k --keepParent Payload "YourWorkspace.ipa"
+          /usr/bin/unzip -t "YourWorkspace.ipa"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v7
         with:
-          path: CodeServerApp.ipa
+          path: YourWorkspace.ipa
           archive: false
           if-no-files-found: error
           retention-days: 14

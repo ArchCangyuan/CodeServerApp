@@ -73,7 +73,7 @@ struct ContentView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
 
             VStack(spacing: 8) {
-                Text("CodeServerApp")
+                Text("YourWorkspace")
                     .font(.largeTitle.bold())
                 Text("Enter the address of your code-server instance.")
                     .foregroundColor(.secondary)

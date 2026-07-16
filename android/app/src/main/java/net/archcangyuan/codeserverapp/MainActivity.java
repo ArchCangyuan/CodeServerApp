@@ -495,7 +495,7 @@ public final class MainActivity extends Activity {
             input.autocapitalize = 'off';
             input.spellcheck = false;
             input.setAttribute('enterkeyhint', 'enter');
-            input.setAttribute('aria-label', 'CodeServerApp keyboard proxy');
+            input.setAttribute('aria-label', 'YourWorkspace keyboard proxy');
             Object.assign(input.style, {
               position: 'fixed',
               left: '1px',

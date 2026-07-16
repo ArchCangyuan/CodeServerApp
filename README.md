@@ -1,4 +1,4 @@
-# CodeServerApp
+# YourWorkspace
 
 Native iOS and Android wrappers for [code-server](https://github.com/coder/code-server).
 
@@ -37,19 +37,19 @@ The two applications are peers in one repository. They share branding and releas
 ## Build the iOS IPA
 
 1. Open the repository's **Actions** tab.
-2. Select **Build CodeServerApp IPA**.
+2. Select **Build YourWorkspace IPA**.
 3. Choose **Run workflow**.
-4. Download and extract the `CodeServerApp-*` artifact.
-5. Send `CodeServerApp.ipa` to the iPhone and open it with TrollStore.
+4. Download and extract the `YourWorkspace.ipa` artifact.
+5. Send `YourWorkspace.ipa` to the iPhone and open it with TrollStore.
 
 The workflow builds without an Apple provisioning profile and applies an ad-hoc signature before packaging.
 
 ## Build the Android APK
 
 1. Open the repository's **Actions** tab.
-2. Select **Build CodeServerApp Android APK**.
+2. Select **Build YourWorkspace Android APK**.
 3. Choose **Run workflow**.
-4. Download `CodeServerApp-android.apk` and open it on the Android device.
+4. Download `YourWorkspace.apk` and open it on the Android device.
 5. Allow installation from the browser or file manager when Android asks.
 
 The Android workflow produces a debug-signed APK that needs no Play Store or signing secrets. Android 8.0 (API 26) or newer is supported. Because hosted runners create development signing keys, uninstall an older workflow build first if Android reports an incompatible update signature.
