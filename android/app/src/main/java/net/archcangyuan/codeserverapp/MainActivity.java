@@ -66,10 +66,10 @@ public final class MainActivity extends Activity {
         "viewport_reload_zoom_migrated";
     private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
     private static final int MIN_LAYOUT_ZOOM_STEPS = -6;
-    private static final int MAX_LAYOUT_ZOOM_STEPS = 6;
+    private static final int MAX_LAYOUT_ZOOM_STEPS = 12;
     private static final double LAYOUT_ZOOM_FACTOR = 1.1;
     private static final long PROJECT_SESSION_TTL_MS = 30L * 60L * 1_000L;
-    private static final int MAX_HOT_PROJECT_SESSIONS = 6;
+    private static final int MAX_HOT_PROJECT_SESSIONS = 10;
     private static final int ACCENT = Color.rgb(103, 80, 164);
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
     private static final String DESKTOP_USER_AGENT =
@@ -81,7 +81,7 @@ public final class MainActivity extends Activity {
           const PROXY_ID = '__code_server_app_keyboard_proxy';
           const setViewportWidth = (requestedWidth) => {
             const numericWidth = Number(requestedWidth) || 1280;
-            const width = Math.max(640, Math.min(2400, Math.round(numericWidth)));
+            const width = Math.max(400, Math.min(2400, Math.round(numericWidth)));
             let viewport = document.querySelector('meta[name="viewport"]');
             if (!viewport) {
               viewport = document.createElement('meta');

@@ -4,10 +4,10 @@ import WebKit
 
 private let desktopViewportWidth = 1280
 private let minimumLayoutZoomSteps = -6
-private let maximumLayoutZoomSteps = 6
+private let maximumLayoutZoomSteps = 12
 private let layoutZoomFactor = 1.1
 private let projectSessionTTL: TimeInterval = 30 * 60
-private let maximumHotProjectSessions = 6
+private let maximumHotProjectSessions = 10
 private let layoutZoomStepsKey = "layoutZoomSteps"
 
 private let desktopUserAgent = """
@@ -19,7 +19,7 @@ private let keyboardBridgeSource = #"""
 (() => {
   const setViewportWidth = (requestedWidth) => {
     const numericWidth = Number(requestedWidth) || 1280;
-    const width = Math.max(640, Math.min(2400, Math.round(numericWidth)));
+    const width = Math.max(400, Math.min(2400, Math.round(numericWidth)));
     let viewport = document.querySelector('meta[name="viewport"]');
     if (!viewport) {
       viewport = document.createElement('meta');
