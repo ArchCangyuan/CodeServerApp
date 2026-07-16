@@ -18,6 +18,15 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    var isArrow: Bool {
+        switch self {
+        case .arrowLeft, .arrowUp, .arrowDown, .arrowRight:
+            return true
+        default:
+            return false
+        }
+    }
+
     var label: String {
         switch self {
         case .escape: return "Esc"
@@ -56,9 +65,12 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
 struct SpecialKeyBar: View {
     @Binding var controlLocked: Bool
     @Binding var shiftLocked: Bool
+    @State private var repeatTask: Task<Void, Never>? = nil
 
     let onKeyboard: () -> Void
     let onKey: (CodeServerKey) -> Void
+    let onCommand: (String) -> Void
+    let onControlC: () -> Void
     let onModifiersChanged: (_ control: Bool, _ shift: Bool) -> Void
 
     var body: some View {
@@ -79,15 +91,30 @@ struct SpecialKeyBar: View {
                 }
 
                 ForEach(CodeServerKey.allCases) { key in
-                    keyButton(label: key.label, accessibilityLabel: key.label) {
-                        onKey(key)
+                    if key.isArrow {
+                        repeatingKeyButton(key)
+                    } else {
+                        keyButton(label: key.label, accessibilityLabel: key.label) {
+                            onKey(key)
+                        }
                     }
+                }
+
+                ForEach(["/context", "/rewind", "/cost"], id: \.self) { command in
+                    keyButton(label: command, accessibilityLabel: "Send \(command) command") {
+                        onCommand(command)
+                    }
+                }
+
+                keyButton(label: "Ctrl+C", accessibilityLabel: "Send Control C") {
+                    onControlC()
                 }
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 6)
         }
         .background(Color(uiColor: .secondarySystemBackground))
+        .onDisappear(perform: stopRepeating)
     }
 
     private func keyButton(
@@ -105,6 +132,37 @@ struct SpecialKeyBar: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(accessibilityLabel)
+    }
+
+    private func repeatingKeyButton(_ key: CodeServerKey) -> some View {
+        keyButton(label: key.label, accessibilityLabel: "Hold \(key.label) to repeat") {
+            onKey(key)
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    startRepeating(key)
+                }
+                .onEnded { _ in
+                    stopRepeating()
+                }
+        )
+    }
+
+    private func startRepeating(_ key: CodeServerKey) {
+        guard repeatTask == nil else { return }
+        repeatTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            while !Task.isCancelled {
+                onKey(key)
+                try? await Task.sleep(nanoseconds: 70_000_000)
+            }
+        }
+    }
+
+    private func stopRepeating() {
+        repeatTask?.cancel()
+        repeatTask = nil
     }
 
     private func modifierButton(

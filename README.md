@@ -8,6 +8,8 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Local HTTP server support
 - Reload and server-address controls
 - Supplemental keyboard for `Esc`, `Tab`, `Enter`, `Backspace`, and arrow keys
+- One-tap `/context`, `/rewind`, and `/cost` command submission plus a dedicated
+  `Ctrl+C` shortcut
 - Lockable `Ctrl` and `Shift` modifiers for combinations entered with the
   on-screen keyboard, a hardware keyboard, or the supplemental keys
 - Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
@@ -18,7 +20,9 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
   focus on canvas-based web RDP clients while forwarding text and editing keys
 - Cloudflare Access browser-RDP support that focuses IronRDP's Shadow DOM
   renderer and sends text, Backspace, Delete, and Enter through its key handler
-- Saved project profiles with bold titles and up to six hot WebView sessions retained for 30 minutes on both platforms
+- Desktop-style code-server gestures: hold and drag to select text, or hold and
+  release to open the right-click context menu for copy and paste
+- Saved project profiles with bold titles and up to ten hot WebView sessions retained for 30 minutes on both platforms
 - GitHub Actions workflows that produce a TrollStore-ready IPA and an Android APK
 
 ## Repository layout

@@ -116,6 +116,12 @@ struct ContentView: View {
                 onKey: { key in
                     webViewStore.send(key)
                 },
+                onCommand: { command in
+                    webViewStore.sendCommand(command)
+                },
+                onControlC: {
+                    webViewStore.sendControlC()
+                },
                 onModifiersChanged: { control, shift in
                     webViewStore.setModifiers(control: control, shift: shift)
                 }
@@ -170,11 +176,6 @@ struct ContentView: View {
                 .textFieldStyle(.roundedBorder)
                 .layoutPriority(1)
                 .onSubmit(loadDraftAddress)
-
-            Button("Go", action: loadDraftAddress)
-                .font(.caption.weight(.semibold))
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Open address")
 
             toolbarButton(systemName: "arrow.clockwise", label: "Reload code-server") {
                 webViewStore.reload()

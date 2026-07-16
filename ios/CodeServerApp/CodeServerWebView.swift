@@ -78,9 +78,10 @@ private let keyboardBridgeSource = #"""
   };
 
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 7) {
+  if (existingBridge && existingBridge.version >= 9) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
+    existingBridge.installDesktopGestures?.();
     return;
   }
 
@@ -89,7 +90,8 @@ private let keyboardBridgeSource = #"""
     shift: false,
     target: null,
     ironRdpCanvas: null,
-    gestureCanvas: null
+    gestureCanvas: null,
+    desktopGestureInstalled: false
   };
 
   const pointFromTouch = (touch) => ({
@@ -219,7 +221,136 @@ private let keyboardBridgeSource = #"""
     return true;
   };
 
+  const installDesktopGestures = () => {
+    if (state.desktopGestureInstalled) return true;
+    state.desktopGestureInstalled = true;
+
+    let gesture = null;
+
+    const eventPath = (event) => typeof event.composedPath === 'function'
+      ? event.composedPath()
+      : [event.target];
+    const isIronRdpEvent = (event) => {
+      const canvas = state.ironRdpCanvas || findIronRdpCanvas();
+      return Boolean(canvas && eventPath(event).includes(canvas));
+    };
+    const isNativeTextTarget = (target) => {
+      if (!target || target.nodeType !== 1) return false;
+      const tagName = target.tagName;
+      return tagName === 'INPUT'
+        || tagName === 'TEXTAREA'
+        || tagName === 'SELECT'
+        || Boolean(target.isContentEditable);
+    };
+    const targetAt = (point, fallback) => {
+      try {
+        return document.elementFromPoint(point.clientX, point.clientY)
+          || fallback;
+      } catch (_) {
+        return fallback;
+      }
+    };
+    const clearTimer = (activeGesture) => {
+      if (activeGesture?.timer) window.clearTimeout(activeGesture.timer);
+    };
+    const sendContextMenu = (target, point) => {
+      if (!target?.dispatchEvent) return;
+      dispatchMouse(target, 'mousemove', point, 0, 0);
+      dispatchMouse(target, 'mousedown', point, 2, 2);
+      dispatchMouse(target, 'mouseup', point, 2, 0);
+      dispatchMouse(target, 'contextmenu', point, 2, 0);
+    };
+
+    document.addEventListener('contextmenu', (event) => {
+      if (!event.isTrusted || !gesture || isIronRdpEvent(event)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
+
+    document.addEventListener('touchstart', (event) => {
+      if (event.touches.length !== 1 || isIronRdpEvent(event)) return;
+      const path = eventPath(event);
+      const startTarget = path.find((target) => target?.dispatchEvent)
+        || event.target;
+      if (!startTarget || isNativeTextTarget(startTarget)) return;
+      if (startTarget.style) startTarget.style.webkitTouchCallout = 'none';
+      const start = pointFromTouch(event.touches[0]);
+      gesture = {
+        start,
+        last: start,
+        startTarget,
+        armed: false,
+        dragging: false,
+        cancelled: false,
+        timer: window.setTimeout(() => {
+          if (gesture && !gesture.cancelled) gesture.armed = true;
+        }, 550)
+      };
+    }, { capture: true, passive: true });
+
+    document.addEventListener('touchmove', (event) => {
+      if (!gesture || event.touches.length !== 1) return;
+      const point = pointFromTouch(event.touches[0]);
+      gesture.last = point;
+      const distance = Math.hypot(
+        point.clientX - gesture.start.clientX,
+        point.clientY - gesture.start.clientY
+      );
+
+      if (!gesture.armed) {
+        if (distance >= 7) {
+          clearTimer(gesture);
+          gesture.cancelled = true;
+        }
+        return;
+      }
+      if (!gesture.dragging && distance < 7) return;
+
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (!gesture.dragging) {
+        gesture.dragging = true;
+        dispatchMouse(gesture.startTarget, 'mousemove', gesture.start, 0, 0);
+        dispatchMouse(gesture.startTarget, 'mousedown', gesture.start, 0, 1);
+      }
+      const moveTarget = targetAt(point, gesture.startTarget);
+      dispatchMouse(moveTarget, 'mousemove', point, 0, 1);
+    }, { capture: true, passive: false });
+
+    const finishGesture = (event, cancelled) => {
+      if (!gesture) return;
+      const activeGesture = gesture;
+      gesture = null;
+      clearTimer(activeGesture);
+      const touch = event.changedTouches?.[0];
+      const point = touch ? pointFromTouch(touch) : activeGesture.last;
+      const endTarget = targetAt(point, activeGesture.startTarget);
+
+      if (activeGesture.dragging) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        dispatchMouse(endTarget, 'mousemove', point, 0, 1);
+        dispatchMouse(endTarget, 'mouseup', point, 0, 0);
+      } else if (activeGesture.armed
+          && !activeGesture.cancelled
+          && !cancelled) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        sendContextMenu(endTarget, point);
+      }
+    };
+
+    document.addEventListener('touchend', (event) => {
+      finishGesture(event, false);
+    }, { capture: true, passive: false });
+    document.addEventListener('touchcancel', (event) => {
+      finishGesture(event, true);
+    }, { capture: true, passive: false });
+    return true;
+  };
+
   installRdpGestures();
+  installDesktopGestures();
   window.setInterval(installRdpGestures, 1000);
   const deepestActiveElement = (rootDocument) => {
     let active = rootDocument.activeElement;
@@ -359,6 +490,59 @@ private let keyboardBridgeSource = #"""
     return true;
   };
 
+  const dispatchShortcut = (
+    key,
+    code,
+    keyCode,
+    useControl = false,
+    useShift = false
+  ) => {
+    const target = activeTarget();
+    if (!target) return false;
+    const needsControl = useControl && !state.control;
+    const needsShift = useShift && !state.shift;
+    if (needsControl) {
+      dispatchKeyPhase(
+        target,
+        'keydown',
+        'Control',
+        'ControlLeft',
+        17,
+        { ctrlKey: true, location: 1 }
+      );
+    }
+    if (needsShift) {
+      dispatchKeyPhase(
+        target,
+        'keydown',
+        'Shift',
+        'ShiftLeft',
+        16,
+        { ctrlKey: useControl, shiftKey: true, location: 1 }
+      );
+    }
+    const source = {
+      ctrlKey: state.control || useControl,
+      shiftKey: state.shift || useShift
+    };
+    dispatchKeyPhase(target, 'keydown', key, code, keyCode, source);
+    dispatchKeyPhase(target, 'keyup', key, code, keyCode, source);
+    if (needsShift) {
+      dispatchKeyPhase(
+        target,
+        'keyup',
+        'Shift',
+        'ShiftLeft',
+        16,
+        { ctrlKey: state.control || useControl }
+      );
+    }
+    if (needsControl) {
+      dispatchKeyPhase(target, 'keyup', 'Control', 'ControlLeft', 17);
+    }
+    return true;
+  };
+
   const forwardText = (text) => {
     for (const key of Array.from(text || '')) {
       const info = keyInfoForText(key);
@@ -408,7 +592,7 @@ private let keyboardBridgeSource = #"""
   document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
   const bridge = {
-    version: 7,
+    version: 9,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();
@@ -422,11 +606,38 @@ private let keyboardBridgeSource = #"""
       return activeTarget() ? 'generic' : 'missing';
     },
     installRdpGestures,
+    installDesktopGestures,
     sendKey(key, code, keyCode) {
       return dispatchCompleteKey(key, code, keyCode);
     },
     sendText(text) {
       return forwardText(String(text || ''));
+    },
+    sendCommand(command) {
+      const previousControl = state.control;
+      const previousShift = state.shift;
+      if (previousShift) {
+        state.shift = false;
+        dispatchModifier('Shift', 'ShiftLeft', 16, false);
+      }
+      if (previousControl) {
+        state.control = false;
+        dispatchModifier('Control', 'ControlLeft', 17, false);
+      }
+      forwardText(String(command || ''));
+      dispatchCompleteKey('Enter', 'Enter', 13);
+      if (previousControl) {
+        state.control = true;
+        dispatchModifier('Control', 'ControlLeft', 17, true);
+      }
+      if (previousShift) {
+        state.shift = true;
+        dispatchModifier('Shift', 'ShiftLeft', 16, true);
+      }
+      return true;
+    },
+    sendShortcut(key, code, keyCode, control, shift) {
+      return dispatchShortcut(key, code, keyCode, control, shift);
     },
     setModifiers(control, shift) {
       const nextControl = Boolean(control);
@@ -624,6 +835,23 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         ) ?? false;
         """
         webView.evaluateJavaScript(script)
+    }
+
+    func sendCommand(_ command: String) {
+        guard !command.isEmpty, let webView = activeSession?.webView else { return }
+        let script = """
+        window.__codeServerAppKeyboard?.sendCommand(
+          \(Self.javaScriptString(command))
+        ) ?? false;
+        """
+        webView.evaluateJavaScript(script)
+    }
+
+    func sendControlC() {
+        guard let webView = activeSession?.webView else { return }
+        webView.evaluateJavaScript(
+            "window.__codeServerAppKeyboard?.sendShortcut('c', 'KeyC', 67, true, false) ?? false;"
+        )
     }
 
     func forceKeyboard() {

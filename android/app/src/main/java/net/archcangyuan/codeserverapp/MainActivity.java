@@ -140,9 +140,10 @@ public final class MainActivity extends Activity {
           };
 
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 7) {
+          if (existingBridge && existingBridge.version >= 9) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
             existingBridge.installRdpGestures?.();
+            existingBridge.installDesktopGestures?.();
             return;
           }
 
@@ -156,7 +157,8 @@ public final class MainActivity extends Activity {
             lastCompositionText: '',
             lastCompositionAt: 0,
             ironRdpCanvas: null,
-            gestureCanvas: null
+            gestureCanvas: null,
+            desktopGestureInstalled: false
           };
 
           const pointFromTouch = (touch) => ({
@@ -286,7 +288,136 @@ public final class MainActivity extends Activity {
             return true;
           };
 
+          const installDesktopGestures = () => {
+            if (state.desktopGestureInstalled) return true;
+            state.desktopGestureInstalled = true;
+
+            let gesture = null;
+
+            const eventPath = (event) => typeof event.composedPath === 'function'
+              ? event.composedPath()
+              : [event.target];
+            const isIronRdpEvent = (event) => {
+              const canvas = state.ironRdpCanvas || findIronRdpCanvas();
+              return Boolean(canvas && eventPath(event).includes(canvas));
+            };
+            const isNativeTextTarget = (target) => {
+              if (!target || target.nodeType !== 1) return false;
+              const tagName = target.tagName;
+              return tagName === 'INPUT'
+                || tagName === 'TEXTAREA'
+                || tagName === 'SELECT'
+                || Boolean(target.isContentEditable);
+            };
+            const targetAt = (point, fallback) => {
+              try {
+                return document.elementFromPoint(point.clientX, point.clientY)
+                  || fallback;
+              } catch (_) {
+                return fallback;
+              }
+            };
+            const clearTimer = (activeGesture) => {
+              if (activeGesture?.timer) window.clearTimeout(activeGesture.timer);
+            };
+            const sendContextMenu = (target, point) => {
+              if (!target?.dispatchEvent) return;
+              dispatchMouse(target, 'mousemove', point, 0, 0);
+              dispatchMouse(target, 'mousedown', point, 2, 2);
+              dispatchMouse(target, 'mouseup', point, 2, 0);
+              dispatchMouse(target, 'contextmenu', point, 2, 0);
+            };
+
+            document.addEventListener('contextmenu', (event) => {
+              if (!event.isTrusted || !gesture || isIronRdpEvent(event)) return;
+              event.preventDefault();
+              event.stopImmediatePropagation();
+            }, true);
+
+            document.addEventListener('touchstart', (event) => {
+              if (event.touches.length !== 1 || isIronRdpEvent(event)) return;
+              const path = eventPath(event);
+              const startTarget = path.find((target) => target?.dispatchEvent)
+                || event.target;
+              if (!startTarget || isNativeTextTarget(startTarget)) return;
+              if (startTarget.style) startTarget.style.webkitTouchCallout = 'none';
+              const start = pointFromTouch(event.touches[0]);
+              gesture = {
+                start,
+                last: start,
+                startTarget,
+                armed: false,
+                dragging: false,
+                cancelled: false,
+                timer: window.setTimeout(() => {
+                  if (gesture && !gesture.cancelled) gesture.armed = true;
+                }, 550)
+              };
+            }, { capture: true, passive: true });
+
+            document.addEventListener('touchmove', (event) => {
+              if (!gesture || event.touches.length !== 1) return;
+              const point = pointFromTouch(event.touches[0]);
+              gesture.last = point;
+              const distance = Math.hypot(
+                point.clientX - gesture.start.clientX,
+                point.clientY - gesture.start.clientY
+              );
+
+              if (!gesture.armed) {
+                if (distance >= 7) {
+                  clearTimer(gesture);
+                  gesture.cancelled = true;
+                }
+                return;
+              }
+              if (!gesture.dragging && distance < 7) return;
+
+              event.preventDefault();
+              event.stopImmediatePropagation();
+              if (!gesture.dragging) {
+                gesture.dragging = true;
+                dispatchMouse(gesture.startTarget, 'mousemove', gesture.start, 0, 0);
+                dispatchMouse(gesture.startTarget, 'mousedown', gesture.start, 0, 1);
+              }
+              const moveTarget = targetAt(point, gesture.startTarget);
+              dispatchMouse(moveTarget, 'mousemove', point, 0, 1);
+            }, { capture: true, passive: false });
+
+            const finishGesture = (event, cancelled) => {
+              if (!gesture) return;
+              const activeGesture = gesture;
+              gesture = null;
+              clearTimer(activeGesture);
+              const touch = event.changedTouches?.[0];
+              const point = touch ? pointFromTouch(touch) : activeGesture.last;
+              const endTarget = targetAt(point, activeGesture.startTarget);
+
+              if (activeGesture.dragging) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                dispatchMouse(endTarget, 'mousemove', point, 0, 1);
+                dispatchMouse(endTarget, 'mouseup', point, 0, 0);
+              } else if (activeGesture.armed
+                  && !activeGesture.cancelled
+                  && !cancelled) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                sendContextMenu(endTarget, point);
+              }
+            };
+
+            document.addEventListener('touchend', (event) => {
+              finishGesture(event, false);
+            }, { capture: true, passive: false });
+            document.addEventListener('touchcancel', (event) => {
+              finishGesture(event, true);
+            }, { capture: true, passive: false });
+            return true;
+          };
+
           installRdpGestures();
+          installDesktopGestures();
           window.setInterval(installRdpGestures, 1000);
           const isProxy = (element) => Boolean(element && element.id === PROXY_ID);
 
@@ -442,6 +573,59 @@ public final class MainActivity extends Activity {
             if (needsSyntheticShift) {
               dispatchKeyPhase(target, 'keyup', 'Shift', 'ShiftLeft', 16);
             }
+          };
+
+          const dispatchShortcut = (
+            key,
+            code,
+            keyCode,
+            useControl = false,
+            useShift = false
+          ) => {
+            const target = activeTarget();
+            if (!target) return false;
+            const needsControl = useControl && !state.control;
+            const needsShift = useShift && !state.shift;
+            if (needsControl) {
+              dispatchKeyPhase(
+                target,
+                'keydown',
+                'Control',
+                'ControlLeft',
+                17,
+                { ctrlKey: true, location: 1 }
+              );
+            }
+            if (needsShift) {
+              dispatchKeyPhase(
+                target,
+                'keydown',
+                'Shift',
+                'ShiftLeft',
+                16,
+                { ctrlKey: useControl, shiftKey: true, location: 1 }
+              );
+            }
+            const source = {
+              ctrlKey: state.control || useControl,
+              shiftKey: state.shift || useShift
+            };
+            dispatchKeyPhase(target, 'keydown', key, code, keyCode, source);
+            dispatchKeyPhase(target, 'keyup', key, code, keyCode, source);
+            if (needsShift) {
+              dispatchKeyPhase(
+                target,
+                'keyup',
+                'Shift',
+                'ShiftLeft',
+                16,
+                { ctrlKey: state.control || useControl }
+              );
+            }
+            if (needsControl) {
+              dispatchKeyPhase(target, 'keyup', 'Control', 'ControlLeft', 17);
+            }
+            return true;
           };
 
           const forwardText = (text) => {
@@ -604,9 +788,10 @@ public final class MainActivity extends Activity {
           document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
           const bridge = {
-            version: 7,
+            version: 9,
             forceKeyboard,
             installRdpGestures,
+            installDesktopGestures,
             sendKey(key, code, keyCode) {
               dispatchCompleteKey(key, code, keyCode);
               return true;
@@ -614,6 +799,32 @@ public final class MainActivity extends Activity {
             sendText(text) {
               forwardText(String(text || ''));
               return true;
+            },
+            sendCommand(command) {
+              const previousControl = state.control;
+              const previousShift = state.shift;
+              if (previousShift) {
+                state.shift = false;
+                dispatchModifier('Shift', 'ShiftLeft', 16, false);
+              }
+              if (previousControl) {
+                state.control = false;
+                dispatchModifier('Control', 'ControlLeft', 17, false);
+              }
+              forwardText(String(command || ''));
+              dispatchCompleteKey('Enter', 'Enter', 13);
+              if (previousControl) {
+                state.control = true;
+                dispatchModifier('Control', 'ControlLeft', 17, true);
+              }
+              if (previousShift) {
+                state.shift = true;
+                dispatchModifier('Shift', 'ShiftLeft', 16, true);
+              }
+              return true;
+            },
+            sendShortcut(key, code, keyCode, control, shift) {
+              return dispatchShortcut(key, code, keyCode, control, shift);
             },
             setModifiers(control, shift) {
               const nextControl = Boolean(control);
@@ -731,10 +942,6 @@ public final class MainActivity extends Activity {
             new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
         );
 
-        Button goButton = createToolbarButton("Go");
-        goButton.setOnClickListener(view -> loadEnteredAddress());
-        addressBar.addView(goButton);
-
         Button reloadButton = createToolbarButton("↻");
         reloadButton.setContentDescription("Reload code-server");
         reloadButton.setOnClickListener(view -> webView.reload());
@@ -814,10 +1021,18 @@ public final class MainActivity extends Activity {
         addKey(keyRow, "Tab", "Tab", "Tab", 9, dp(54));
         addKey(keyRow, "Enter", "Enter", "Enter", 13, dp(64));
         addKey(keyRow, "Bksp", "Backspace", "Backspace", 8, dp(64));
-        addKey(keyRow, "←", "ArrowLeft", "ArrowLeft", 37, dp(50));
-        addKey(keyRow, "↑", "ArrowUp", "ArrowUp", 38, dp(50));
-        addKey(keyRow, "↓", "ArrowDown", "ArrowDown", 40, dp(50));
-        addKey(keyRow, "→", "ArrowRight", "ArrowRight", 39, dp(50));
+        addRepeatingKey(keyRow, "←", "ArrowLeft", "ArrowLeft", 37, dp(50));
+        addRepeatingKey(keyRow, "↑", "ArrowUp", "ArrowUp", 38, dp(50));
+        addRepeatingKey(keyRow, "↓", "ArrowDown", "ArrowDown", 40, dp(50));
+        addRepeatingKey(keyRow, "→", "ArrowRight", "ArrowRight", 39, dp(50));
+        addCommandKey(keyRow, "/context", "/context", dp(88));
+        addCommandKey(keyRow, "/rewind", "/rewind", dp(84));
+        addCommandKey(keyRow, "/cost", "/cost", dp(68));
+
+        Button controlCButton = createKeyButton("Ctrl+C");
+        controlCButton.setContentDescription("Send Control C");
+        controlCButton.setOnClickListener(view -> sendControlC());
+        keyRow.addView(controlCButton, keyLayoutParams(dp(74)));
 
         keyboardScroll.addView(keyRow);
         root.addView(
@@ -1546,6 +1761,24 @@ public final class MainActivity extends Activity {
         webView.requestFocus();
     }
 
+    private void sendCommand(String command) {
+        String script = "window.__codeServerAppKeyboard"
+            + " && typeof window.__codeServerAppKeyboard.sendCommand === 'function'"
+            + " ? window.__codeServerAppKeyboard.sendCommand("
+            + JSONObject.quote(command) + ") : false";
+        webView.evaluateJavascript(script, null);
+        webView.requestFocus();
+    }
+
+    private void sendControlC() {
+        String script = "window.__codeServerAppKeyboard"
+            + " && typeof window.__codeServerAppKeyboard.sendShortcut === 'function'"
+            + " ? window.__codeServerAppKeyboard.sendShortcut("
+            + "'c','KeyC',67,true,false) : false";
+        webView.evaluateJavascript(script, null);
+        webView.requestFocus();
+    }
+
     private void addKey(
         LinearLayout row,
         String label,
@@ -1556,6 +1789,54 @@ public final class MainActivity extends Activity {
     ) {
         Button button = createKeyButton(label);
         button.setOnClickListener(view -> sendKey(key, code, keyCode));
+        row.addView(button, keyLayoutParams(width));
+    }
+
+    private void addRepeatingKey(
+        LinearLayout row,
+        String label,
+        String key,
+        String code,
+        int keyCode,
+        int width
+    ) {
+        Button button = createKeyButton(label);
+        button.setOnClickListener(view -> sendKey(key, code, keyCode));
+        final Runnable[] repeatAction = new Runnable[1];
+        repeatAction[0] = () -> {
+            sendKey(key, code, keyCode);
+            button.postDelayed(repeatAction[0], 70L);
+        };
+        button.setOnTouchListener((view, event) -> {
+            switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                button.removeCallbacks(repeatAction[0]);
+                button.postDelayed(repeatAction[0], 350L);
+                break;
+            case MotionEvent.ACTION_UP:
+                button.removeCallbacks(repeatAction[0]);
+                view.performClick();
+                break;
+            case MotionEvent.ACTION_CANCEL:
+                button.removeCallbacks(repeatAction[0]);
+                break;
+            default:
+                break;
+            }
+            return true;
+        });
+        row.addView(button, keyLayoutParams(width));
+    }
+
+    private void addCommandKey(
+        LinearLayout row,
+        String label,
+        String command,
+        int width
+    ) {
+        Button button = createKeyButton(label);
+        button.setContentDescription("Send " + command + " command");
+        button.setOnClickListener(view -> sendCommand(command));
         row.addView(button, keyLayoutParams(width));
     }
 
