@@ -78,7 +78,7 @@ private let keyboardBridgeSource = #"""
   };
 
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 6) {
+  if (existingBridge && existingBridge.version >= 7) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
     return;
@@ -336,12 +336,26 @@ private let keyboardBridgeSource = #"""
   const dispatchCompleteKey = (key, code, keyCode, forceShift = false) => {
     const target = activeTarget();
     if (!target) return false;
+    const needsSyntheticShift = forceShift && !state.shift;
     const source = forceShift ? { shiftKey: true } : null;
+    if (needsSyntheticShift) {
+      dispatchKeyPhase(
+        target,
+        'keydown',
+        'Shift',
+        'ShiftLeft',
+        16,
+        { shiftKey: true, location: 1 }
+      );
+    }
     dispatchKeyPhase(target, 'keydown', key, code, keyCode, source);
     if (Array.from(key).length === 1 && !state.control) {
       dispatchKeyPhase(target, 'keypress', key, code, keyCode, source);
     }
     dispatchKeyPhase(target, 'keyup', key, code, keyCode, source);
+    if (needsSyntheticShift) {
+      dispatchKeyPhase(target, 'keyup', 'Shift', 'ShiftLeft', 16);
+    }
     return true;
   };
 
@@ -394,7 +408,7 @@ private let keyboardBridgeSource = #"""
   document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
   const bridge = {
-    version: 6,
+    version: 7,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();

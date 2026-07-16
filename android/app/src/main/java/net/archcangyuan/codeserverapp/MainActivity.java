@@ -140,7 +140,7 @@ public final class MainActivity extends Activity {
           };
 
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 6) {
+          if (existingBridge && existingBridge.version >= 7) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
             existingBridge.installRdpGestures?.();
             return;
@@ -422,12 +422,26 @@ public final class MainActivity extends Activity {
           const dispatchCompleteKey = (key, code, keyCode, forceShift = false) => {
             const target = activeTarget();
             if (!target) return;
+            const needsSyntheticShift = forceShift && !state.shift;
             const source = forceShift ? { shiftKey: true } : null;
+            if (needsSyntheticShift) {
+              dispatchKeyPhase(
+                target,
+                'keydown',
+                'Shift',
+                'ShiftLeft',
+                16,
+                { shiftKey: true, location: 1 }
+              );
+            }
             dispatchKeyPhase(target, 'keydown', key, code, keyCode, source);
             if (Array.from(key).length === 1 && !state.control) {
               dispatchKeyPhase(target, 'keypress', key, code, keyCode, source);
             }
             dispatchKeyPhase(target, 'keyup', key, code, keyCode, source);
+            if (needsSyntheticShift) {
+              dispatchKeyPhase(target, 'keyup', 'Shift', 'ShiftLeft', 16);
+            }
           };
 
           const forwardText = (text) => {
@@ -590,7 +604,7 @@ public final class MainActivity extends Activity {
           document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
           const bridge = {
-            version: 6,
+            version: 7,
             forceKeyboard,
             installRdpGestures,
             sendKey(key, code, keyCode) {
