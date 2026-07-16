@@ -1194,8 +1194,9 @@ public final class MainActivity extends Activity {
                 if (currentSession != null) {
                     currentSession.lastInactiveAt = now;
                 }
-                webView.onPause();
-                webView.setVisibility(View.GONE);
+                // Keep hot sessions attached, visible behind the active WebView, and
+                // resumed so RDP/WebSocket connections are not suspended on switch.
+                webView.clearFocus();
             }
         }
 
@@ -1623,7 +1624,11 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
-        if (webView != null) {
+        boolean activeViewIsCached = activeSessionKey != null;
+        for (ProjectSession session : projectSessions.values()) {
+            session.webView.onPause();
+        }
+        if (!activeViewIsCached && webView != null) {
             webView.onPause();
         }
         super.onPause();
@@ -1632,7 +1637,11 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (webView != null) {
+        boolean activeViewIsCached = activeSessionKey != null;
+        for (ProjectSession session : projectSessions.values()) {
+            session.webView.onResume();
+        }
+        if (!activeViewIsCached && webView != null) {
             webView.onResume();
         }
     }

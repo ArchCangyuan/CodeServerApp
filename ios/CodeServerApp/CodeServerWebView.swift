@@ -539,12 +539,16 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
            activeSessionKey != target.key,
            let current = sessions[activeSessionKey] {
             current.lastInactiveAt = now
-            current.webView.isHidden = true
+            // Keep the inactive WKWebView visible behind the active one so WebKit
+            // does not suspend its RDP/WebSocket session. It cannot receive input.
+            current.webView.isHidden = false
+            current.webView.isUserInteractionEnabled = false
         }
 
         activeSessionKey = target.key
         target.lastInactiveAt = nil
         target.webView.isHidden = false
+        target.webView.isUserInteractionEnabled = true
         hostView.bringWebViewToFront(target.webView)
         publishAddress(for: target, fallback: normalized)
 
