@@ -701,7 +701,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         }
     }
 
-    func activate(address: String) {
+    func activate(address: String, restoringSavedAddress: Bool = false) {
         let normalized = Self.normalizedAddress(address)
         guard !normalized.isEmpty else { return }
         requestedAddress = normalized
@@ -734,17 +734,27 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
             current.webView.isUserInteractionEnabled = false
         }
 
+        let currentAddress = target.webView.url?.absoluteString ?? ""
+        let restoreSavedAddress = restoringSavedAddress
+            && !created
+            && !Self.addressesEquivalent(currentAddress, normalized)
+
         activeSessionKey = target.key
         target.lastInactiveAt = nil
         target.webView.isHidden = false
         target.webView.isUserInteractionEnabled = true
         hostView.bringWebViewToFront(target.webView)
-        publishAddress(for: target, fallback: normalized)
 
-        if created, let url = URL(string: normalized) {
+        if (created || restoreSavedAddress), let url = URL(string: normalized) {
+            if currentPageAddress != normalized {
+                currentPageAddress = normalized
+            }
             target.webView.load(URLRequest(url: url))
-        } else if target.appliedZoomSteps != layoutZoomSteps {
-            applyLayoutZoom(to: target, reloadAfterApply: target.webView.url != nil)
+        } else {
+            publishAddress(for: target, fallback: normalized)
+            if target.appliedZoomSteps != layoutZoomSteps {
+                applyLayoutZoom(to: target, reloadAfterApply: target.webView.url != nil)
+            }
         }
         syncModifiers(on: target.webView)
         evictExcessSessions()
@@ -854,13 +864,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
     }
 
     private func session(matching normalizedAddress: String) -> ProjectSession? {
-        if let exact = sessions[normalizedAddress] {
-            return exact
-        }
-        return sessions.values.first { session in
-            guard let currentURL = session.webView.url?.absoluteString else { return false }
-            return Self.normalizedAddress(currentURL) == normalizedAddress
-        }
+        sessions[normalizedAddress]
     }
 
     private func observeURLChanges(for session: ProjectSession) {
@@ -1029,6 +1033,23 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
               let encoded = String(data: data, encoding: .utf8),
               encoded.count >= 2 else { return "\"\"" }
         return String(encoded.dropFirst().dropLast())
+    }
+
+    private static func addressesEquivalent(_ first: String, _ second: String) -> Bool {
+        comparableAddress(first) == comparableAddress(second)
+    }
+
+    private static func comparableAddress(_ address: String) -> String {
+        let normalized = normalizedAddress(address)
+        guard var components = URLComponents(string: normalized) else {
+            return normalized
+        }
+        if components.path == "/" {
+            components.path = ""
+        } else if components.path.hasSuffix("/") {
+            components.path.removeLast()
+        }
+        return components.string ?? normalized
     }
 
     func webView(

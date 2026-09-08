@@ -261,14 +261,14 @@ struct ContentView: View {
         draftAddress = normalized
         activeSessionAddress = normalized
         serverURL = normalized
-        webViewStore.activate(address: normalized)
+        webViewStore.activate(address: normalized, restoringSavedAddress: true)
     }
 
     private func openProject(_ project: ProjectProfile) {
         draftAddress = project.url
         activeSessionAddress = project.url
         serverURL = project.url
-        webViewStore.activate(address: project.url)
+        webViewStore.activate(address: project.url, restoringSavedAddress: true)
         isShowingProjects = false
     }
 

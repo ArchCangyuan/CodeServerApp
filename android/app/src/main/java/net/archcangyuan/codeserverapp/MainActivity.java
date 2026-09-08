@@ -49,7 +49,6 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
@@ -1381,24 +1380,24 @@ public final class MainActivity extends Activity {
         long now = SystemClock.elapsedRealtime();
         cleanupExpiredProjectSessions(now);
 
-        Map.Entry<String, ProjectSession> existingEntry = findProjectSession(normalized);
-        ProjectSession targetSession = existingEntry == null ? null : existingEntry.getValue();
-        String targetSessionKey = existingEntry == null ? normalized : existingEntry.getKey();
+        ProjectSession targetSession = findProjectSession(normalized);
         boolean created = targetSession == null;
         if (created) {
             targetSession = new ProjectSession(createProjectWebView());
             projectSessions.put(normalized, targetSession);
-            targetSessionKey = normalized;
         }
 
-        activateProjectSession(targetSessionKey, targetSession, now);
-        if (created) {
+        String currentUrl = targetSession.webView.getUrl();
+        boolean restoreSavedAddress = !created
+            && !addressesEquivalent(currentUrl, normalized);
+
+        activateProjectSession(normalized, targetSession, now);
+        if (created || restoreSavedAddress) {
             targetSession.webView.loadUrl(normalized);
         }
         evictExcessProjectSessions();
 
-        String currentUrl = targetSession.webView.getUrl();
-        String displayedAddress = currentUrl == null || currentUrl.trim().isEmpty()
+        String displayedAddress = created || restoreSavedAddress
             ? normalized
             : currentUrl;
         addressField.setText(displayedAddress);
@@ -1407,19 +1406,8 @@ public final class MainActivity extends Activity {
         targetSession.webView.requestFocus();
     }
 
-    private Map.Entry<String, ProjectSession> findProjectSession(String address) {
-        String normalized = normalizeAddress(address);
-        ProjectSession exact = projectSessions.get(normalized);
-        if (exact != null) {
-            return new AbstractMap.SimpleImmutableEntry<>(normalized, exact);
-        }
-        for (Map.Entry<String, ProjectSession> entry : projectSessions.entrySet()) {
-            String currentUrl = entry.getValue().webView.getUrl();
-            if (currentUrl != null && normalizeAddress(currentUrl).equals(normalized)) {
-                return entry;
-            }
-        }
-        return null;
+    private ProjectSession findProjectSession(String address) {
+        return projectSessions.get(normalizeAddress(address));
     }
 
     private void updateAddressFromWebView(WebView source, String url) {
@@ -1517,12 +1505,12 @@ public final class MainActivity extends Activity {
     }
 
     private boolean isProjectSessionHot(String address, long now) {
-        Map.Entry<String, ProjectSession> entry = findProjectSession(address);
-        if (entry == null) {
+        String normalized = normalizeAddress(address);
+        ProjectSession session = findProjectSession(normalized);
+        if (session == null) {
             return false;
         }
-        ProjectSession session = entry.getValue();
-        return entry.getKey().equals(activeSessionKey)
+        return normalized.equals(activeSessionKey)
             || (keepAliveEnabled && session.lastInactiveAt > 0L)
             || (session.lastInactiveAt > 0L
                 && now - session.lastInactiveAt < PROJECT_SESSION_TTL_MS);
@@ -1725,6 +1713,30 @@ public final class MainActivity extends Activity {
             return trimmed;
         }
         return "http://" + trimmed;
+    }
+
+    private static boolean addressesEquivalent(String first, String second) {
+        return comparableAddress(first).equals(comparableAddress(second));
+    }
+
+    private static String comparableAddress(String address) {
+        String normalized = normalizeAddress(address);
+        int queryIndex = normalized.indexOf('?');
+        int fragmentIndex = normalized.indexOf('#');
+        int suffixIndex;
+        if (queryIndex < 0) {
+            suffixIndex = fragmentIndex;
+        } else if (fragmentIndex < 0) {
+            suffixIndex = queryIndex;
+        } else {
+            suffixIndex = Math.min(queryIndex, fragmentIndex);
+        }
+        String base = suffixIndex < 0 ? normalized : normalized.substring(0, suffixIndex);
+        String suffix = suffixIndex < 0 ? "" : normalized.substring(suffixIndex);
+        if (base.endsWith("/")) {
+            base = base.substring(0, base.length() - 1);
+        }
+        return base + suffix;
     }
 
     private void installKeyboardBridge(
