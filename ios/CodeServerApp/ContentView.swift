@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 private let savedProjectsKey = "savedProjects"
 
@@ -23,14 +24,17 @@ struct ProjectProfile: Codable, Identifiable, Equatable {
 
 struct ContentView: View {
     @AppStorage("codeServerURL") private var serverURL = ""
+    @AppStorage("keepAliveEnabled") private var keepAliveEnabled = false
     @StateObject private var webViewStore = CodeServerWebViewStore()
     @State private var draftAddress = ""
     @State private var activeSessionAddress = ""
     @State private var savedProjects = ProjectProfile.loadSaved()
     @State private var isShowingProjects = false
+    @State private var isShowingSettings = false
     @State private var controlLocked = false
     @State private var shiftLocked = false
     @State private var isFullscreen = false
+    @Environment(\.scenePhase) private var scenePhase
     @FocusState private var addressFieldFocused: Bool
 
     var body: some View {
@@ -49,6 +53,7 @@ struct ContentView: View {
             if activeSessionAddress.isEmpty {
                 activeSessionAddress = serverURL
             }
+            applyKeepAliveMode()
         }
         .onChange(of: serverURL) { newAddress in
             if !addressFieldFocused {
@@ -61,6 +66,15 @@ struct ContentView: View {
             if !addressFieldFocused {
                 draftAddress = newAddress
             }
+        }
+        .onChange(of: keepAliveEnabled) { _ in
+            applyKeepAliveMode()
+        }
+        .onChange(of: scenePhase) { _ in
+            applyKeepAliveMode()
+        }
+        .sheet(isPresented: $isShowingSettings) {
+            SettingsView(keepAliveEnabled: $keepAliveEnabled)
         }
     }
 
@@ -93,6 +107,12 @@ struct ContentView: View {
                 .disabled(draftAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding(28)
+        .overlay(alignment: .topTrailing) {
+            toolbarButton(systemName: "gearshape", label: "Settings") {
+                isShowingSettings = true
+            }
+            .padding(12)
+        }
     }
 
     private var browserView: some View {
@@ -115,9 +135,6 @@ struct ContentView: View {
                 },
                 onKey: { key in
                     webViewStore.send(key)
-                },
-                onCommand: { command in
-                    webViewStore.sendCommand(command)
                 },
                 onControlC: {
                     webViewStore.sendControlC()
@@ -195,6 +212,10 @@ struct ContentView: View {
             ) {
                 isFullscreen = true
             }
+
+            toolbarButton(systemName: "gearshape", label: "Settings") {
+                isShowingSettings = true
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
@@ -267,6 +288,42 @@ struct ContentView: View {
     private func deleteProjects(at offsets: IndexSet) {
         savedProjects.remove(atOffsets: offsets)
         ProjectProfile.persist(savedProjects)
+    }
+
+    private func applyKeepAliveMode() {
+        let shouldKeepAwake = keepAliveEnabled && scenePhase == .active
+        UIApplication.shared.isIdleTimerDisabled = shouldKeepAwake
+        webViewStore.setKeepAliveEnabled(keepAliveEnabled)
+    }
+}
+
+private struct SettingsView: View {
+    @Binding var keepAliveEnabled: Bool
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section {
+                    Toggle("Keep sessions alive", isOn: $keepAliveEnabled)
+                } footer: {
+                    Text(
+                        "While YourWorkspace is in the foreground, this keeps the screen awake "
+                            + "and keeps all hot project sessions connected. iOS can still "
+                            + "suspend the app after it enters the background."
+                    )
+                }
+            }
+            .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
     }
 }
 

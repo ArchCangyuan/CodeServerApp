@@ -7,9 +7,8 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Configurable code-server URL with persistent cookies and website data
 - Local HTTP server support
 - Reload and server-address controls
-- Supplemental keyboard for `Esc`, `Tab`, `Enter`, `Backspace`, and arrow keys
-- One-tap `/context`, `/rewind`, and `/cost` command submission plus a dedicated
-  `Ctrl+C` shortcut
+- Supplemental keyboard for `Esc`, `Tab`, `Enter`, `Backspace`, arrow keys,
+  `PageUp`, and `PageDown`, plus a dedicated `Ctrl+C` shortcut
 - Lockable `Ctrl` and `Shift` modifiers for combinations entered with the
   on-screen keyboard, a hardware keyboard, or the supplemental keys
 - Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
@@ -23,6 +22,9 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Desktop-style code-server gestures: hold and drag to select text, or hold and
   release to open the right-click context menu for copy and paste
 - Saved project profiles with bold titles and up to ten hot WebView sessions retained for 30 minutes on both platforms
+- Optional session keep-alive setting. Android uses a foreground service and
+  persistent notification; iOS keeps the screen awake while the app is in the foreground.
+  While enabled, hot sessions are exempt from the 30-minute expiry (up to ten sessions).
 - GitHub Actions workflows that produce a TrollStore-ready IPA and an Android APK
 
 ## Repository layout

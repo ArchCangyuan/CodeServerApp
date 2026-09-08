@@ -613,29 +613,6 @@ private let keyboardBridgeSource = #"""
     sendText(text) {
       return forwardText(String(text || ''));
     },
-    sendCommand(command) {
-      const previousControl = state.control;
-      const previousShift = state.shift;
-      if (previousShift) {
-        state.shift = false;
-        dispatchModifier('Shift', 'ShiftLeft', 16, false);
-      }
-      if (previousControl) {
-        state.control = false;
-        dispatchModifier('Control', 'ControlLeft', 17, false);
-      }
-      forwardText(String(command || ''));
-      dispatchCompleteKey('Enter', 'Enter', 13);
-      if (previousControl) {
-        state.control = true;
-        dispatchModifier('Control', 'ControlLeft', 17, true);
-      }
-      if (previousShift) {
-        state.shift = true;
-        dispatchModifier('Shift', 'ShiftLeft', 16, true);
-      }
-      return true;
-    },
     sendShortcut(key, code, keyCode, control, shift) {
       return dispatchShortcut(key, code, keyCode, control, shift);
     },
@@ -681,6 +658,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
     private weak var hostView: WebViewSessionContainerView?
     private var requestedAddress = ""
     private var activeSessionKey: String?
+    private var keepAliveEnabled = false
     private var controlLocked = false
     private var shiftLocked = false
     private var layoutZoomSteps: Int
@@ -800,7 +778,15 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         guard let session = session(matching: normalized) else { return false }
         if session.key == activeSessionKey { return true }
         guard let inactiveAt = session.lastInactiveAt else { return false }
+        if keepAliveEnabled { return true }
         return now - inactiveAt < projectSessionTTL
+    }
+
+    func setKeepAliveEnabled(_ enabled: Bool) {
+        keepAliveEnabled = enabled
+        if !enabled {
+            cleanupExpiredSessions(now: Date.timeIntervalSinceReferenceDate)
+        }
     }
 
     func setModifiers(control: Bool, shift: Bool) {
@@ -832,16 +818,6 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         let script = """
         window.__codeServerAppKeyboard?.sendText(
           \(Self.javaScriptString(text))
-        ) ?? false;
-        """
-        webView.evaluateJavaScript(script)
-    }
-
-    func sendCommand(_ command: String) {
-        guard !command.isEmpty, let webView = activeSession?.webView else { return }
-        let script = """
-        window.__codeServerAppKeyboard?.sendCommand(
-          \(Self.javaScriptString(command))
         ) ?? false;
         """
         webView.evaluateJavaScript(script)
@@ -1007,6 +983,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
     }
 
     private func cleanupExpiredSessions(now: TimeInterval) {
+        guard !keepAliveEnabled else { return }
         let expiredKeys = sessions.compactMap { key, session -> String? in
             guard key != activeSessionKey,
                   let inactiveAt = session.lastInactiveAt,

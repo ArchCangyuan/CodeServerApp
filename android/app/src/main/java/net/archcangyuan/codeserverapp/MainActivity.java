@@ -1,10 +1,13 @@
 package net.archcangyuan.codeserverapp;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Color;
@@ -36,6 +39,7 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -60,6 +64,8 @@ public final class MainActivity extends Activity {
     private static final String PREFERENCES = "code_server_app";
     private static final String ADDRESS_KEY = "server_address";
     private static final String PROJECTS_KEY = "saved_projects";
+    private static final String KEEP_ALIVE_KEY = "keep_alive_enabled";
+    private static final int NOTIFICATION_PERMISSION_REQUEST = 2001;
     private static final String LEGACY_NATIVE_ZOOM_PERCENT_KEY = "zoom_percent";
     private static final String LAYOUT_ZOOM_STEPS_KEY = "layout_zoom_steps";
     private static final String VIEWPORT_RELOAD_ZOOM_MIGRATED_KEY =
@@ -800,29 +806,6 @@ public final class MainActivity extends Activity {
               forwardText(String(text || ''));
               return true;
             },
-            sendCommand(command) {
-              const previousControl = state.control;
-              const previousShift = state.shift;
-              if (previousShift) {
-                state.shift = false;
-                dispatchModifier('Shift', 'ShiftLeft', 16, false);
-              }
-              if (previousControl) {
-                state.control = false;
-                dispatchModifier('Control', 'ControlLeft', 17, false);
-              }
-              forwardText(String(command || ''));
-              dispatchCompleteKey('Enter', 'Enter', 13);
-              if (previousControl) {
-                state.control = true;
-                dispatchModifier('Control', 'ControlLeft', 17, true);
-              }
-              if (previousShift) {
-                state.shift = true;
-                dispatchModifier('Shift', 'ShiftLeft', 16, true);
-              }
-              return true;
-            },
             sendShortcut(key, code, keyCode, control, shift) {
               return dispatchShortcut(key, code, keyCode, control, shift);
             },
@@ -866,6 +849,7 @@ public final class MainActivity extends Activity {
     private boolean controlLocked;
     private boolean shiftLocked;
     private boolean fullscreen;
+    private boolean keepAliveEnabled;
     private int layoutZoomSteps;
 
     @Override
@@ -886,9 +870,11 @@ public final class MainActivity extends Activity {
                 preferences.getInt(LAYOUT_ZOOM_STEPS_KEY, 0)
             )
         );
+        keepAliveEnabled = preferences.getBoolean(KEEP_ALIVE_KEY, false);
         loadProjects();
         setContentView(createContentView());
         configureSystemUi();
+        applyKeepAliveMode();
 
         String savedAddress = preferences.getString(ADDRESS_KEY, "");
         addressField.setText(savedAddress);
@@ -966,6 +952,11 @@ public final class MainActivity extends Activity {
         fullscreenButton.setOnClickListener(view -> toggleFullscreen());
         addressBar.addView(fullscreenButton);
 
+        Button settingsButton = createToolbarButton("⚙");
+        settingsButton.setContentDescription("Settings");
+        settingsButton.setOnClickListener(view -> showSettings());
+        addressBar.addView(settingsButton);
+
         root.addView(
             addressBar,
             new LinearLayout.LayoutParams(
@@ -1025,9 +1016,8 @@ public final class MainActivity extends Activity {
         addRepeatingKey(keyRow, "↑", "ArrowUp", "ArrowUp", 38, dp(50));
         addRepeatingKey(keyRow, "↓", "ArrowDown", "ArrowDown", 40, dp(50));
         addRepeatingKey(keyRow, "→", "ArrowRight", "ArrowRight", 39, dp(50));
-        addCommandKey(keyRow, "/context", "/context", dp(88));
-        addCommandKey(keyRow, "/rewind", "/rewind", dp(84));
-        addCommandKey(keyRow, "/cost", "/cost", dp(68));
+        addKey(keyRow, "PgUp", "PageUp", "PageUp", 33, dp(64));
+        addKey(keyRow, "PgDn", "PageDown", "PageDown", 34, dp(64));
 
         Button controlCButton = createKeyButton("Ctrl+C");
         controlCButton.setContentDescription("Send Control C");
@@ -1052,6 +1042,62 @@ public final class MainActivity extends Activity {
             getWindow().setDecorFitsSystemWindows(false);
         }
         applyFullscreenState();
+    }
+
+    private void showSettings() {
+        CheckBox keepAliveCheckBox = new CheckBox(this);
+        keepAliveCheckBox.setText(
+            "Keep sessions alive\n"
+                + "Uses a foreground service and persistent notification. "
+                + "Keeps up to 10 open sessions connected without the 30-minute expiry. "
+                + "May increase battery usage."
+        );
+        keepAliveCheckBox.setChecked(keepAliveEnabled);
+        int padding = dp(20);
+        keepAliveCheckBox.setPadding(padding, dp(8), padding, dp(8));
+
+        new AlertDialog.Builder(this)
+            .setTitle(boldText("Settings"))
+            .setView(keepAliveCheckBox)
+            .setPositiveButton("Done", (dialog, which) -> {
+                setKeepAliveEnabled(keepAliveCheckBox.isChecked());
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void setKeepAliveEnabled(boolean enabled) {
+        if (keepAliveEnabled == enabled) {
+            return;
+        }
+        keepAliveEnabled = enabled;
+        preferences.edit().putBoolean(KEEP_ALIVE_KEY, enabled).apply();
+        applyKeepAliveMode();
+        if (!enabled) {
+            cleanupExpiredProjectSessions(SystemClock.elapsedRealtime());
+        }
+        Toast.makeText(
+            this,
+            enabled ? "Session keep-alive enabled" : "Session keep-alive disabled",
+            Toast.LENGTH_SHORT
+        ).show();
+    }
+
+    private void applyKeepAliveMode() {
+        Intent serviceIntent = new Intent(this, KeepAliveService.class);
+        if (keepAliveEnabled) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(
+                    new String[] { Manifest.permission.POST_NOTIFICATIONS },
+                    NOTIFICATION_PERMISSION_REQUEST
+                );
+            }
+            startForegroundService(serviceIntent);
+        } else {
+            stopService(serviceIntent);
+        }
     }
 
     private void toggleFullscreen() {
@@ -1428,6 +1474,9 @@ public final class MainActivity extends Activity {
     }
 
     private void cleanupExpiredProjectSessions(long now) {
+        if (keepAliveEnabled) {
+            return;
+        }
         Iterator<Map.Entry<String, ProjectSession>> iterator =
             projectSessions.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -1474,6 +1523,7 @@ public final class MainActivity extends Activity {
         }
         ProjectSession session = entry.getValue();
         return entry.getKey().equals(activeSessionKey)
+            || (keepAliveEnabled && session.lastInactiveAt > 0L)
             || (session.lastInactiveAt > 0L
                 && now - session.lastInactiveAt < PROJECT_SESSION_TTL_MS);
     }
@@ -1761,15 +1811,6 @@ public final class MainActivity extends Activity {
         webView.requestFocus();
     }
 
-    private void sendCommand(String command) {
-        String script = "window.__codeServerAppKeyboard"
-            + " && typeof window.__codeServerAppKeyboard.sendCommand === 'function'"
-            + " ? window.__codeServerAppKeyboard.sendCommand("
-            + JSONObject.quote(command) + ") : false";
-        webView.evaluateJavascript(script, null);
-        webView.requestFocus();
-    }
-
     private void sendControlC() {
         String script = "window.__codeServerAppKeyboard"
             + " && typeof window.__codeServerAppKeyboard.sendShortcut === 'function'"
@@ -1825,18 +1866,6 @@ public final class MainActivity extends Activity {
             }
             return true;
         });
-        row.addView(button, keyLayoutParams(width));
-    }
-
-    private void addCommandKey(
-        LinearLayout row,
-        String label,
-        String command,
-        int width
-    ) {
-        Button button = createKeyButton(label);
-        button.setContentDescription("Send " + command + " command");
-        button.setOnClickListener(view -> sendCommand(command));
         row.addView(button, keyLayoutParams(width));
     }
 
@@ -1905,12 +1934,14 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
-        boolean activeViewIsCached = activeSessionKey != null;
-        for (ProjectSession session : projectSessions.values()) {
-            session.webView.onPause();
-        }
-        if (!activeViewIsCached && webView != null) {
-            webView.onPause();
+        if (!keepAliveEnabled) {
+            boolean activeViewIsCached = activeSessionKey != null;
+            for (ProjectSession session : projectSessions.values()) {
+                session.webView.onPause();
+            }
+            if (!activeViewIsCached && webView != null) {
+                webView.onPause();
+            }
         }
         super.onPause();
     }

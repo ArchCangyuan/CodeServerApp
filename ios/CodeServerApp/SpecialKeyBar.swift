@@ -15,6 +15,8 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
     case arrowUp
     case arrowDown
     case arrowRight
+    case pageUp
+    case pageDown
 
     var id: String { rawValue }
 
@@ -37,6 +39,8 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
         case .arrowUp: return "↑"
         case .arrowDown: return "↓"
         case .arrowRight: return "→"
+        case .pageUp: return "PgUp"
+        case .pageDown: return "PgDn"
         }
     }
 
@@ -58,6 +62,10 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
             return KeyboardStroke(key: "ArrowDown", code: "ArrowDown", keyCode: 40)
         case .arrowRight:
             return KeyboardStroke(key: "ArrowRight", code: "ArrowRight", keyCode: 39)
+        case .pageUp:
+            return KeyboardStroke(key: "PageUp", code: "PageUp", keyCode: 33)
+        case .pageDown:
+            return KeyboardStroke(key: "PageDown", code: "PageDown", keyCode: 34)
         }
     }
 }
@@ -69,7 +77,6 @@ struct SpecialKeyBar: View {
 
     let onKeyboard: () -> Void
     let onKey: (CodeServerKey) -> Void
-    let onCommand: (String) -> Void
     let onControlC: () -> Void
     let onModifiersChanged: (_ control: Bool, _ shift: Bool) -> Void
 
@@ -97,12 +104,6 @@ struct SpecialKeyBar: View {
                         keyButton(label: key.label, accessibilityLabel: key.label) {
                             onKey(key)
                         }
-                    }
-                }
-
-                ForEach(["/context", "/rewind", "/cost"], id: \.self) { command in
-                    keyButton(label: command, accessibilityLabel: "Send \(command) command") {
-                        onCommand(command)
                     }
                 }
 
