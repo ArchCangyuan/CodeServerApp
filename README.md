@@ -23,7 +23,9 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
   release to open the right-click context menu for copy and paste
 - Saved project profiles with bold titles and up to ten hot WebView sessions retained for 30 minutes on both platforms
 - Optional session keep-alive setting. Android uses a foreground service and
-  persistent notification; iOS keeps the screen awake while the app is in the foreground.
+  persistent notification, partial wake lock, native WebView pulses, and an optional
+  one-pixel overlay anchor. It can request overlay and unrestricted-battery permissions
+  from Android system settings. iOS keeps the screen awake while the app is in the foreground.
   While enabled, hot sessions are exempt from the 30-minute expiry (up to ten sessions).
 - GitHub Actions workflows that produce a TrollStore-ready IPA and an Android APK
 

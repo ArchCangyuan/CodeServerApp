@@ -13,9 +13,14 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Typeface;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.text.Editable;
 import android.text.SpannableString;
 import android.text.SpannableStringBuilder;
@@ -65,6 +70,8 @@ public final class MainActivity extends Activity {
     private static final String PROJECTS_KEY = "saved_projects";
     private static final String KEEP_ALIVE_KEY = "keep_alive_enabled";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 2001;
+    private static final int OVERLAY_PERMISSION_REQUEST = 2002;
+    private static final long SESSION_KEEP_ALIVE_PULSE_MS = 10_000L;
     private static final String LEGACY_NATIVE_ZOOM_PERCENT_KEY = "zoom_percent";
     private static final String LAYOUT_ZOOM_STEPS_KEY = "layout_zoom_steps";
     private static final String VIEWPORT_RELOAD_ZOOM_MIGRATED_KEY =
@@ -80,6 +87,9 @@ public final class MainActivity extends Activity {
     private static final String DESKTOP_USER_AGENT =
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    private static final String KEEP_ALIVE_PULSE_SCRIPT =
+        "(() => { window.dispatchEvent(new Event('__your_workspace_keep_alive')); "
+            + "return document.visibilityState; })()";
 
     private static final String KEYBOARD_BRIDGE = """
         (() => {
@@ -850,6 +860,23 @@ public final class MainActivity extends Activity {
     private boolean fullscreen;
     private boolean keepAliveEnabled;
     private int layoutZoomSteps;
+    private final Handler keepAliveHandler = new Handler(Looper.getMainLooper());
+    private final Runnable sessionKeepAlivePulse = new Runnable() {
+        @Override
+        public void run() {
+            if (!keepAliveEnabled || isDestroyed()) {
+                return;
+            }
+            boolean activeViewIsCached = activeSessionKey != null;
+            for (ProjectSession session : projectSessions.values()) {
+                pulseWebView(session.webView);
+            }
+            if (!activeViewIsCached) {
+                pulseWebView(webView);
+            }
+            keepAliveHandler.postDelayed(this, SESSION_KEEP_ALIVE_PULSE_MS);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -1047,7 +1074,8 @@ public final class MainActivity extends Activity {
         CheckBox keepAliveCheckBox = new CheckBox(this);
         keepAliveCheckBox.setText(
             "Keep sessions alive\n"
-                + "Uses a foreground service and persistent notification. "
+                + "Uses a foreground service, persistent notification, native WebView pulses, "
+                + "and an optional 1-pixel overlay process anchor. "
                 + "Keeps up to 10 open sessions connected without the 30-minute expiry. "
                 + "May increase battery usage."
         );
@@ -1061,6 +1089,9 @@ public final class MainActivity extends Activity {
             .setPositiveButton("Done", (dialog, which) -> {
                 setKeepAliveEnabled(keepAliveCheckBox.isChecked());
             })
+            .setNeutralButton("System permissions", (dialog, which) -> {
+                requestKeepAlivePermissions();
+            })
             .setNegativeButton("Cancel", null)
             .show();
     }
@@ -1072,6 +1103,11 @@ public final class MainActivity extends Activity {
         keepAliveEnabled = enabled;
         preferences.edit().putBoolean(KEEP_ALIVE_KEY, enabled).apply();
         applyKeepAliveMode();
+        updateWebViewRendererPriority();
+        updateSessionKeepAlivePulse();
+        if (enabled) {
+            requestKeepAlivePermissions();
+        }
         if (!enabled) {
             cleanupExpiredProjectSessions(SystemClock.elapsedRealtime());
         }
@@ -1085,17 +1121,114 @@ public final class MainActivity extends Activity {
     private void applyKeepAliveMode() {
         Intent serviceIntent = new Intent(this, KeepAliveService.class);
         if (keepAliveEnabled) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                    != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(
-                    new String[] { Manifest.permission.POST_NOTIFICATIONS },
-                    NOTIFICATION_PERMISSION_REQUEST
-                );
-            }
             startForegroundService(serviceIntent);
         } else {
             stopService(serviceIntent);
+        }
+    }
+
+    private void requestKeepAlivePermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+            && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                new String[] { Manifest.permission.POST_NOTIFICATIONS },
+                NOTIFICATION_PERMISSION_REQUEST
+            );
+            return;
+        }
+        requestAggressiveKeepAlivePermissions();
+    }
+
+    private void requestAggressiveKeepAlivePermissions() {
+        if (!Settings.canDrawOverlays(this)) {
+            Intent overlayIntent = new Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:" + getPackageName())
+            );
+            startActivityForResult(overlayIntent, OVERLAY_PERMISSION_REQUEST);
+            return;
+        }
+        requestBatteryOptimizationExemption();
+    }
+
+    private void requestBatteryOptimizationExemption() {
+        PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+        if (powerManager == null
+            || powerManager.isIgnoringBatteryOptimizations(getPackageName())) {
+            return;
+        }
+        try {
+            Intent batteryIntent = new Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:" + getPackageName())
+            );
+            startActivity(batteryIntent);
+        } catch (RuntimeException exception) {
+            Toast.makeText(
+                this,
+                "Open system battery settings and allow unrestricted background use",
+                Toast.LENGTH_LONG
+            ).show();
+        }
+    }
+
+    private void updateSessionKeepAlivePulse() {
+        keepAliveHandler.removeCallbacks(sessionKeepAlivePulse);
+        if (keepAliveEnabled) {
+            keepAliveHandler.post(sessionKeepAlivePulse);
+        }
+    }
+
+    private void updateWebViewRendererPriority() {
+        boolean activeViewIsCached = activeSessionKey != null;
+        for (ProjectSession session : projectSessions.values()) {
+            applyWebViewRendererPriority(session.webView);
+        }
+        if (!activeViewIsCached) {
+            applyWebViewRendererPriority(webView);
+        }
+    }
+
+    private void applyWebViewRendererPriority(WebView target) {
+        if (target == null) {
+            return;
+        }
+        target.setRendererPriorityPolicy(
+            keepAliveEnabled
+                ? WebView.RENDERER_PRIORITY_IMPORTANT
+                : WebView.RENDERER_PRIORITY_BOUND,
+            !keepAliveEnabled
+        );
+    }
+
+    private void pulseWebView(WebView target) {
+        if (target == null) {
+            return;
+        }
+        try {
+            target.evaluateJavascript(KEEP_ALIVE_PULSE_SCRIPT, null);
+        } catch (RuntimeException ignored) {}
+    }
+
+    @Override
+    public void onRequestPermissionsResult(
+        int requestCode,
+        String[] permissions,
+        int[] grantResults
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == NOTIFICATION_PERMISSION_REQUEST) {
+            requestAggressiveKeepAlivePermissions();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == OVERLAY_PERMISSION_REQUEST) {
+            applyKeepAliveMode();
+            requestBatteryOptimizationExemption();
         }
     }
 
@@ -1257,6 +1390,7 @@ public final class MainActivity extends Activity {
         target.setFocusableInTouchMode(true);
         target.setVisibility(View.GONE);
         configureWebView(target);
+        applyWebViewRendererPriority(target);
         webContainer.addView(
             target,
             new FrameLayout.LayoutParams(
@@ -1961,6 +2095,10 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (keepAliveEnabled) {
+            applyKeepAliveMode();
+        }
+        updateSessionKeepAlivePulse();
         boolean activeViewIsCached = activeSessionKey != null;
         for (ProjectSession session : projectSessions.values()) {
             session.webView.onResume();
@@ -1972,6 +2110,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        keepAliveHandler.removeCallbacks(sessionKeepAlivePulse);
         boolean activeViewIsCached = activeSessionKey != null;
         for (ProjectSession session : new ArrayList<>(projectSessions.values())) {
             destroyWebView(session.webView);
