@@ -119,9 +119,14 @@ struct ContentView: View {
     }
 
     private var browserView: some View {
+        // The page fills the status-bar area too; only the address bar steps
+        // below the sensor housing when it is shown.
+        GeometryReader { proxy in
         VStack(spacing: 0) {
             if isAddressBarVisible {
                 addressBar
+                    .padding(.top, proxy.safeAreaInsets.top)
+                    .background(Color(uiColor: .secondarySystemBackground))
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
 
@@ -173,6 +178,9 @@ struct ContentView: View {
                 }
             )
         }
+        .ignoresSafeArea(.container, edges: .top)
+        }
+        .deferringTopEdgeSystemGesture()
         .animation(.easeInOut(duration: 0.18), value: isAddressBarVisible)
         .onChange(of: webViewStore.pageLoadCount) { _ in
             showAddressBarTemporarily()
@@ -309,6 +317,18 @@ struct ContentView: View {
         let shouldKeepAwake = keepAliveEnabled && scenePhase == .active
         UIApplication.shared.isIdleTimerDisabled = shouldKeepAwake
         webViewStore.setKeepAliveEnabled(keepAliveEnabled)
+    }
+}
+
+private extension View {
+    /// Lets the app's top-edge pull win over Notification Center on the first swipe.
+    @ViewBuilder
+    func deferringTopEdgeSystemGesture() -> some View {
+        if #available(iOS 16.0, *) {
+            defersSystemGestures(on: .top)
+        } else {
+            self
+        }
     }
 }
 
