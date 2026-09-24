@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
@@ -63,6 +64,7 @@ final class RdpGateway {
     private final Map<String, String> sessionHosts = new ConcurrentHashMap<>();
     private final Map<String, String> sessionStages = new ConcurrentHashMap<>();
     private final Map<String, String> sessionErrors = new ConcurrentHashMap<>();
+    private final java.util.Set<String> rsaKeyExchangeHosts = ConcurrentHashMap.newKeySet();
     private final SecureRandom random = new SecureRandom();
     private volatile Listener listener;
 
@@ -258,16 +260,38 @@ final class RdpGateway {
         output.flush();
     }
 
+    /** The tunnel, X.224 response and TLS connection to one RDP server. */
+    private static final class ServerLink implements java.io.Closeable {
+        AccessWebSocket tunnel;
+        Socket[] pair;
+        SSLSocket tls;
+        byte[] x224Response;
+
+        @Override
+        public void close() {
+            if (tls != null) {
+                closeQuietly(tls);
+            }
+            if (pair != null) {
+                closeQuietly(pair[0]);
+                closeQuietly(pair[1]);
+            }
+            if (tunnel != null) {
+                tunnel.close();
+            }
+        }
+    }
+
+    /** Signals a failure already answered with an RDCleanPath error PDU. */
+    private static final class ReportedException extends Exception {}
+
     /** One RDCleanPath session: handshake, TLS to the RDP server, then relay. */
     private void runCleanPathSession(AccessWebSocket client) {
-        AccessWebSocket tunnel = null;
-        Socket[] pair = null;
-        SSLSocket tls = null;
-        String host = null;
+        ServerLink link = null;
         String sessionToken = null;
         try {
             RdCleanPath.Request request = readRequest(client);
-            host = sessionHosts.get(request.proxyAuth);
+            String host = sessionHosts.get(request.proxyAuth);
             if (host == null) {
                 sendPdu(client, RdCleanPath.encodeGeneralError(403));
                 return;
@@ -282,45 +306,34 @@ final class RdpGateway {
                 sendPdu(client, RdCleanPath.encodeGeneralError(401));
                 return;
             }
+
+            boolean rsaKeyExchange = rsaKeyExchangeHosts.contains(host);
             try {
-                tunnel = environment.openTunnel(host, token);
-            } catch (AccessWebSocket.LoginRequiredException exception) {
-                setError(sessionToken, "Cloudflare sign-in required");
-                environment.clearToken(host);
-                notifyLoginRequired(host);
-                sendPdu(client, RdCleanPath.encodeGeneralError(401));
-                return;
-            } catch (IOException exception) {
-                setError(sessionToken, "Cloudflare tunnel failed: " + describe(exception));
-                sendPdu(client, RdCleanPath.encodeGeneralError(502));
+                link = connectServer(client, sessionToken, host, token, request, rsaKeyExchange);
+            } catch (SSLHandshakeException exception) {
+                if (rsaKeyExchange || !isKeyUsageFailure(exception)) {
+                    throw exception;
+                }
+                // Windows' self-signed RDP certificate only allows key
+                // encipherment, which BoringSSL enforces for ECDHE and TLS 1.3
+                // (Windows clients do not). Fall back to RSA key exchange.
+                rsaKeyExchangeHosts.add(host);
+                link = connectServer(client, sessionToken, host, token, request, true);
+            }
+            if (link == null) {
                 return;
             }
 
-            setStage(sessionToken, "negotiate");
-            TunnelInputStream tunnelInput = new TunnelInputStream(tunnel);
-            tunnel.sendBinary(request.x224ConnectionRequest, 0, request.x224ConnectionRequest.length);
-            byte[] x224Response = readTpkt(tunnelInput);
-            if (x224Response.length >= 12 && (x224Response[11] & 0xFF) == 0x03) {
-                // RDP_NEG_FAILURE: let the client explain (e.g. CredSSP required).
-                setError(sessionToken, "The remote PC refused the security protocol");
-                sendPdu(client, RdCleanPath.encodeNegotiationError(x224Response));
-                return;
-            }
-
-            setStage(sessionToken, "tls");
-            pair = socketPair();
-            pump(tunnelInput, pair[1], tunnel);
-            tls = (SSLSocket) trustAllContext().getSocketFactory()
-                .createSocket(pair[0], host, TLS_PORT, true);
-            tls.startHandshake();
             List<byte[]> chain = new ArrayList<>();
-            for (Certificate certificate : tls.getSession().getPeerCertificates()) {
+            for (Certificate certificate : link.tls.getSession().getPeerCertificates()) {
                 chain.add(certificate.getEncoded());
             }
-            sendPdu(client, RdCleanPath.encodeResponse(host + ":" + TLS_PORT, x224Response, chain));
+            sendPdu(client, RdCleanPath.encodeResponse(host + ":" + TLS_PORT, link.x224Response, chain));
 
             setStage(sessionToken, "relay");
-            relay(client, tls);
+            relay(client, link.tls);
+        } catch (ReportedException exception) {
+            // The client already has the error.
         } catch (Exception exception) {
             if (sessionToken != null && !"relay".equals(sessionStages.get(sessionToken))) {
                 setError(sessionToken, describe(exception));
@@ -332,17 +345,92 @@ final class RdpGateway {
             }
         } finally {
             client.close();
-            if (tls != null) {
-                closeQuietly(tls);
-            }
-            if (pair != null) {
-                closeQuietly(pair[0]);
-                closeQuietly(pair[1]);
-            }
-            if (tunnel != null) {
-                tunnel.close();
+            if (link != null) {
+                link.close();
             }
         }
+    }
+
+    /**
+     * Opens the tunnel, exchanges the X.224 connection request and completes
+     * TLS with the server. Returns {@code null} after answering the client
+     * with a negotiation failure.
+     */
+    private ServerLink connectServer(
+        AccessWebSocket client,
+        String sessionToken,
+        String host,
+        String token,
+        RdCleanPath.Request request,
+        boolean rsaKeyExchange
+    ) throws Exception {
+        ServerLink link = new ServerLink();
+        boolean done = false;
+        try {
+            setStage(sessionToken, "tunnel");
+            try {
+                link.tunnel = environment.openTunnel(host, token);
+            } catch (AccessWebSocket.LoginRequiredException exception) {
+                setError(sessionToken, "Cloudflare sign-in required");
+                environment.clearToken(host);
+                notifyLoginRequired(host);
+                sendPdu(client, RdCleanPath.encodeGeneralError(401));
+                throw new ReportedException();
+            } catch (IOException exception) {
+                setError(sessionToken, "Cloudflare tunnel failed: " + describe(exception));
+                sendPdu(client, RdCleanPath.encodeGeneralError(502));
+                throw new ReportedException();
+            }
+
+            setStage(sessionToken, "negotiate");
+            TunnelInputStream tunnelInput = new TunnelInputStream(link.tunnel);
+            link.tunnel.sendBinary(request.x224ConnectionRequest, 0, request.x224ConnectionRequest.length);
+            link.x224Response = readTpkt(tunnelInput);
+            if (link.x224Response.length >= 12 && (link.x224Response[11] & 0xFF) == 0x03) {
+                // RDP_NEG_FAILURE: let the client explain (e.g. CredSSP required).
+                setError(sessionToken, "The remote PC refused the security protocol");
+                sendPdu(client, RdCleanPath.encodeNegotiationError(link.x224Response));
+                return null;
+            }
+
+            setStage(sessionToken, "tls");
+            link.pair = socketPair();
+            pump(tunnelInput, link.pair[1], link.tunnel);
+            link.tls = (SSLSocket) trustAllContext().getSocketFactory()
+                .createSocket(link.pair[0], host, TLS_PORT, true);
+            if (rsaKeyExchange) {
+                restrictToRsaKeyExchange(link.tls);
+            }
+            link.tls.startHandshake();
+            done = true;
+            return link;
+        } finally {
+            if (!done) {
+                link.close();
+            }
+        }
+    }
+
+    private static boolean isKeyUsageFailure(SSLHandshakeException exception) {
+        for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
+            String message = cause.getMessage();
+            if (message != null && message.toUpperCase(Locale.US).contains("KEY_USAGE")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** TLS 1.2 with RSA key exchange only, which needs no signature from the certificate. */
+    private static void restrictToRsaKeyExchange(SSLSocket socket) {
+        List<String> suites = new ArrayList<>();
+        for (String suite : socket.getSupportedCipherSuites()) {
+            if (suite.startsWith("TLS_RSA_WITH_AES_")) {
+                suites.add(suite);
+            }
+        }
+        socket.setEnabledCipherSuites(suites.toArray(new String[0]));
+        socket.setEnabledProtocols(new String[] { "TLSv1.2" });
     }
 
     private void notifyLoginRequired(String host) {
