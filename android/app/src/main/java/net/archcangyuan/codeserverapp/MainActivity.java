@@ -572,31 +572,6 @@ public final class MainActivity extends Activity {
             window.location.reload();
           };
           window.setInterval(reloadOnExpiredAccessToken, 2000);
-
-          // A quiet remote desktop can send nothing for minutes, and mobile networks or
-          // routers then drop the idle connection; the reconnect asks for the password
-          // again. Every 45 s, repeat the last pointer position on the IronRDP canvas so
-          // a little input keeps the connection active. The remote cursor does not move.
-          const rdpPointer = { x: null, y: null };
-          document.addEventListener('mousemove', (event) => {
-            const canvas = state.ironRdpCanvas;
-            if (!canvas || typeof event.composedPath !== 'function') return;
-            if (!event.composedPath().includes(canvas)) return;
-            rdpPointer.x = event.clientX;
-            rdpPointer.y = event.clientY;
-          }, true);
-          window.setInterval(() => {
-            const canvas = state.ironRdpCanvas;
-            if (!canvas || !canvas.isConnected || rdpPointer.x === null) return;
-            if (document.visibilityState !== 'visible' || mouse.buttons) return;
-            const point = {
-              clientX: rdpPointer.x,
-              clientY: rdpPointer.y,
-              screenX: rdpPointer.x,
-              screenY: rdpPointer.y
-            };
-            dispatchMouse(canvas, 'mousemove', point, 0, 0);
-          }, 45000);
           const isProxy = (element) => Boolean(element && element.id === PROXY_ID);
 
           const deepestActiveElement = (rootDocument) => {
