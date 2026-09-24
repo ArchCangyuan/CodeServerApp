@@ -335,8 +335,8 @@ private struct ZoomSlider: View {
     @State private var isEditing = false
 
     private var range: ClosedRange<Double> {
-        Double(CodeServerWebViewStore.zoomStepRange.lowerBound)
-            ...Double(CodeServerWebViewStore.zoomStepRange.upperBound)
+        let steps = CodeServerWebViewStore.zoomStepRange
+        return Double(steps.lowerBound)...Double(steps.upperBound)
     }
 
     var body: some View {
