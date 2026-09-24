@@ -1604,7 +1604,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
             target = existing
             created = false
         } else {
-            let webView = makeWebView()
+            let webView = makeWebView(zoomSteps: savedZoomSteps(forKey: normalized))
             target = ProjectSession(key: normalized, webView: webView)
             sessions[normalized] = target
             observeURLChanges(for: target)
@@ -1628,6 +1628,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
             && !Self.addressesEquivalent(currentAddress, normalized)
 
         activeSessionKey = target.key
+        showZoom(of: target.key)
         target.lastInactiveAt = nil
         target.webView.isHidden = false
         target.webView.isUserInteractionEnabled = true
@@ -1666,10 +1667,13 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         guard nextSteps != layoutZoomSteps else { return }
 
         layoutZoomSteps = nextSteps
-        UserDefaults.standard.set(layoutZoomSteps, forKey: layoutZoomStepsKey)
+        UserDefaults.standard.set(layoutZoomSteps, forKey: Self.zoomStepsKey(forKey: activeSessionKey))
         zoomPercent = Self.zoomPercent(forSteps: layoutZoomSteps)
-        for session in sessions.values {
-            installUserScripts(in: session.webView.configuration.userContentController)
+        if let activeSession {
+            installUserScripts(
+                in: activeSession.webView.configuration.userContentController,
+                zoomSteps: layoutZoomSteps
+            )
         }
         if let activeSession {
             applyLayoutZoom(
@@ -1808,14 +1812,14 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         }
     }
 
-    private func makeWebView() -> WKWebView {
+    private func makeWebView(zoomSteps: Int) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         configuration.defaultWebpagePreferences.preferredContentMode = .desktop
-        installUserScripts(in: configuration.userContentController)
+        installUserScripts(in: configuration.userContentController, zoomSteps: zoomSteps)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         disableDoubleTapZoom(in: webView)
@@ -1835,12 +1839,12 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         return webView
     }
 
-    private func installUserScripts(in controller: WKUserContentController) {
+    private func installUserScripts(in controller: WKUserContentController, zoomSteps: Int) {
         controller.removeAllUserScripts()
         // Seed the zoomed viewport width so the first layout already uses it.
         controller.addUserScript(
             WKUserScript(
-                source: "window.__codeServerAppViewportWidth = \(viewportWidth());",
+                source: "window.__codeServerAppViewportWidth = \(viewportWidth(steps: zoomSteps));",
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: true
             )
@@ -1888,16 +1892,43 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         )
     }
 
-    private func viewportWidth() -> Int {
-        Int(round(Double(desktopViewportWidth) / pow(layoutZoomFactor, Double(layoutZoomSteps))))
+    /// Each project keeps its own zoom; the global value is the default for new ones.
+    private static func zoomStepsKey(forKey key: String?) -> String {
+        guard let key else { return layoutZoomStepsKey }
+        return "\(layoutZoomStepsKey):\(key)"
+    }
+
+    private func savedZoomSteps(forKey key: String?) -> Int {
+        let defaults = UserDefaults.standard
+        let global = defaults.integer(forKey: layoutZoomStepsKey)
+        let keyName = Self.zoomStepsKey(forKey: key)
+        let saved = defaults.object(forKey: keyName) == nil ? global : defaults.integer(forKey: keyName)
+        return min(max(saved, minimumLayoutZoomSteps), maximumLayoutZoomSteps)
+    }
+
+    private func zoomStepsOf(_ session: ProjectSession) -> Int {
+        session.key == activeSessionKey ? layoutZoomSteps : savedZoomSteps(forKey: session.key)
+    }
+
+    /// Makes the zoom slider show (and set) the zoom of the project in front.
+    private func showZoom(of key: String?) {
+        layoutZoomSteps = savedZoomSteps(forKey: key)
+        let percent = Self.zoomPercent(forSteps: layoutZoomSteps)
+        if zoomPercent != percent {
+            zoomPercent = percent
+        }
+    }
+
+    private func viewportWidth(steps: Int) -> Int {
+        Int(round(Double(desktopViewportWidth) / pow(layoutZoomFactor, Double(steps))))
     }
 
     /// Applies the layout zoom in place by changing the virtual viewport width and
     /// pinning the page scale to fit it. The page reloads only when the web view
     /// still does not fit afterwards and a fallback reload is allowed.
     private func applyLayoutZoom(to session: ProjectSession, allowFallbackReload: Bool) {
-        let requestedSteps = layoutZoomSteps
-        let requestedWidth = viewportWidth()
+        let requestedSteps = zoomStepsOf(session)
+        let requestedWidth = viewportWidth(steps: requestedSteps)
         let viewWidth = session.webView.bounds.width > 0
             ? session.webView.bounds.width
             : hostView?.bounds.width ?? 0
@@ -1928,7 +1959,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
                 guard let self,
                       let session,
                       self.sessions[session.key] === session,
-                      requestedSteps == self.layoutZoomSteps else { return }
+                      requestedSteps == self.zoomStepsOf(session) else { return }
                 session.appliedZoomSteps = requestedSteps
             }
         }
@@ -2023,8 +2054,9 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         if session.key == activeSessionKey {
             pageLoadCount += 1
         }
-        let zoomChanged = (session.appliedZoomSteps == nil && layoutZoomSteps != 0)
-            || (session.appliedZoomSteps != nil && session.appliedZoomSteps != layoutZoomSteps)
+        let steps = zoomStepsOf(session)
+        let zoomChanged = (session.appliedZoomSteps == nil && steps != 0)
+            || (session.appliedZoomSteps != nil && session.appliedZoomSteps != steps)
         applyLayoutZoom(to: session, allowFallbackReload: zoomChanged)
         syncModifiers(on: webView)
         syncMouseMode(on: webView)

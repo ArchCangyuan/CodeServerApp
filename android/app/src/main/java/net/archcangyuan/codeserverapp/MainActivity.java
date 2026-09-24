@@ -1745,6 +1745,7 @@ public final class MainActivity extends Activity {
     private Button disconnectButton;
     private LinearLayout zoomOverlay;
     private TextView zoomPercentLabel;
+    private SeekBar zoomSlider;
     private boolean zoomSliderTracking;
     private WebView webView;
     private String activeSessionKey;
@@ -2420,6 +2421,16 @@ public final class MainActivity extends Activity {
         webView.setVisibility(View.VISIBLE);
         webView.onResume();
         activeSessionKey = null;
+        showZoomOf(null);
+    }
+
+    /** Makes the zoom slider show (and set) the zoom of the page in front. */
+    private void showZoomOf(String sessionKey) {
+        layoutZoomSteps = zoomStepsFor(sessionKey);
+        if (zoomSlider != null) {
+            zoomSlider.setProgress(layoutZoomSteps - MIN_LAYOUT_ZOOM_STEPS);
+        }
+        updateZoomPercentLabel(layoutZoomSteps);
     }
 
     private LinearLayout createZoomOverlay() {
@@ -2442,6 +2453,7 @@ public final class MainActivity extends Activity {
         overlay.addView(smaller);
 
         SeekBar slider = new SeekBar(this);
+        zoomSlider = slider;
         slider.setMax(MAX_LAYOUT_ZOOM_STEPS - MIN_LAYOUT_ZOOM_STEPS);
         slider.setProgress(layoutZoomSteps - MIN_LAYOUT_ZOOM_STEPS);
         slider.setContentDescription("UI zoom");
@@ -2503,19 +2515,46 @@ public final class MainActivity extends Activity {
     }
 
     private void setLayoutZoomSteps(int steps) {
-        int nextSteps = Math.max(MIN_LAYOUT_ZOOM_STEPS, Math.min(MAX_LAYOUT_ZOOM_STEPS, steps));
+        int nextSteps = clampZoomSteps(steps);
         if (webView == null || nextSteps == layoutZoomSteps) {
             return;
         }
         layoutZoomSteps = nextSteps;
-        preferences.edit().putInt(LAYOUT_ZOOM_STEPS_KEY, layoutZoomSteps).apply();
+        preferences.edit().putInt(zoomStepsKey(activeSessionKey), layoutZoomSteps).apply();
         applyLayoutZoom(webView, true);
     }
 
-    private int calculateLayoutViewportWidth() {
-        return (int) Math.round(
-            DESKTOP_VIEWPORT_WIDTH / Math.pow(LAYOUT_ZOOM_FACTOR, layoutZoomSteps)
-        );
+    private static int clampZoomSteps(int steps) {
+        return Math.max(MIN_LAYOUT_ZOOM_STEPS, Math.min(MAX_LAYOUT_ZOOM_STEPS, steps));
+    }
+
+    /** Each project keeps its own zoom; pages outside a project use the global one. */
+    private static String zoomStepsKey(String sessionKey) {
+        return sessionKey == null ? LAYOUT_ZOOM_STEPS_KEY : LAYOUT_ZOOM_STEPS_KEY + ":" + sessionKey;
+    }
+
+    /** A project's zoom; projects without one start from the global zoom. */
+    private int zoomStepsFor(String sessionKey) {
+        int global = preferences.getInt(LAYOUT_ZOOM_STEPS_KEY, 0);
+        return clampZoomSteps(sessionKey == null
+            ? global
+            : preferences.getInt(zoomStepsKey(sessionKey), global));
+    }
+
+    private int zoomStepsFor(WebView target) {
+        if (target == webView) {
+            return layoutZoomSteps;
+        }
+        for (Map.Entry<String, ProjectSession> entry : projectSessions.entrySet()) {
+            if (entry.getValue().webView == target) {
+                return zoomStepsFor(entry.getKey());
+            }
+        }
+        return zoomStepsFor((String) null);
+    }
+
+    private static int calculateLayoutViewportWidth(int steps) {
+        return (int) Math.round(DESKTOP_VIEWPORT_WIDTH / Math.pow(LAYOUT_ZOOM_FACTOR, steps));
     }
 
     /**
@@ -2527,8 +2566,8 @@ public final class MainActivity extends Activity {
         if (target == null) {
             return;
         }
-        int requestedSteps = layoutZoomSteps;
-        int viewportWidth = calculateLayoutViewportWidth();
+        int requestedSteps = zoomStepsFor(target);
+        int viewportWidth = calculateLayoutViewportWidth(requestedSteps);
         int viewWidthPx = target.getWidth() > 0
             ? target.getWidth()
             : (webContainer == null ? 0 : webContainer.getWidth());
@@ -2553,7 +2592,7 @@ public final class MainActivity extends Activity {
             + "return width;"
             + "})()";
         target.evaluateJavascript(script, value -> {
-            if (requestedSteps != layoutZoomSteps) {
+            if (requestedSteps != zoomStepsFor(target)) {
                 return;
             }
             appliedLayoutZoomSteps.put(target, requestedSteps);
@@ -2784,6 +2823,7 @@ public final class MainActivity extends Activity {
         webView = targetSession.webView;
         activeSessionKey = sessionKey;
         targetSession.lastInactiveAt = 0L;
+        showZoomOf(sessionKey);
         webView.setVisibility(View.VISIBLE);
         webView.bringToFront();
         webView.onResume();
@@ -3154,13 +3194,14 @@ public final class MainActivity extends Activity {
 
     private void installKeyboardBridge(WebView target, boolean applyZoom) {
         // Seed the zoomed viewport width so the first layout already uses it.
+        int steps = zoomStepsFor(target);
         String script = "window.__codeServerAppViewportWidth="
-            + calculateLayoutViewportWidth() + ";" + KEYBOARD_BRIDGE;
+            + calculateLayoutViewportWidth(steps) + ";" + KEYBOARD_BRIDGE;
         target.evaluateJavascript(script, value -> {
             if (applyZoom) {
                 Integer appliedSteps = appliedLayoutZoomSteps.get(target);
-                boolean zoomChanged = (appliedSteps == null && layoutZoomSteps != 0)
-                    || (appliedSteps != null && appliedSteps != layoutZoomSteps);
+                boolean zoomChanged = (appliedSteps == null && steps != 0)
+                    || (appliedSteps != null && appliedSteps != steps);
                 applyLayoutZoom(target, zoomChanged);
             }
             syncModifiers(target);
