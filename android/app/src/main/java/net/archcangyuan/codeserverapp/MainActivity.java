@@ -1690,6 +1690,7 @@ public final class MainActivity extends Activity {
     private RdpConnectionPanel rdpPanel;
     private RdpPageBridge rdpPageBridge;
     private final Set<WebView> rdpWebViews = Collections.newSetFromMap(new WeakHashMap<>());
+    private FrameLayout contentFrame;
     private LinearLayout zoomOverlay;
     private TextView zoomPercentLabel;
     private boolean zoomSliderTracking;
@@ -1862,10 +1863,12 @@ public final class MainActivity extends Activity {
                 dp(56)
             )
         );
+        // Raised so it can float above a remote desktop (see updateAddressBarOverlay).
+        addressBar.setElevation(dp(2));
 
         // The zoom slider floats above the web views in a separate frame, so
         // bringing a session's WebView to the front never covers it.
-        FrameLayout contentFrame = new FrameLayout(this);
+        contentFrame = new FrameLayout(this);
         root.addView(
             contentFrame,
             new LinearLayout.LayoutParams(
@@ -2219,6 +2222,7 @@ public final class MainActivity extends Activity {
         if (params != null && params.height != dp(56) + topInset) {
             params.height = dp(56) + topInset;
             addressBar.setLayoutParams(params);
+            updateAddressBarOverlay();
         }
     }
 
@@ -2730,6 +2734,7 @@ public final class MainActivity extends Activity {
         applyLayoutZoom(webView, zoomChanged);
         syncModifiers(webView);
         syncMouseMode(webView);
+        updateAddressBarOverlay();
     }
 
     private void cleanupExpiredProjectSessions(long now) {
@@ -2815,6 +2820,7 @@ public final class MainActivity extends Activity {
         if (zoomOverlay != null) {
             zoomOverlay.setVisibility(View.VISIBLE);
         }
+        updateAddressBarOverlay();
         scheduleAddressBarAutoHide();
     }
 
@@ -2830,6 +2836,40 @@ public final class MainActivity extends Activity {
         }
         if (zoomOverlay != null) {
             zoomOverlay.setVisibility(View.GONE);
+        }
+        updateAddressBarOverlay();
+    }
+
+    /**
+     * Over a remote desktop the address bar floats above the page instead of
+     * pushing it down, so showing and auto-hiding it does not resize the
+     * remote desktop twice. Web pages keep the regular layout.
+     */
+    private void updateAddressBarOverlay() {
+        if (contentFrame == null || addressBar == null) {
+            return;
+        }
+        boolean overlay = addressBar.getVisibility() == View.VISIBLE
+            && webView != null
+            && rdpWebViews.contains(webView);
+        ViewGroup.LayoutParams barParams = addressBar.getLayoutParams();
+        int barHeight = barParams != null && barParams.height > 0 ? barParams.height : dp(56);
+        LinearLayout.LayoutParams frameParams =
+            (LinearLayout.LayoutParams) contentFrame.getLayoutParams();
+        int frameMargin = overlay ? -barHeight : 0;
+        if (frameParams != null && frameParams.topMargin != frameMargin) {
+            frameParams.topMargin = frameMargin;
+            contentFrame.setLayoutParams(frameParams);
+        }
+        if (zoomOverlay != null
+            && zoomOverlay.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+            FrameLayout.LayoutParams zoomParams =
+                (FrameLayout.LayoutParams) zoomOverlay.getLayoutParams();
+            int zoomMargin = dp(8) + (overlay ? barHeight : 0);
+            if (zoomParams.topMargin != zoomMargin) {
+                zoomParams.topMargin = zoomMargin;
+                zoomOverlay.setLayoutParams(zoomParams);
+            }
         }
     }
 
