@@ -2,9 +2,10 @@ name: Build YourWorkspace Android APK
 
 on:
   workflow_dispatch:
+  release:
+    types: [published]
   push:
     branches: [main]
-    tags: ["v*"]
     paths:
       - "android/**"
       - ".github/workflows/build-android.yml"
@@ -56,8 +57,8 @@ jobs:
         run: |
           set -euo pipefail
           NOTES=".github/release-notes/$TAG.md"
-          # Both platform workflows run for the same tag; whichever finishes
-          # first creates the release and the other one attaches to it.
+          # Normally the release already exists (it triggered this run); otherwise
+          # whichever platform workflow finishes first creates it.
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             if [[ -f "$NOTES" ]]; then
               gh release create "$TAG" --verify-tag --title "YourWorkspace $TAG" \
