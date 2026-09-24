@@ -145,7 +145,7 @@ private let keyboardBridgeSource = #"""
   window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
 
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 12) {
+  if (existingBridge && existingBridge.version >= 14) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
     existingBridge.installDesktopGestures?.();
@@ -244,7 +244,45 @@ private let keyboardBridgeSource = #"""
       event.stopImmediatePropagation();
     }, true);
 
+    // Two-finger swipes scroll like a mouse wheel at the fingers' midpoint.
+    // Pixel deltas, doubled so a swipe covers a comfortable distance.
+    const WHEEL_GAIN = 2;
+    let wheel = null;
+    const midpoint = (touches) => {
+      const first = pointFromTouch(touches[0]);
+      const second = pointFromTouch(touches[1]);
+      return {
+        clientX: (first.clientX + second.clientX) / 2,
+        clientY: (first.clientY + second.clientY) / 2,
+        screenX: (first.screenX + second.screenX) / 2,
+        screenY: (first.screenY + second.screenY) / 2
+      };
+    };
+    const dispatchWheel = (point, deltaX, deltaY) => {
+      const eventWindow = canvas.ownerDocument?.defaultView || window;
+      canvas.dispatchEvent(new eventWindow.WheelEvent('wheel', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: eventWindow,
+        clientX: point.clientX,
+        clientY: point.clientY,
+        screenX: point.screenX,
+        screenY: point.screenY,
+        deltaX,
+        deltaY,
+        deltaMode: 0
+      }));
+    };
+
     canvas.addEventListener('touchstart', (event) => {
+      if (event.touches.length === 2 && !gesture?.dragging) {
+        releaseGesture();
+        gesture = null;
+        wheel = { last: midpoint(event.touches) };
+        dispatchMouse(canvas, 'mousemove', wheel.last, 0, 0);
+        return;
+      }
       if (event.touches.length !== 1) return;
       const start = pointFromTouch(event.touches[0]);
       gesture = {
@@ -260,6 +298,22 @@ private let keyboardBridgeSource = #"""
     }, { capture: true, passive: true });
 
     canvas.addEventListener('touchmove', (event) => {
+      if (wheel && event.touches.length === 2) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const point = midpoint(event.touches);
+        const dx = point.clientX - wheel.last.clientX;
+        const dy = point.clientY - wheel.last.clientY;
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+        wheel.last = point;
+        // IronRDP scrolls one axis per event: send the dominant one.
+        if (Math.abs(dy) >= Math.abs(dx)) {
+          dispatchWheel(point, 0, -dy * WHEEL_GAIN);
+        } else {
+          dispatchWheel(point, -dx * WHEEL_GAIN, 0);
+        }
+        return;
+      }
       if (!gesture || event.touches.length !== 1) return;
       const point = pointFromTouch(event.touches[0]);
       gesture.last = point;
@@ -289,6 +343,7 @@ private let keyboardBridgeSource = #"""
     }, { capture: true, passive: false });
 
     const finishGesture = (event, cancelled) => {
+      if (wheel && event.touches.length < 2) wheel = null;
       if (!gesture) return;
       releaseGesture();
       const touch = event.changedTouches?.[0];
@@ -364,7 +419,24 @@ private let keyboardBridgeSource = #"""
       event.stopImmediatePropagation();
     }, true);
 
+    // Two-finger swipes scroll like a mouse wheel (pages and Monaco alike),
+    // following the midpoint of the fingers. They replace pinch zoom; the
+    // app's zoom slider sets the page zoom.
+    let wheel = null;
+    const touchMidpoint = (touches) => ({
+      clientX: (touches[0].clientX + touches[1].clientX) / 2,
+      clientY: (touches[0].clientY + touches[1].clientY) / 2
+    });
+
     document.addEventListener('touchstart', (event) => {
+      if (event.touches.length === 2
+          && !isIronRdpEvent(event)
+          && !gesture?.dragging) {
+        clearTimer(gesture);
+        gesture = null;
+        wheel = { last: touchMidpoint(event.touches) };
+        return;
+      }
       if (event.touches.length !== 1 || isIronRdpEvent(event)) return;
       const path = eventPath(event);
       const startTarget = path.find((target) => target?.dispatchEvent)
@@ -386,6 +458,17 @@ private let keyboardBridgeSource = #"""
     }, { capture: true, passive: true });
 
     document.addEventListener('touchmove', (event) => {
+      if (wheel && event.touches.length === 2) {
+        if (event.cancelable) event.preventDefault();
+        event.stopImmediatePropagation();
+        const point = touchMidpoint(event.touches);
+        const dx = wheel.last.clientX - point.clientX;
+        const dy = wheel.last.clientY - point.clientY;
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+        wheel.last = point;
+        mouseWheel(point.clientX, point.clientY, dx, dy);
+        return;
+      }
       if (!gesture || event.touches.length !== 1) return;
       const point = pointFromTouch(event.touches[0]);
       gesture.last = point;
@@ -415,6 +498,7 @@ private let keyboardBridgeSource = #"""
     }, { capture: true, passive: false });
 
     const finishGesture = (event, cancelled) => {
+      if (wheel && event.touches.length < 2) wheel = null;
       if (!gesture) return;
       const activeGesture = gesture;
       gesture = null;
@@ -772,6 +856,9 @@ private let keyboardBridgeSource = #"""
     leftUnlockPending: false,
     lockTimer: 0,
     rightHeld: false,
+    // Set by the app's keyboard lock ("locked hidden"): like mouse mode,
+    // editable elements get inputmode=none so the keyboard never opens.
+    keyboardLocked: false,
     inputModes: new Map()
   };
 
@@ -939,8 +1026,10 @@ private let keyboardBridgeSource = #"""
 
   // inputmode="none" keeps the system keyboard hidden while the element
   // still takes focus and receives forwarded keys.
+  const keyboardBlocked = () => mouseMode.enabled || mouseMode.keyboardLocked;
+
   const suppressKeyboardFor = (element) => {
-    if (!mouseMode.enabled || !isEditableElement(element)) return;
+    if (!keyboardBlocked() || !isEditableElement(element)) return;
     if (!mouseMode.inputModes.has(element)) {
       mouseMode.inputModes.set(element, element.getAttribute('inputmode'));
     }
@@ -950,7 +1039,7 @@ private let keyboardBridgeSource = #"""
   };
 
   const suppressKeyboardInDocument = () => {
-    if (!mouseMode.enabled) return;
+    if (!keyboardBlocked()) return;
     for (const element of document.querySelectorAll(
       'textarea, input, [contenteditable]'
     )) {
@@ -1461,13 +1550,24 @@ private let keyboardBridgeSource = #"""
     } else {
       releaseMouseButtons();
       if (mouseMode.host) mouseMode.host.style.display = 'none';
+      if (!mouseMode.keyboardLocked) restoreKeyboardInputModes();
+    }
+    return true;
+  };
+
+  const setKeyboardLocked = (locked) => {
+    if (locked === mouseMode.keyboardLocked) return true;
+    mouseMode.keyboardLocked = locked;
+    if (locked) {
+      suppressKeyboardInDocument();
+    } else if (!mouseMode.enabled) {
       restoreKeyboardInputModes();
     }
     return true;
   };
 
   const bridge = {
-    version: 12,
+    version: 14,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();
@@ -1493,6 +1593,9 @@ private let keyboardBridgeSource = #"""
     },
     setMouseMode(enabled, viewWidth) {
       return setMouseMode(Boolean(enabled), Number(viewWidth) || 0);
+    },
+    setKeyboardLocked(locked) {
+      return setKeyboardLocked(Boolean(locked));
     },
     setModifiers(control, shift) {
       const nextControl = Boolean(control);

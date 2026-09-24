@@ -80,6 +80,12 @@ public final class MainActivity extends Activity {
     private static final String PROJECTS_KEY = "saved_projects";
     private static final String KEEP_ALIVE_KEY = "keep_alive_enabled";
     private static final String MOUSE_MODE_KEY = "mouse_mode_enabled";
+    private static final String FULLSCREEN_KEY = "fullscreen_enabled";
+    private static final int KEYBOARD_UNLOCKED = 0;
+    private static final int KEYBOARD_LOCKED_OPEN = 1;
+    private static final int KEYBOARD_LOCKED_HIDDEN = 2;
+    private static final long KEYBOARD_RESHOW_DELAY_MS = 120L;
+    private static final long KEYBOARD_HOLD_TIMEOUT_MS = 1_500L;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 2001;
     private static final int OVERLAY_PERMISSION_REQUEST = 2002;
     private static final long SESSION_KEEP_ALIVE_PULSE_MS = 10_000L;
@@ -234,7 +240,7 @@ public final class MainActivity extends Activity {
           window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
 
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 12) {
+          if (existingBridge && existingBridge.version >= 14) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
             existingBridge.installRdpGestures?.();
             existingBridge.installDesktopGestures?.();
@@ -338,7 +344,45 @@ public final class MainActivity extends Activity {
               event.stopImmediatePropagation();
             }, true);
 
+            // Two-finger swipes scroll like a mouse wheel at the fingers' midpoint.
+            // Pixel deltas, doubled so a swipe covers a comfortable distance.
+            const WHEEL_GAIN = 2;
+            let wheel = null;
+            const midpoint = (touches) => {
+              const first = pointFromTouch(touches[0]);
+              const second = pointFromTouch(touches[1]);
+              return {
+                clientX: (first.clientX + second.clientX) / 2,
+                clientY: (first.clientY + second.clientY) / 2,
+                screenX: (first.screenX + second.screenX) / 2,
+                screenY: (first.screenY + second.screenY) / 2
+              };
+            };
+            const dispatchWheel = (point, deltaX, deltaY) => {
+              const eventWindow = canvas.ownerDocument?.defaultView || window;
+              canvas.dispatchEvent(new eventWindow.WheelEvent('wheel', {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: eventWindow,
+                clientX: point.clientX,
+                clientY: point.clientY,
+                screenX: point.screenX,
+                screenY: point.screenY,
+                deltaX,
+                deltaY,
+                deltaMode: 0
+              }));
+            };
+
             canvas.addEventListener('touchstart', (event) => {
+              if (event.touches.length === 2 && !gesture?.dragging) {
+                releaseGesture();
+                gesture = null;
+                wheel = { last: midpoint(event.touches) };
+                dispatchMouse(canvas, 'mousemove', wheel.last, 0, 0);
+                return;
+              }
               if (event.touches.length !== 1) return;
               const start = pointFromTouch(event.touches[0]);
               gesture = {
@@ -354,6 +398,22 @@ public final class MainActivity extends Activity {
             }, { capture: true, passive: true });
 
             canvas.addEventListener('touchmove', (event) => {
+              if (wheel && event.touches.length === 2) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                const point = midpoint(event.touches);
+                const dx = point.clientX - wheel.last.clientX;
+                const dy = point.clientY - wheel.last.clientY;
+                if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+                wheel.last = point;
+                // IronRDP scrolls one axis per event: send the dominant one.
+                if (Math.abs(dy) >= Math.abs(dx)) {
+                  dispatchWheel(point, 0, -dy * WHEEL_GAIN);
+                } else {
+                  dispatchWheel(point, -dx * WHEEL_GAIN, 0);
+                }
+                return;
+              }
               if (!gesture || event.touches.length !== 1) return;
               const point = pointFromTouch(event.touches[0]);
               gesture.last = point;
@@ -383,6 +443,7 @@ public final class MainActivity extends Activity {
             }, { capture: true, passive: false });
 
             const finishGesture = (event, cancelled) => {
+              if (wheel && event.touches.length < 2) wheel = null;
               if (!gesture) return;
               releaseGesture();
               const touch = event.changedTouches?.[0];
@@ -458,7 +519,24 @@ public final class MainActivity extends Activity {
               event.stopImmediatePropagation();
             }, true);
 
+            // Two-finger swipes scroll like a mouse wheel (pages and Monaco alike),
+            // following the midpoint of the fingers. They replace pinch zoom; the
+            // app's zoom slider sets the page zoom.
+            let wheel = null;
+            const touchMidpoint = (touches) => ({
+              clientX: (touches[0].clientX + touches[1].clientX) / 2,
+              clientY: (touches[0].clientY + touches[1].clientY) / 2
+            });
+
             document.addEventListener('touchstart', (event) => {
+              if (event.touches.length === 2
+                  && !isIronRdpEvent(event)
+                  && !gesture?.dragging) {
+                clearTimer(gesture);
+                gesture = null;
+                wheel = { last: touchMidpoint(event.touches) };
+                return;
+              }
               if (event.touches.length !== 1 || isIronRdpEvent(event)) return;
               const path = eventPath(event);
               const startTarget = path.find((target) => target?.dispatchEvent)
@@ -480,6 +558,17 @@ public final class MainActivity extends Activity {
             }, { capture: true, passive: true });
 
             document.addEventListener('touchmove', (event) => {
+              if (wheel && event.touches.length === 2) {
+                if (event.cancelable) event.preventDefault();
+                event.stopImmediatePropagation();
+                const point = touchMidpoint(event.touches);
+                const dx = wheel.last.clientX - point.clientX;
+                const dy = wheel.last.clientY - point.clientY;
+                if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+                wheel.last = point;
+                mouseWheel(point.clientX, point.clientY, dx, dy);
+                return;
+              }
               if (!gesture || event.touches.length !== 1) return;
               const point = pointFromTouch(event.touches[0]);
               gesture.last = point;
@@ -509,6 +598,7 @@ public final class MainActivity extends Activity {
             }, { capture: true, passive: false });
 
             const finishGesture = (event, cancelled) => {
+              if (wheel && event.touches.length < 2) wheel = null;
               if (!gesture) return;
               const activeGesture = gesture;
               gesture = null;
@@ -995,6 +1085,9 @@ public final class MainActivity extends Activity {
             leftUnlockPending: false,
             lockTimer: 0,
             rightHeld: false,
+            // Set by the app's keyboard lock ("locked hidden"): like mouse mode,
+            // editable elements get inputmode=none so the keyboard never opens.
+            keyboardLocked: false,
             inputModes: new Map()
           };
 
@@ -1162,8 +1255,10 @@ public final class MainActivity extends Activity {
 
           // inputmode="none" keeps the system keyboard hidden while the element
           // still takes focus and receives forwarded keys.
+          const keyboardBlocked = () => mouseMode.enabled || mouseMode.keyboardLocked;
+
           const suppressKeyboardFor = (element) => {
-            if (!mouseMode.enabled || !isEditableElement(element)) return;
+            if (!keyboardBlocked() || !isEditableElement(element)) return;
             if (!mouseMode.inputModes.has(element)) {
               mouseMode.inputModes.set(element, element.getAttribute('inputmode'));
             }
@@ -1173,7 +1268,7 @@ public final class MainActivity extends Activity {
           };
 
           const suppressKeyboardInDocument = () => {
-            if (!mouseMode.enabled) return;
+            if (!keyboardBlocked()) return;
             for (const element of document.querySelectorAll(
               'textarea, input, [contenteditable]'
             )) {
@@ -1684,13 +1779,24 @@ public final class MainActivity extends Activity {
             } else {
               releaseMouseButtons();
               if (mouseMode.host) mouseMode.host.style.display = 'none';
+              if (!mouseMode.keyboardLocked) restoreKeyboardInputModes();
+            }
+            return true;
+          };
+
+          const setKeyboardLocked = (locked) => {
+            if (locked === mouseMode.keyboardLocked) return true;
+            mouseMode.keyboardLocked = locked;
+            if (locked) {
+              suppressKeyboardInDocument();
+            } else if (!mouseMode.enabled) {
               restoreKeyboardInputModes();
             }
             return true;
           };
 
           const bridge = {
-            version: 12,
+            version: 14,
             forceKeyboard,
             installRdpGestures,
             installDesktopGestures,
@@ -1707,6 +1813,9 @@ public final class MainActivity extends Activity {
             },
             setMouseMode(enabled, viewWidth) {
               return setMouseMode(Boolean(enabled), Number(viewWidth) || 0);
+            },
+            setKeyboardLocked(locked) {
+              return setKeyboardLocked(Boolean(locked));
             },
             setModifiers(control, shift) {
               const nextControl = Boolean(control);
@@ -1752,6 +1861,15 @@ public final class MainActivity extends Activity {
     private Button controlButton;
     private Button shiftButton;
     private Button mouseModeButton;
+    private Button keyboardLockButton;
+    private Button fullscreenButton;
+    private boolean fullscreenEnabled;
+    /** Keyboard lock: KEYBOARD_UNLOCKED, KEYBOARD_LOCKED_OPEN or KEYBOARD_LOCKED_HIDDEN. */
+    private int keyboardLock = KEYBOARD_UNLOCKED;
+    private boolean imeShown;
+    /** IME height kept as padding while a locked-open keyboard is being brought back. */
+    private int heldImeBottom;
+    private long imeHoldStartedAt;
     private boolean controlLocked;
     private boolean shiftLocked;
     private boolean keepAliveEnabled;
@@ -1768,6 +1886,13 @@ public final class MainActivity extends Activity {
             return;
         }
         if (webView == null || webView.getUrl() == null) {
+            return;
+        }
+        if (!fullscreenEnabled) {
+            // The address bar stays outside fullscreen; only the zoom slider hides.
+            if (zoomOverlay != null) {
+                zoomOverlay.setVisibility(View.GONE);
+            }
             return;
         }
         hideAddressBar();
@@ -1809,6 +1934,7 @@ public final class MainActivity extends Activity {
         );
         keepAliveEnabled = preferences.getBoolean(KEEP_ALIVE_KEY, false);
         mouseModeEnabled = preferences.getBoolean(MOUSE_MODE_KEY, false);
+        fullscreenEnabled = preferences.getBoolean(FULLSCREEN_KEY, false);
         loadProjects();
         setContentView(createContentView());
         configureSystemUi();
@@ -1910,6 +2036,11 @@ public final class MainActivity extends Activity {
         disconnectButton.setVisibility(View.GONE);
         addressBar.addView(disconnectButton);
 
+        fullscreenButton = createToolbarButton("⛶");
+        fullscreenButton.setOnClickListener(view -> setFullscreenEnabled(!fullscreenEnabled));
+        addressBar.addView(fullscreenButton);
+        updateFullscreenButton();
+
         Button settingsButton = createToolbarButton("⚙");
         settingsButton.setContentDescription("Settings");
         settingsButton.setOnClickListener(view -> showSettings());
@@ -1973,8 +2104,18 @@ public final class MainActivity extends Activity {
 
         Button keyboardButton = createKeyButton("KB");
         keyboardButton.setContentDescription("Force show keyboard");
-        keyboardButton.setOnClickListener(view -> forceShowKeyboard());
+        keyboardButton.setOnClickListener(view -> {
+            if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+                Toast.makeText(this, "Keyboard is locked hidden", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            forceShowKeyboard();
+        });
         keyRow.addView(keyboardButton, keyLayoutParams(dp(54)));
+
+        keyboardLockButton = createKeyButton("⌨🔓");
+        keyboardLockButton.setOnClickListener(view -> toggleKeyboardLock());
+        keyRow.addView(keyboardLockButton, keyLayoutParams(dp(58)));
 
         mouseModeButton = createKeyButton("🖱");
         mouseModeButton.setOnClickListener(view -> setMouseModeEnabled(!mouseModeEnabled));
@@ -2028,6 +2169,7 @@ public final class MainActivity extends Activity {
         );
 
         updateModifierButtons();
+        updateKeyboardLockButton();
         applyMouseMode();
         return root;
     }
@@ -2043,7 +2185,60 @@ public final class MainActivity extends Activity {
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             getWindow().setAttributes(attributes);
         }
-        hideSystemBars();
+        applySystemBars();
+    }
+
+    /**
+     * Fullscreen hides the system bars and lets the address bar auto-hide; the
+     * regular mode keeps both visible (the zoom slider still auto-hides).
+     */
+    private void setFullscreenEnabled(boolean enabled) {
+        fullscreenEnabled = enabled;
+        preferences.edit().putBoolean(FULLSCREEN_KEY, enabled).apply();
+        applySystemBars();
+        updateFullscreenButton();
+        if (enabled) {
+            // Hide the system bars now and the address bar five seconds later.
+            showAddressBarTemporarily();
+        } else if (addressBar != null) {
+            addressBar.setVisibility(View.VISIBLE);
+            updateAddressBarOverlay();
+        }
+        if (rootContainer != null) {
+            rootContainer.requestApplyInsets();
+        }
+    }
+
+    private void updateFullscreenButton() {
+        if (fullscreenButton == null) {
+            return;
+        }
+        fullscreenButton.setContentDescription(
+            fullscreenEnabled ? "Exit fullscreen" : "Enter fullscreen"
+        );
+        fullscreenButton.setTextColor(fullscreenEnabled ? ACCENT : Color.BLACK);
+    }
+
+    private void applySystemBars() {
+        if (fullscreenEnabled) {
+            hideSystemBars();
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_DEFAULT);
+                controller.show(WindowInsets.Type.systemBars());
+                int lightBars = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                    | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                controller.setSystemBarsAppearance(lightBars, lightBars);
+            }
+        } else {
+            getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                    | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+            );
+        }
     }
 
     private void showSettings() {
@@ -2209,7 +2404,7 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * The app always runs fullscreen in sticky immersive mode. An edge swipe then
+     * Fullscreen runs in sticky immersive mode. An edge swipe then
      * only shows translucent, temporary system bars (never the notification shade)
      * and is still delivered to the app, which answers the first swipe with its own
      * address bar and dismisses the system bars again; see EdgeGestureLayout.
@@ -2238,9 +2433,13 @@ public final class MainActivity extends Activity {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && keyboardLock == KEYBOARD_LOCKED_OPEN && !imeShown) {
+            addressBarHandler.removeCallbacks(reshowLockedKeyboard);
+            addressBarHandler.postDelayed(reshowLockedKeyboard, 300L);
+        }
         if (hasFocus) {
             // Dialogs and other windows can bring the system bars back.
-            hideSystemBars();
+            applySystemBars();
         }
     }
 
@@ -2254,22 +2453,148 @@ public final class MainActivity extends Activity {
             // cutout strip. Only the address bar steps below a top cutout, and side
             // cutouts in landscape keep their padding.
             Insets cutout = insets.getInsets(WindowInsets.Type.displayCutout());
+            // Outside fullscreen the visible system bars also take their space.
+            Insets bars = fullscreenEnabled
+                ? Insets.NONE
+                : insets.getInsets(WindowInsets.Type.systemBars());
             view.setPadding(
-                cutout.left,
+                Math.max(cutout.left, bars.left),
                 0,
-                cutout.right,
-                Math.max(cutout.bottom, ime.bottom)
+                Math.max(cutout.right, bars.right),
+                Math.max(Math.max(cutout.bottom, bars.bottom), heldKeyboardInset(ime.bottom))
             );
-            applyAddressBarTopInset(cutout.top);
+            applyAddressBarTopInset(Math.max(cutout.top, bars.top));
         } else {
             int bottomInset = insets.getSystemWindowInsetBottom();
             int keyboardInset = bottomInset > dp(120) ? bottomInset : 0;
             imeVisible = keyboardInset > 0;
-            view.setPadding(0, 0, 0, keyboardInset);
+            view.setPadding(0, 0, 0, heldKeyboardInset(keyboardInset));
         }
         if (webView instanceof RdpInputWebView) {
             ((RdpInputWebView) webView).setImeVisible(imeVisible);
         }
+        onImeVisibilityChanged(imeVisible);
+    }
+
+    /**
+     * While the keyboard is locked open and something closes it (a tap on a
+     * remote desktop canvas, for instance), keeps its height as padding until
+     * it is back, so the page and a remote desktop are not resized meanwhile.
+     */
+    private int heldKeyboardInset(int imeBottom) {
+        if (imeBottom > 0) {
+            heldImeBottom = imeBottom;
+            imeHoldStartedAt = 0L;
+            return imeBottom;
+        }
+        if (keyboardLock != KEYBOARD_LOCKED_OPEN || heldImeBottom <= 0 || !hasWindowFocus()) {
+            heldImeBottom = 0;
+            return 0;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (imeHoldStartedAt == 0L) {
+            imeHoldStartedAt = now;
+        } else if (now - imeHoldStartedAt > KEYBOARD_HOLD_TIMEOUT_MS) {
+            heldImeBottom = 0;
+            return 0;
+        }
+        return heldImeBottom;
+    }
+
+    private final Runnable reshowLockedKeyboard = () -> {
+        if (keyboardLock != KEYBOARD_LOCKED_OPEN || imeShown || !hasWindowFocus()) {
+            return;
+        }
+        forceShowKeyboard(true);
+    };
+
+    private final Runnable releaseKeyboardHold = () -> {
+        if (imeShown || heldImeBottom <= 0) {
+            return;
+        }
+        heldImeBottom = 0;
+        if (rootContainer != null) {
+            rootContainer.requestApplyInsets();
+        }
+    };
+
+    private void onImeVisibilityChanged(boolean visible) {
+        boolean wasShown = imeShown;
+        imeShown = visible;
+        if (wasShown && !visible && keyboardLock == KEYBOARD_LOCKED_OPEN && hasWindowFocus()) {
+            addressBarHandler.removeCallbacks(reshowLockedKeyboard);
+            addressBarHandler.postDelayed(reshowLockedKeyboard, KEYBOARD_RESHOW_DELAY_MS);
+            addressBarHandler.removeCallbacks(releaseKeyboardHold);
+            addressBarHandler.postDelayed(releaseKeyboardHold, KEYBOARD_HOLD_TIMEOUT_MS + 100L);
+        }
+    }
+
+    /**
+     * Locks the keyboard in its current state: open stays open (it is brought
+     * back whenever it closes), hidden stays hidden (pages cannot raise it).
+     * Tapping again unlocks.
+     */
+    private void toggleKeyboardLock() {
+        String message;
+        if (keyboardLock != KEYBOARD_UNLOCKED) {
+            keyboardLock = KEYBOARD_UNLOCKED;
+            message = "Keyboard unlocked";
+        } else if (imeShown) {
+            keyboardLock = KEYBOARD_LOCKED_OPEN;
+            message = "Keyboard locked open";
+        } else {
+            keyboardLock = KEYBOARD_LOCKED_HIDDEN;
+            message = "Keyboard locked hidden";
+        }
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+        heldImeBottom = keyboardLock == KEYBOARD_LOCKED_OPEN ? heldImeBottom : 0;
+        if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+            hideSystemKeyboard();
+        }
+        if (webView instanceof RdpInputWebView) {
+            // Re-evaluate whether the WebView accepts text input.
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.restartInput(webView);
+            }
+        }
+        for (ProjectSession session : projectSessions.values()) {
+            syncMouseMode(session.webView);
+        }
+        if (webView != null && activeSessionKey == null) {
+            syncMouseMode(webView);
+        }
+        if (rootContainer != null) {
+            rootContainer.requestApplyInsets();
+        }
+        updateKeyboardLockButton();
+    }
+
+    private void updateKeyboardLockButton() {
+        if (keyboardLockButton == null) {
+            return;
+        }
+        String label;
+        String description;
+        if (keyboardLock == KEYBOARD_LOCKED_OPEN) {
+            label = "⌨🔒";
+            description = "Keyboard locked open. Tap to unlock.";
+        } else if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+            label = "🚫⌨";
+            description = "Keyboard locked hidden. Tap to unlock.";
+        } else {
+            label = "⌨🔓";
+            description = "Lock the keyboard open or hidden";
+        }
+        keyboardLockButton.setText(label);
+        keyboardLockButton.setContentDescription(description);
+        keyboardLockButton.setBackgroundTintList(ColorStateList.valueOf(
+            keyboardLock == KEYBOARD_UNLOCKED ? KEY_BACKGROUND : ACCENT
+        ));
+        keyboardLockButton.setTextColor(
+            keyboardLock == KEYBOARD_UNLOCKED ? Color.BLACK : Color.WHITE
+        );
     }
 
     private void applyAddressBarTopInset(int topInset) {
@@ -2602,6 +2927,10 @@ public final class MainActivity extends Activity {
     }
 
     private void forceShowKeyboard() {
+        forceShowKeyboard(false);
+    }
+
+    private void forceShowKeyboard(boolean quiet) {
         if (webView == null) {
             return;
         }
@@ -2613,13 +2942,15 @@ public final class MainActivity extends Activity {
             if (target != webView) {
                 return;
             }
-            Toast.makeText(
-                this,
-                "\"ironrdp\"".equals(value)
-                    ? "IronRDP focused"
-                    : "RDP canvas not found",
-                Toast.LENGTH_SHORT
-            ).show();
+            if (!quiet) {
+                Toast.makeText(
+                    this,
+                    "\"ironrdp\"".equals(value)
+                        ? "IronRDP focused"
+                        : "RDP canvas not found",
+                    Toast.LENGTH_SHORT
+                ).show();
+            }
             if (target instanceof RdpInputWebView) {
                 ((RdpInputWebView) target).showForcedIme(
                     "\"ironrdp\"".equals(value)
@@ -2970,7 +3301,8 @@ public final class MainActivity extends Activity {
         if (contentFrame == null || addressBar == null) {
             return;
         }
-        boolean overlay = addressBar.getVisibility() == View.VISIBLE
+        boolean overlay = fullscreenEnabled
+            && addressBar.getVisibility() == View.VISIBLE
             && webView != null
             && rdpWebViews.contains(webView);
         ViewGroup.LayoutParams barParams = addressBar.getLayoutParams();
@@ -3339,7 +3671,9 @@ public final class MainActivity extends Activity {
             Locale.US,
             "window.__codeServerAppKeyboard"
                 + " && typeof window.__codeServerAppKeyboard.setMouseMode === 'function'"
-                + " ? window.__codeServerAppKeyboard.setMouseMode(%b, %.2f) : false",
+                + " ? (window.__codeServerAppKeyboard.setKeyboardLocked?.(%b),"
+                + " window.__codeServerAppKeyboard.setMouseMode(%b, %.2f)) : false",
+            keyboardLock == KEYBOARD_LOCKED_HIDDEN,
             mouseModeEnabled,
             widthDp
         );
@@ -3620,6 +3954,9 @@ public final class MainActivity extends Activity {
 
         @Override
         public boolean onCheckIsTextEditor() {
+            if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+                return false;
+            }
             if (forcedImeEnabled) {
                 return true;
             }
@@ -3629,6 +3966,9 @@ public final class MainActivity extends Activity {
 
         @Override
         public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+            if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+                return null;
+            }
             if (!forcedImeEnabled) {
                 return mouseModeEnabled ? null : super.onCreateInputConnection(outAttrs);
             }
@@ -3935,7 +4275,17 @@ public final class MainActivity extends Activity {
                 boolean barHidden = addressBar != null
                     && addressBar.getVisibility() != View.VISIBLE;
                 float contentY = event.getY() - getPaddingTop();
-                if (barHidden && contentY >= 0f && contentY <= dp(40)) {
+                // Fullscreen: a pull from the top edge brings the address bar back.
+                // Otherwise a pull down on the address bar shows the zoom slider.
+                boolean fromTopEdge = fullscreenEnabled
+                    && barHidden
+                    && contentY >= 0f
+                    && contentY <= dp(40);
+                boolean fromAddressBar = !fullscreenEnabled
+                    && addressBar != null
+                    && addressBar.getVisibility() == View.VISIBLE
+                    && event.getY() <= addressBar.getBottom();
+                if (fromTopEdge || fromAddressBar) {
                     edgePullStartX = event.getX();
                     edgePullStartY = event.getY();
                     trackingEdgePull = true;
@@ -3958,11 +4308,13 @@ public final class MainActivity extends Activity {
                     super.dispatchTouchEvent(cancel);
                     cancel.recycle();
                     showAddressBarTemporarily();
-                    // The same edge swipe also brought up the transient system bars;
-                    // put them away so the first swipe belongs to the app. Once the
-                    // address bar shows, a further swipe keeps them.
-                    hideSystemBars();
-                    postDelayed(MainActivity.this::hideSystemBars, 250L);
+                    if (fullscreenEnabled) {
+                        // The same edge swipe also brought up the transient system
+                        // bars; put them away so the first swipe belongs to the app.
+                        // Once the address bar shows, a further swipe keeps them.
+                        hideSystemBars();
+                        postDelayed(MainActivity.this::hideSystemBars, 250L);
+                    }
                     return true;
                 }
                 if (dy < -dp(8) || dx > dp(48)) {
