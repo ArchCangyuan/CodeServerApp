@@ -2505,6 +2505,12 @@ public final class MainActivity extends Activity {
         if (keyboardLock != KEYBOARD_LOCKED_OPEN || imeShown || !hasWindowFocus()) {
             return;
         }
+        if (webView instanceof RdpInputWebView
+            && ((RdpInputWebView) webView).isForcedImeEnabled()) {
+            // Remote desktop typing: reopen the keyboard on the same connection.
+            ((RdpInputWebView) webView).reshowForcedIme();
+            return;
+        }
         forceShowKeyboard(true);
     };
 
@@ -3914,8 +3920,26 @@ public final class MainActivity extends Activity {
         void setImeVisible(boolean visible) {
             boolean wasVisible = imeVisible;
             imeVisible = visible;
-            if (wasVisible && !visible && forcedImeEnabled) {
+            // A keyboard locked open is brought back right away, so keep the
+            // forced input connection (and with it the remote desktop typing).
+            if (wasVisible && !visible && forcedImeEnabled
+                && keyboardLock != KEYBOARD_LOCKED_OPEN) {
                 disableForcedIme();
+            }
+        }
+
+        boolean isForcedImeEnabled() {
+            return forcedImeEnabled;
+        }
+
+        /** Shows the keyboard again on the existing forced input connection. */
+        void reshowForcedIme() {
+            forcedImeRequestedAt = SystemClock.elapsedRealtime();
+            requestFocus();
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
             }
         }
 
@@ -3987,6 +4011,7 @@ public final class MainActivity extends Activity {
             if (event.getActionMasked() == MotionEvent.ACTION_DOWN
                 && forcedImeEnabled
                 && !imeVisible
+                && keyboardLock != KEYBOARD_LOCKED_OPEN
                 && SystemClock.elapsedRealtime() - forcedImeRequestedAt > 500L) {
                 disableForcedIme();
             }
