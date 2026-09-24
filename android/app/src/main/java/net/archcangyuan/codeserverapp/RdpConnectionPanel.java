@@ -53,6 +53,7 @@ final class RdpConnectionPanel {
     private EditText usernameField;
     private TextView tunnelStatus;
     private Button copyButton;
+    private TextView probeResult;
     private boolean openClientWhenRunning;
 
     RdpConnectionPanel(Activity activity) {
@@ -152,6 +153,13 @@ final class RdpConnectionPanel {
         tunnelStatus = statusText(tunnelRow);
         copyButton = smallButton(tunnelRow, "Copy");
         copyButton.setOnClickListener(view -> copyLocalAddress(true));
+        Button probeButton = smallButton(tunnelRow, "Test");
+        probeButton.setOnClickListener(view -> probe());
+        probeResult = new TextView(activity);
+        probeResult.setTextSize(12);
+        probeResult.setTextColor(MUTED);
+        probeResult.setVisibility(View.GONE);
+        tunnelCard.addView(probeResult);
 
         dialog = new AlertDialog.Builder(activity)
             .setTitle(boldText(host))
@@ -204,6 +212,30 @@ final class RdpConnectionPanel {
         openClientWhenRunning = true;
         RdpTunnelService.start(activity, host);
         refresh();
+    }
+
+    /** Tests Cloudflare, the token and the remote desktop without a client app. */
+    private void probe() {
+        String token = AccessTokenStore.loadToken(activity, host);
+        if (token == null) {
+            showLogin(this::probe);
+            return;
+        }
+        String probedHost = host;
+        probeResult.setVisibility(View.VISIBLE);
+        probeResult.setTextColor(MUTED);
+        probeResult.setText("Testing the connection…");
+        new Thread(() -> {
+            String result = AccessWebSocket.probeRemoteDesktop(probedHost, token);
+            handler.post(() -> {
+                if (probeResult == null || !probedHost.equals(host)) {
+                    return;
+                }
+                probeResult.setText(result);
+                probeResult.setTextColor(result.startsWith("OK") ? SIGNED_IN : Color.rgb(183, 28, 28));
+                refresh();
+            });
+        }, "RdpProbe").start();
     }
 
     private void onTunnelStateChanged() {

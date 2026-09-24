@@ -182,6 +182,38 @@ final class AccessWebSocket implements AutoCloseable {
         }
     }
 
+    /**
+     * Checks the whole path to the remote desktop: sends an RDP X.224
+     * Connection Request through the tunnel and waits for the Connection
+     * Confirm. Returns a short human-readable result.
+     */
+    static String probeRemoteDesktop(String host, String accessToken) {
+        // TPKT + X.224 Connection Request with RDP_NEG_REQ (TLS | CredSSP).
+        byte[] request = {
+            0x03, 0x00, 0x00, 0x13, 0x0e, (byte) 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00
+        };
+        try (AccessWebSocket tunnel = connect(host, accessToken)) {
+            tunnel.setReadTimeout(10_000);
+            tunnel.sendBinary(request, 0, request.length);
+            byte[] response = tunnel.readMessage();
+            if (response == null) {
+                return "Tunnel opened, but the remote side closed it without answering. "
+                    + "Check that the tunnel's service is rdp://… and the PC is reachable.";
+            }
+            if (response.length >= 6 && response[0] == 0x03 && (response[5] & 0xF0) == 0xD0) {
+                return "OK: the remote desktop answered through Cloudflare.";
+            }
+            return "Tunnel opened, but the answer is not RDP (" + response.length + " bytes).";
+        } catch (LoginRequiredException exception) {
+            return "Cloudflare rejected the token: sign in again.";
+        } catch (java.net.SocketTimeoutException exception) {
+            return "Tunnel opened, but the remote desktop did not answer within 10 s.";
+        } catch (IOException exception) {
+            return "Failed: " + exception.getMessage();
+        }
+    }
+
     /** Sends one binary message. Safe to call from any thread. */
     void sendBinary(byte[] data, int offset, int length) throws IOException {
         sendFrame(OPCODE_BINARY, data, offset, length);
@@ -307,6 +339,11 @@ final class AccessWebSocket implements AutoCloseable {
             }
             offset += count;
         }
+    }
+
+    /** Sets a read timeout in milliseconds for {@link #readMessage()}; 0 waits forever. */
+    void setReadTimeout(int millis) throws IOException {
+        socket.setSoTimeout(millis);
     }
 
     boolean isClosed() {
