@@ -11,12 +11,21 @@ private let maximumHotProjectSessions = 10
 private let layoutZoomStepsKey = "layoutZoomSteps"
 
 private let desktopUserAgent = """
-Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36
 """.replacingOccurrences(of: "\n", with: "")
 
 private let keyboardBridgeSource = #"""
 (() => {
+  // Match the Linux user agent: xterm.js and others detect macOS from
+  // navigator.platform, which WKWebView reports as MacIntel in desktop mode.
+  try {
+    Object.defineProperty(Navigator.prototype, 'platform', {
+      configurable: true,
+      get: () => 'Linux x86_64'
+    });
+  } catch (_) {}
+
   const setViewportWidth = (requestedWidth) => {
     const numericWidth = Number(requestedWidth) || 1280;
     const width = Math.max(400, Math.min(2400, Math.round(numericWidth)));
