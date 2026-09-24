@@ -1844,13 +1844,6 @@ public final class MainActivity extends Activity {
             getWindow().setAttributes(attributes);
         }
         hideSystemBars();
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            getWindow().getDecorView().setOnSystemUiVisibilityChangeListener(visibility -> {
-                if ((visibility & View.SYSTEM_UI_FLAG_FULLSCREEN) == 0) {
-                    onSystemBarsRevealed();
-                }
-            });
-        }
     }
 
     private void showSettings() {
@@ -2016,17 +2009,18 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * The app always runs fullscreen with the system bars hidden. A swipe from the
-     * top edge reveals them; see {@link #onSystemBarsRevealed()} for how the first
-     * swipe is redirected to the address bar.
+     * The app always runs fullscreen in sticky immersive mode. An edge swipe then
+     * only shows translucent, temporary system bars (never the notification shade)
+     * and is still delivered to the app, which answers the first swipe with its own
+     * address bar and dismisses the system bars again; see EdgeGestureLayout.
      */
     private void hideSystemBars() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
-                // Non-transient reveal (BEHAVIOR_DEFAULT, formerly SHOW_BARS_BY_SWIPE),
-                // so a swipe updates the insets and the app can react to it.
-                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_DEFAULT);
+                controller.setSystemBarsBehavior(
+                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                );
                 controller.hide(WindowInsets.Type.systemBars());
             }
         } else {
@@ -2036,24 +2030,9 @@ public final class MainActivity extends Activity {
                     | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                     | View.SYSTEM_UI_FLAG_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_IMMERSIVE
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
             );
         }
-    }
-
-    /**
-     * Emulates deferred system gestures: the first swipe from the top edge shows
-     * the address bar and re-hides the system bars; a swipe while the address bar
-     * is already showing keeps the system bars, which then hide with the bar.
-     */
-    private void onSystemBarsRevealed() {
-        if (addressBar == null) {
-            return;
-        }
-        if (addressBar.getVisibility() != View.VISIBLE) {
-            addressBar.post(this::hideSystemBars);
-        }
-        showAddressBarTemporarily();
     }
 
     @Override
@@ -2070,9 +2049,6 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Insets ime = insets.getInsets(WindowInsets.Type.ime());
             imeVisible = insets.isVisible(WindowInsets.Type.ime()) || ime.bottom > 0;
-            if (insets.isVisible(WindowInsets.Type.statusBars())) {
-                onSystemBarsRevealed();
-            }
 
             // System bars are hidden and the page fills the top edge, including the
             // cutout strip. Only the address bar steps below a top cutout, and side
@@ -2591,7 +2567,6 @@ public final class MainActivity extends Activity {
 
     private void hideAddressBar() {
         addressBarHandler.removeCallbacks(autoHideAddressBar);
-        hideSystemBars();
         if (addressBar != null) {
             addressBar.setVisibility(View.GONE);
         }
@@ -3515,7 +3490,7 @@ public final class MainActivity extends Activity {
                 boolean barHidden = addressBar != null
                     && addressBar.getVisibility() != View.VISIBLE;
                 float contentY = event.getY() - getPaddingTop();
-                if (barHidden && contentY >= 0f && contentY <= dp(32)) {
+                if (barHidden && contentY >= 0f && contentY <= dp(40)) {
                     edgePullStartX = event.getX();
                     edgePullStartY = event.getY();
                     trackingEdgePull = true;
@@ -3530,7 +3505,7 @@ public final class MainActivity extends Activity {
             if (trackingEdgePull && action == MotionEvent.ACTION_MOVE) {
                 float dx = Math.abs(event.getX() - edgePullStartX);
                 float dy = event.getY() - edgePullStartY;
-                if (dy >= dp(48) && dx < dy) {
+                if (dy >= dp(24) && dx < dy) {
                     trackingEdgePull = false;
                     consumingEdgePull = true;
                     MotionEvent cancel = MotionEvent.obtain(event);
@@ -3538,6 +3513,11 @@ public final class MainActivity extends Activity {
                     super.dispatchTouchEvent(cancel);
                     cancel.recycle();
                     showAddressBarTemporarily();
+                    // The same edge swipe also brought up the transient system bars;
+                    // put them away so the first swipe belongs to the app. Once the
+                    // address bar shows, a further swipe keeps them.
+                    hideSystemBars();
+                    postDelayed(MainActivity.this::hideSystemBars, 250L);
                     return true;
                 }
                 if (dy < -dp(8) || dx > dp(48)) {
