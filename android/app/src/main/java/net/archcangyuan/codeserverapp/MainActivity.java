@@ -96,6 +96,8 @@ public final class MainActivity extends Activity {
     private static final long ADDRESS_BAR_AUTO_HIDE_MS = 5_000L;
     private static final int ACCENT = Color.rgb(103, 80, 164);
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
+    /** Height of the key bar's keys; the bar adds 3 dp above and below. */
+    private static final int KEY_HEIGHT_DP = 32;
     private static final String DESKTOP_USER_AGENT =
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -1740,6 +1742,7 @@ public final class MainActivity extends Activity {
     private RdpPageBridge rdpPageBridge;
     private final Set<WebView> rdpWebViews = Collections.newSetFromMap(new WeakHashMap<>());
     private FrameLayout contentFrame;
+    private Button disconnectButton;
     private LinearLayout zoomOverlay;
     private TextView zoomPercentLabel;
     private boolean zoomSliderTracking;
@@ -1900,6 +1903,12 @@ public final class MainActivity extends Activity {
         reloadButton.setOnClickListener(view -> webView.reload());
         addressBar.addView(reloadButton);
 
+        disconnectButton = createToolbarButton("⏏");
+        disconnectButton.setContentDescription("Disconnect the remote desktop");
+        disconnectButton.setOnClickListener(view -> disconnectActiveRdpSession());
+        disconnectButton.setVisibility(View.GONE);
+        addressBar.addView(disconnectButton);
+
         Button settingsButton = createToolbarButton("⚙");
         settingsButton.setContentDescription("Settings");
         settingsButton.setOnClickListener(view -> showSettings());
@@ -2013,7 +2022,7 @@ public final class MainActivity extends Activity {
             keyboardScroll,
             new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(58)
+                dp(KEY_HEIGHT_DP + 6)
             )
         );
 
@@ -2841,6 +2850,25 @@ public final class MainActivity extends Activity {
                 && now - session.lastInactiveAt < PROJECT_SESSION_TTL_MS);
     }
 
+    /**
+     * Ends the remote desktop session in front: its page is destroyed, which
+     * closes the gateway connection and the Cloudflare tunnel. The connection
+     * panel then offers to reconnect.
+     */
+    private void disconnectActiveRdpSession() {
+        WebView target = webView;
+        String address = activeSessionKey;
+        if (target == null || address == null || !rdpWebViews.contains(target)) {
+            return;
+        }
+        projectSessions.remove(address);
+        rdpWebViews.remove(target);
+        showBlankWebView();
+        destroyWebView(target);
+        updateAddressBarOverlay();
+        rdpPanel.show(address, "Disconnected from the remote desktop.");
+    }
+
     private void destroyWebView(WebView target) {
         appliedLayoutZoomSteps.remove(target);
         lastFinishedUrls.remove(target);
@@ -2895,6 +2923,10 @@ public final class MainActivity extends Activity {
      * remote desktop twice. Web pages keep the regular layout.
      */
     private void updateAddressBarOverlay() {
+        if (disconnectButton != null) {
+            boolean rdpActive = webView != null && rdpWebViews.contains(webView);
+            disconnectButton.setVisibility(rdpActive ? View.VISIBLE : View.GONE);
+        }
         if (contentFrame == null || addressBar == null) {
             return;
         }
@@ -3404,7 +3436,7 @@ public final class MainActivity extends Activity {
     }
 
     private LinearLayout.LayoutParams keyLayoutParams(int width) {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, dp(34));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, dp(KEY_HEIGHT_DP));
         params.setMarginEnd(dp(4));
         return params;
     }
