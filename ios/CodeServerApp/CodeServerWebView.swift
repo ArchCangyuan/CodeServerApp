@@ -78,7 +78,7 @@ private let keyboardBridgeSource = #"""
   };
 
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 10) {
+  if (existingBridge && existingBridge.version >= 11) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
     existingBridge.installDesktopGestures?.();
@@ -599,8 +599,8 @@ private let keyboardBridgeSource = #"""
   const mouse = {
     buttons: 0,
     captureTarget: null,
-    lastFx: 0.5,
-    lastFy: 0.5,
+    lastX: 0,
+    lastY: 0,
     lastHit: null,
     hoverPath: [],
     downTargets: {},
@@ -608,6 +608,30 @@ private let keyboardBridgeSource = #"""
     lastDownAt: 0,
     lastDownX: 0,
     lastDownY: 0
+  };
+
+  // Mouse mode: the finger positions the cursor and in-page L/R buttons click.
+  // Everything runs inside real touch handlers, so clicks carry user
+  // activation (clipboard writes, window.open) like a physical mouse.
+  const mouseMode = {
+    enabled: false,
+    viewWidth: 0,
+    scale: 1,
+    host: null,
+    cursor: null,
+    left: null,
+    right: null,
+    touches: new Map(),
+    cursorX: -1,
+    cursorY: -1,
+    leftHeld: false,
+    leftLocked: false,
+    leftLockArmed: false,
+    leftMoved: false,
+    leftUnlockPending: false,
+    lockTimer: 0,
+    rightHeld: false,
+    inputModes: new Map()
   };
 
   const installPointerCapture = (eventWindow) => {
@@ -638,19 +662,6 @@ private let keyboardBridgeSource = #"""
     return 1;
   };
 
-  const viewportPoint = (fx, fy) => {
-    const viewport = window.visualViewport;
-    const width = viewport ? viewport.width : window.innerWidth;
-    const height = viewport ? viewport.height : window.innerHeight;
-    const left = viewport ? viewport.offsetLeft : 0;
-    const top = viewport ? viewport.offsetTop : 0;
-    const clamp = (value) => Math.max(0, Math.min(1, Number(value) || 0));
-    return {
-      x: left + Math.min(width - 1, clamp(fx) * width),
-      y: top + Math.min(height - 1, clamp(fy) * height)
-    };
-  };
-
   // Resolve the deepest element under the cursor, descending into open
   // shadow roots (IronRDP) and same-origin iframes.
   const mouseHitTest = (x, y) => {
@@ -660,6 +671,10 @@ private let keyboardBridgeSource = #"""
     let hit = null;
     for (let depth = 0; depth < 8; depth += 1) {
       let element = root.elementFromPoint(localX, localY);
+      if (element && element === mouseMode.host) {
+        element = root.elementsFromPoint(localX, localY)
+          .find((candidate) => candidate !== mouseMode.host) || null;
+      }
       for (let level = 0; element?.shadowRoot && level < 16; level += 1) {
         const inner = element.shadowRoot.elementFromPoint(localX, localY);
         if (!inner || inner === element) break;
@@ -767,11 +782,56 @@ private let keyboardBridgeSource = #"""
     mouse.hoverPath = nextPath;
   };
 
+  const isEditableElement = (element) => {
+    if (!element || element.nodeType !== 1) return false;
+    if (element.tagName === 'TEXTAREA' || element.isContentEditable) return true;
+    if (element.tagName !== 'INPUT') return false;
+    const nonText = [
+      'button', 'checkbox', 'color', 'file', 'hidden', 'image',
+      'radio', 'range', 'reset', 'submit'
+    ];
+    return !nonText.includes(String(element.type || '').toLowerCase());
+  };
+
+  // inputmode="none" keeps the system keyboard hidden while the element
+  // still takes focus and receives forwarded keys.
+  const suppressKeyboardFor = (element) => {
+    if (!mouseMode.enabled || !isEditableElement(element)) return;
+    if (!mouseMode.inputModes.has(element)) {
+      mouseMode.inputModes.set(element, element.getAttribute('inputmode'));
+    }
+    if (element.getAttribute('inputmode') !== 'none') {
+      element.setAttribute('inputmode', 'none');
+    }
+  };
+
+  const suppressKeyboardInDocument = () => {
+    if (!mouseMode.enabled) return;
+    for (const element of document.querySelectorAll(
+      'textarea, input, [contenteditable]'
+    )) {
+      suppressKeyboardFor(element);
+    }
+    suppressKeyboardFor(deepestActiveElement(document));
+  };
+
+  const restoreKeyboardInputModes = () => {
+    for (const [element, previous] of mouseMode.inputModes) {
+      if (previous === null) {
+        element.removeAttribute('inputmode');
+      } else {
+        element.setAttribute('inputmode', previous);
+      }
+    }
+    mouseMode.inputModes.clear();
+  };
+
   const focusFromMouse = (target) => {
     const selector = 'input, textarea, select, button, a[href], [tabindex], '
       + '[contenteditable=""], [contenteditable="true"]';
     for (const element of composedAncestors(target)) {
       if (!element.matches?.(selector) || element.disabled) continue;
+      suppressKeyboardFor(element);
       try {
         element.focus({ preventScroll: true });
       } catch (_) {}
@@ -787,20 +847,10 @@ private let keyboardBridgeSource = #"""
     return null;
   };
 
-  const mouseAction = (action, fx, fy, button) => {
-    if (action === 'release') {
-      for (const held of [0, 2, 1]) {
-        if (mouse.buttons & mouseButtonMask(held)) {
-          mouseAction('up', mouse.lastFx, mouse.lastFy, held);
-        }
-      }
-      return true;
-    }
-
-    mouse.lastFx = fx;
-    mouse.lastFy = fy;
-    const point = viewportPoint(fx, fy);
-    const hit = mouseHitTest(point.x, point.y)
+  const mouseAction = (action, x, y, button = 0) => {
+    mouse.lastX = x;
+    mouse.lastY = y;
+    const hit = mouseHitTest(x, y)
       || (mouse.lastHit?.element?.isConnected ? mouse.lastHit : null);
     if (!hit) {
       if (action === 'up') mouse.buttons &= ~mouseButtonMask(button);
@@ -821,17 +871,15 @@ private let keyboardBridgeSource = #"""
     if (action === 'down') {
       if (button === 0) {
         const now = performance.now();
-        const nearPrevious = Math.hypot(
-          point.x - mouse.lastDownX,
-          point.y - mouse.lastDownY
-        ) < 8;
+        const nearPrevious = Math.hypot(x - mouse.lastDownX, y - mouse.lastDownY) < 8;
         mouse.clickCount = nearPrevious && now - mouse.lastDownAt < 500
           ? Math.min(mouse.clickCount + 1, 3)
           : 1;
         mouse.lastDownAt = now;
-        mouse.lastDownX = point.x;
-        mouse.lastDownY = point.y;
+        mouse.lastDownX = x;
+        mouse.lastDownY = y;
       }
+      suppressKeyboardInDocument();
       mouse.captureTarget = null;
       mouse.buttons |= mouseButtonMask(button);
       mouse.downTargets[button] = target;
@@ -875,8 +923,361 @@ private let keyboardBridgeSource = #"""
     return false;
   };
 
+  const scrollableAncestor = (element, deltaX, deltaY) => {
+    for (const candidate of composedAncestors(element)) {
+      const style = candidate.ownerDocument.defaultView.getComputedStyle(candidate);
+      const scrollY = deltaY
+        && /(auto|scroll|overlay)/.test(style.overflowY)
+        && candidate.scrollHeight > candidate.clientHeight;
+      const scrollX = deltaX
+        && /(auto|scroll|overlay)/.test(style.overflowX)
+        && candidate.scrollWidth > candidate.clientWidth;
+      if (scrollY || scrollX) return candidate;
+    }
+    return element.ownerDocument.scrollingElement;
+  };
+
+  const mouseWheel = (x, y, deltaX, deltaY) => {
+    const hit = mouseHitTest(x, y);
+    if (!hit) return;
+    const eventWindow = hit.view;
+    const allowed = hit.element.dispatchEvent(new eventWindow.WheelEvent('wheel', {
+      ...mouseEventInit(hit, 0, mouse.buttons, 0, true),
+      deltaX,
+      deltaY,
+      deltaMode: 0,
+      // Chromium leaves the legacy wheelDelta at 0 for synthetic events and
+      // Monaco prefers it; 2.4x maps one finger pixel to one editor pixel.
+      wheelDeltaX: -deltaX * 2.4,
+      wheelDeltaY: -deltaY * 2.4
+    }));
+    // Untrusted wheel events never scroll natively, so scroll plain pages here.
+    if (allowed) scrollableAncestor(hit.element, deltaX, deltaY)?.scrollBy(deltaX, deltaY);
+  };
+
+  const visualViewportRect = () => {
+    const viewport = window.visualViewport;
+    return {
+      left: viewport ? viewport.offsetLeft : 0,
+      top: viewport ? viewport.offsetTop : 0,
+      width: viewport ? viewport.width : window.innerWidth,
+      height: viewport ? viewport.height : window.innerHeight
+    };
+  };
+
+  const ensureMouseOverlay = () => {
+    if (mouseMode.host) {
+      if (!mouseMode.host.isConnected) document.documentElement.appendChild(mouseMode.host);
+      return;
+    }
+    const host = document.createElement('div');
+    host.setAttribute('data-code-server-app-mouse', '');
+    Object.assign(host.style, {
+      position: 'fixed',
+      left: '0',
+      top: '0',
+      width: '0',
+      height: '0',
+      margin: '0',
+      padding: '0',
+      border: '0',
+      zIndex: '2147483647',
+      pointerEvents: 'none',
+      display: 'none'
+    });
+    const root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>
+      .cursor {
+        position: absolute; left: 0; top: 0; width: 14px; height: 22px;
+        transform-origin: 0 0; pointer-events: none; overflow: visible;
+      }
+      .button {
+        position: absolute; box-sizing: border-box; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        font-family: system-ui, sans-serif; font-weight: 700; color: #fff;
+        background: rgba(0, 0, 0, 0.31); border: 2px solid rgba(255, 255, 255, 0.6);
+        pointer-events: auto; touch-action: none;
+        user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+      }
+      .button.pressed { background: rgba(103, 80, 164, 0.67); }
+      .button.locked { background: rgba(103, 80, 164, 0.86); border-color: #fff; }
+    </style>
+    <svg class="cursor" viewBox="0 0 14 22">
+      <path d="M0.7 0.7 L0.7 18.5 L5.2 14.3 L8.3 21 L11.3 19.7 L8.2 13.1 L13.7 13.1 Z"
+        fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/>
+    </svg>
+    <div class="button left">L</div>
+    <div class="button right">R</div>`;
+    mouseMode.host = host;
+    mouseMode.cursor = root.querySelector('.cursor');
+    mouseMode.left = root.querySelector('.left');
+    mouseMode.right = root.querySelector('.right');
+    document.documentElement.appendChild(host);
+  };
+
+  const updateMouseCursor = () => {
+    if (!mouseMode.cursor) return;
+    const rect = visualViewportRect();
+    mouseMode.cursor.style.display = mouseMode.cursorX < 0 ? 'none' : 'block';
+    mouseMode.cursor.style.transform = `translate(${mouseMode.cursorX - rect.left}px, `
+      + `${mouseMode.cursorY - rect.top}px) scale(${mouseMode.scale})`;
+  };
+
+  const updateMouseButtons = () => {
+    if (!mouseMode.left) return;
+    const leftLocked = mouseMode.leftLocked || mouseMode.leftLockArmed;
+    mouseMode.left.classList.toggle(
+      'pressed',
+      mouseMode.leftHeld || mouseMode.leftUnlockPending
+    );
+    mouseMode.left.classList.toggle('locked', leftLocked);
+    mouseMode.left.textContent = leftLocked ? 'L🔒' : 'L';
+    mouseMode.right.classList.toggle('pressed', mouseMode.rightHeld);
+  };
+
+  const layoutMouseOverlay = () => {
+    if (!mouseMode.enabled || !mouseMode.host) return;
+    ensureMouseOverlay();
+    const rect = visualViewportRect();
+    // Size controls in native points so they stay finger-sized at any page zoom.
+    const scale = mouseMode.viewWidth > 0 ? rect.width / mouseMode.viewWidth : 1;
+    mouseMode.scale = scale;
+    Object.assign(mouseMode.host.style, {
+      display: 'block',
+      left: `${rect.left}px`,
+      top: `${rect.top}px`,
+      width: `${rect.width}px`,
+      height: `${rect.height}px`
+    });
+    const place = (element, size, right, bottom) => Object.assign(element.style, {
+      width: `${size * scale}px`,
+      height: `${size * scale}px`,
+      right: `${right * scale}px`,
+      bottom: `${bottom * scale}px`,
+      fontSize: `${18 * scale}px`,
+      borderWidth: `${2 * scale}px`
+    });
+    place(mouseMode.left, 68, 84, 40);
+    place(mouseMode.right, 56, 16, 16);
+    if (mouseMode.cursorX < 0) {
+      mouseMode.cursorX = rect.left + rect.width / 2;
+      mouseMode.cursorY = rect.top + rect.height / 2;
+    }
+    updateMouseCursor();
+  };
+
+  const moveMouseCursor = (x, y) => {
+    mouseMode.cursorX = x;
+    mouseMode.cursorY = y;
+    if (mouseMode.leftHeld) mouseMode.leftMoved = true;
+    updateMouseCursor();
+    mouseAction('move', x, y);
+  };
+
+  const clearLeftLockTimer = () => {
+    if (mouseMode.lockTimer) window.clearTimeout(mouseMode.lockTimer);
+    mouseMode.lockTimer = 0;
+  };
+
+  const mouseLeftDown = () => {
+    if (mouseMode.leftLocked) {
+      // Tap while drag-locked: release the button when this tap ends.
+      mouseMode.leftLocked = false;
+      mouseMode.leftUnlockPending = true;
+      updateMouseButtons();
+      return;
+    }
+    mouseMode.leftHeld = true;
+    mouseMode.leftLockArmed = false;
+    mouseMode.leftMoved = false;
+    mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
+    clearLeftLockTimer();
+    mouseMode.lockTimer = window.setTimeout(() => {
+      mouseMode.lockTimer = 0;
+      if (!mouseMode.leftHeld || mouseMode.leftMoved) return;
+      mouseMode.leftLockArmed = true;
+      navigator.vibrate?.(15);
+      updateMouseButtons();
+    }, 500);
+    updateMouseButtons();
+  };
+
+  const mouseLeftUp = (cancelled) => {
+    clearLeftLockTimer();
+    if (mouseMode.leftUnlockPending) {
+      mouseMode.leftUnlockPending = false;
+      mouseMode.leftHeld = false;
+      mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+      updateMouseButtons();
+      return;
+    }
+    if (!mouseMode.leftHeld) return;
+    if (!cancelled && mouseMode.leftLockArmed && !mouseMode.leftMoved) {
+      // Long press without movement: keep the button down for one-finger drags.
+      mouseMode.leftLockArmed = false;
+      mouseMode.leftLocked = true;
+      updateMouseButtons();
+      return;
+    }
+    mouseMode.leftHeld = false;
+    mouseMode.leftLockArmed = false;
+    mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+    updateMouseButtons();
+  };
+
+  const releaseMouseButtons = () => {
+    clearLeftLockTimer();
+    for (const held of [0, 2, 1]) {
+      if (mouse.buttons & mouseButtonMask(held)) {
+        mouseAction('up', mouse.lastX, mouse.lastY, held);
+      }
+    }
+    mouseMode.leftHeld = false;
+    mouseMode.leftLocked = false;
+    mouseMode.leftLockArmed = false;
+    mouseMode.leftUnlockPending = false;
+    mouseMode.rightHeld = false;
+    mouseMode.touches.clear();
+    updateMouseButtons();
+  };
+
+  const pointInElement = (element, x, y) => {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  };
+
+  const handleMouseModeTouch = (event) => {
+    if (!mouseMode.enabled) return;
+    if (event.cancelable) event.preventDefault();
+    event.stopImmediatePropagation();
+    const type = event.type;
+    for (const touch of Array.from(event.changedTouches || [])) {
+      const x = touch.clientX;
+      const y = touch.clientY;
+
+      if (type === 'touchstart') {
+        const pageTouches = Array.from(mouseMode.touches.values())
+          .filter((info) => info.role === 'cursor' || info.role === 'anchor');
+        let role = 'cursor';
+        if (pointInElement(mouseMode.left, x, y)) {
+          role = 'left';
+        } else if (pointInElement(mouseMode.right, x, y)) {
+          role = 'right';
+        } else if (pageTouches.length) {
+          // A second finger on the page scrolls; the first one stops steering.
+          role = 'scroll';
+          for (const info of pageTouches) {
+            info.role = 'anchor';
+          }
+        }
+        mouseMode.touches.set(touch.identifier, {
+          role,
+          startX: x,
+          startY: y,
+          lastX: x,
+          lastY: y,
+          startedAt: performance.now(),
+          moved: false
+        });
+        if (role === 'left') {
+          mouseLeftDown();
+        } else if (role === 'right') {
+          mouseMode.rightHeld = true;
+          mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 2);
+          updateMouseButtons();
+        } else if (role === 'cursor') {
+          moveMouseCursor(x, y);
+        }
+        continue;
+      }
+
+      const info = mouseMode.touches.get(touch.identifier);
+      if (!info) continue;
+
+      if (type === 'touchmove') {
+        if (Math.hypot(x - info.startX, y - info.startY) > 10 * mouseMode.scale) {
+          info.moved = true;
+        }
+        if (info.role === 'cursor') {
+          moveMouseCursor(x, y);
+        } else if (info.role === 'scroll') {
+          mouseWheel(mouseMode.cursorX, mouseMode.cursorY, info.lastX - x, info.lastY - y);
+        }
+        info.lastX = x;
+        info.lastY = y;
+        continue;
+      }
+
+      mouseMode.touches.delete(touch.identifier);
+      const cancelled = type === 'touchcancel';
+      if (info.role === 'left') {
+        mouseLeftUp(cancelled);
+      } else if (info.role === 'right') {
+        if (mouseMode.rightHeld) {
+          mouseMode.rightHeld = false;
+          mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 2);
+          updateMouseButtons();
+        }
+      } else if (info.role === 'cursor'
+          && !cancelled
+          && !info.moved
+          && !mouse.buttons
+          && performance.now() - info.startedAt < 350) {
+        // A quick tap is a left click at the finger.
+        mouseAction('down', x, y, 0);
+        mouseAction('up', x, y, 0);
+      }
+    }
+  };
+
+  // Keep real touch-derived pointer and mouse events away from the page so
+  // only the emulated mouse reaches it.
+  const blockNativePointerEvents = (event) => {
+    if (!mouseMode.enabled || !event.isTrusted) return;
+    if (event.pointerType === 'mouse' || event.pointerType === 'pen') return;
+    event.stopImmediatePropagation();
+    if (event.cancelable) event.preventDefault();
+  };
+
+  for (const type of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) {
+    window.addEventListener(type, handleMouseModeTouch, { capture: true, passive: false });
+  }
+  for (const type of [
+    'pointerdown', 'pointermove', 'pointerup', 'pointercancel',
+    'mousedown', 'mousemove', 'mouseup', 'click', 'dblclick', 'contextmenu'
+  ]) {
+    window.addEventListener(type, blockNativePointerEvents, true);
+  }
+  document.addEventListener('focusin', (event) => {
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    suppressKeyboardFor(path[0] || event.target);
+  }, true);
+  window.visualViewport?.addEventListener('resize', layoutMouseOverlay);
+  window.visualViewport?.addEventListener('scroll', layoutMouseOverlay);
+
+  const setMouseMode = (enabled, viewWidth) => {
+    if (viewWidth > 0) mouseMode.viewWidth = viewWidth;
+    if (enabled === mouseMode.enabled) {
+      layoutMouseOverlay();
+      return true;
+    }
+    mouseMode.enabled = enabled;
+    if (enabled) {
+      ensureMouseOverlay();
+      layoutMouseOverlay();
+      updateMouseButtons();
+      suppressKeyboardInDocument();
+    } else {
+      releaseMouseButtons();
+      if (mouseMode.host) mouseMode.host.style.display = 'none';
+      restoreKeyboardInputModes();
+    }
+    return true;
+  };
+
   const bridge = {
-    version: 10,
+    version: 11,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();
@@ -900,8 +1301,8 @@ private let keyboardBridgeSource = #"""
     sendShortcut(key, code, keyCode, control, shift) {
       return dispatchShortcut(key, code, keyCode, control, shift);
     },
-    mouse(action, fx, fy, button) {
-      return mouseAction(String(action), Number(fx), Number(fy), Number(button) || 0);
+    setMouseMode(enabled, viewWidth) {
+      return setMouseMode(Boolean(enabled), Number(viewWidth) || 0);
     },
     setModifiers(control, shift) {
       const nextControl = Boolean(control);
@@ -921,7 +1322,7 @@ private let keyboardBridgeSource = #"""
 """#
 
 @MainActor
-final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDelegate {
+final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
     @Published private(set) var zoomPercent: Int
     @Published private(set) var statusMessage: String?
     @Published private(set) var currentPageAddress = ""
@@ -948,6 +1349,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
     private var keepAliveEnabled = false
     private var controlLocked = false
     private var shiftLocked = false
+    private var mouseModeEnabled = false
     private var layoutZoomSteps: Int
     private var statusToken = UUID()
 
@@ -980,8 +1382,8 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         view.onEnter = { [weak self] in
             self?.send(.enter)
         }
-        view.onMouse = { [weak self] action, point, button in
-            self?.sendMouse(action, at: point, button: button)
+        view.onWidthChanged = { [weak self] in
+            self?.syncMouseModeOnAllSessions()
         }
         for session in sessions.values {
             view.install(session.webView)
@@ -1017,8 +1419,6 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         if let activeSessionKey,
            activeSessionKey != target.key,
            let current = sessions[activeSessionKey] {
-            // Release held mouse buttons on the page that is being left.
-            hostView.releaseMouseButtons()
             current.lastInactiveAt = now
             // Keep the inactive WKWebView visible behind the active one so WebKit
             // does not suspend its RDP/WebSocket session. It cannot receive input.
@@ -1049,6 +1449,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
             }
         }
         syncModifiers(on: target.webView)
+        syncMouseMode(on: target.webView)
         evictExcessSessions()
     }
 
@@ -1097,7 +1498,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         if let webView = activeSession?.webView {
             syncModifiers(on: webView)
         }
-        if control || shift {
+        if (control || shift) && !mouseModeEnabled {
             hostView?.activateKeyboardCapture()
         }
     }
@@ -1132,19 +1533,20 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         )
     }
 
-    func sendMouse(_ action: MouseAction, at point: CGPoint, button: Int) {
-        guard let webView = activeSession?.webView else { return }
-        let x = min(max(Double(point.x), 0), 1)
-        let y = min(max(Double(point.y), 0), 1)
-        webView.evaluateJavaScript(
-            "window.__codeServerAppKeyboard?.mouse?.('\(action.rawValue)', \(x), \(y), \(button)) ?? false;"
-        )
+    func setMouseModeEnabled(_ enabled: Bool) {
+        guard enabled != mouseModeEnabled else { return }
+        mouseModeEnabled = enabled
+        if enabled {
+            // Dismiss any visible system keyboard; the page keeps it hidden afterwards.
+            hostView?.endEditing(true)
+        }
+        syncMouseModeOnAllSessions()
     }
 
     func announceMouseMode(_ enabled: Bool) {
         showStatus(
             enabled
-                ? "Mouse mode: joystick moves, L/R click, hold L to lock drag"
+                ? "Mouse mode: finger moves the cursor, tap or L/R to click"
                 : "Mouse mode off"
         )
     }
@@ -1206,6 +1608,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         configuration.websiteDataStore = .default()
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         configuration.defaultWebpagePreferences.preferredContentMode = .desktop
         configuration.userContentController.addUserScript(
             WKUserScript(
@@ -1222,6 +1625,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
             self.disableDoubleTapZoom(in: webView)
         }
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         webView.customUserAgent = desktopUserAgent
         webView.allowsBackForwardNavigationGestures = true
         webView.allowsLinkPreview = false
@@ -1251,6 +1655,19 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         );
         """
         webView.evaluateJavaScript(script)
+    }
+
+    private func syncMouseModeOnAllSessions() {
+        for session in sessions.values {
+            syncMouseMode(on: session.webView)
+        }
+    }
+
+    private func syncMouseMode(on webView: WKWebView) {
+        let width = webView.bounds.width > 0 ? webView.bounds.width : hostView?.bounds.width ?? 0
+        webView.evaluateJavaScript(
+            "window.__codeServerAppKeyboard?.setMouseMode?.(\(mouseModeEnabled), \(Double(width))) ?? false;"
+        )
     }
 
     private func viewportWidth() -> Int {
@@ -1323,6 +1740,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         session.urlObservation = nil
         session.webView.stopLoading()
         session.webView.navigationDelegate = nil
+        session.webView.uiDelegate = nil
         session.webView.removeFromSuperview()
     }
 
@@ -1389,6 +1807,23 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
                     && session.appliedZoomSteps != layoutZoomSteps))
         applyLayoutZoom(to: session, reloadAfterApply: needsReload)
         syncModifiers(on: webView)
+        syncMouseMode(on: webView)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        // Links opened with window.open (e.g. terminal and editor links) go to
+        // the system browser instead of a new in-app window.
+        if let url = navigationAction.request.url,
+           let scheme = url.scheme?.lowercased(),
+           ["http", "https", "mailto"].contains(scheme) {
+            UIApplication.shared.open(url)
+        }
+        return nil
     }
 }
 
@@ -1406,7 +1841,7 @@ struct CodeServerWebView: UIViewRepresentable {
     func updateUIView(_ view: WebViewSessionContainerView, context: Context) {
         store.attach(to: view)
         store.activate(address: address)
-        view.setMouseModeEnabled(mouseModeEnabled)
+        store.setMouseModeEnabled(mouseModeEnabled)
     }
 }
 
@@ -1420,17 +1855,14 @@ final class WebViewSessionContainerView: UIView {
     var onEnter: (() -> Void)? {
         didSet { keyboardCapture.onEnter = onEnter }
     }
-    var onMouse: ((MouseAction, CGPoint, Int) -> Void)? {
-        didSet { mouseOverlay.onMouse = onMouse }
-    }
+    var onWidthChanged: (() -> Void)?
 
     private let keyboardCapture = KeyboardCaptureTextView()
-    private let mouseOverlay = MouseOverlayView()
+    private var lastLayoutWidth: CGFloat = 0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .systemBackground
-        addSubview(mouseOverlay)
         addSubview(keyboardCapture)
     }
 
@@ -1443,22 +1875,12 @@ final class WebViewSessionContainerView: UIView {
             addSubview(webView)
         }
         webView.frame = bounds
-        bringSubviewToFront(mouseOverlay)
         bringSubviewToFront(keyboardCapture)
     }
 
     func bringWebViewToFront(_ webView: WKWebView) {
         bringSubviewToFront(webView)
-        bringSubviewToFront(mouseOverlay)
         bringSubviewToFront(keyboardCapture)
-    }
-
-    func setMouseModeEnabled(_ enabled: Bool) {
-        mouseOverlay.setEnabled(enabled)
-    }
-
-    func releaseMouseButtons() {
-        mouseOverlay.releaseButtons()
     }
 
     func activateKeyboardCapture() {
@@ -1477,6 +1899,10 @@ final class WebViewSessionContainerView: UIView {
             width: 1,
             height: 1
         )
+        if bounds.width != lastLayoutWidth {
+            lastLayoutWidth = bounds.width
+            onWidthChanged?()
+        }
     }
 }
 
