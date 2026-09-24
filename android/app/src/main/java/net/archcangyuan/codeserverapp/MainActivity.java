@@ -35,8 +35,10 @@ import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -1834,7 +1836,21 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             getWindow().setDecorFitsSystemWindows(false);
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            // Let the page extend into the status-bar strip beside a camera cutout.
+            WindowManager.LayoutParams attributes = getWindow().getAttributes();
+            attributes.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(attributes);
+        }
         hideSystemBars();
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            getWindow().getDecorView().setOnSystemUiVisibilityChangeListener(visibility -> {
+                if ((visibility & View.SYSTEM_UI_FLAG_FULLSCREEN) == 0) {
+                    onSystemBarsRevealed();
+                }
+            });
+        }
     }
 
     private void showSettings() {
@@ -2000,17 +2016,18 @@ public final class MainActivity extends Activity {
     }
 
     /**
-     * The app always runs fullscreen: system bars stay hidden and only appear
-     * transiently when swiped in from the screen edge.
+     * The app always runs fullscreen with the system bars hidden. A swipe from the
+     * top edge reveals them; see {@link #onSystemBarsRevealed()} for how the first
+     * swipe is redirected to the address bar.
      */
     private void hideSystemBars() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
+                // Non-transient reveal (BEHAVIOR_DEFAULT, formerly SHOW_BARS_BY_SWIPE),
+                // so a swipe updates the insets and the app can react to it.
+                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_DEFAULT);
                 controller.hide(WindowInsets.Type.systemBars());
-                controller.setSystemBarsBehavior(
-                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                );
             }
         } else {
             getWindow().getDecorView().setSystemUiVisibility(
@@ -2019,9 +2036,24 @@ public final class MainActivity extends Activity {
                     | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                     | View.SYSTEM_UI_FLAG_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE
             );
         }
+    }
+
+    /**
+     * Emulates deferred system gestures: the first swipe from the top edge shows
+     * the address bar and re-hides the system bars; a swipe while the address bar
+     * is already showing keeps the system bars, which then hide with the bar.
+     */
+    private void onSystemBarsRevealed() {
+        if (addressBar == null) {
+            return;
+        }
+        if (addressBar.getVisibility() != View.VISIBLE) {
+            addressBar.post(this::hideSystemBars);
+        }
+        showAddressBarTemporarily();
     }
 
     @Override
@@ -2038,15 +2070,21 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Insets ime = insets.getInsets(WindowInsets.Type.ime());
             imeVisible = insets.isVisible(WindowInsets.Type.ime()) || ime.bottom > 0;
+            if (insets.isVisible(WindowInsets.Type.statusBars())) {
+                onSystemBarsRevealed();
+            }
 
-            // System bars are hidden, so only the display cutout needs space.
+            // System bars are hidden and the page fills the top edge, including the
+            // cutout strip. Only the address bar steps below a top cutout, and side
+            // cutouts in landscape keep their padding.
             Insets cutout = insets.getInsets(WindowInsets.Type.displayCutout());
             view.setPadding(
                 cutout.left,
-                cutout.top,
+                0,
                 cutout.right,
                 Math.max(cutout.bottom, ime.bottom)
             );
+            applyAddressBarTopInset(cutout.top);
         } else {
             int bottomInset = insets.getSystemWindowInsetBottom();
             int keyboardInset = bottomInset > dp(120) ? bottomInset : 0;
@@ -2055,6 +2093,18 @@ public final class MainActivity extends Activity {
         }
         if (webView instanceof RdpInputWebView) {
             ((RdpInputWebView) webView).setImeVisible(imeVisible);
+        }
+    }
+
+    private void applyAddressBarTopInset(int topInset) {
+        if (addressBar == null) {
+            return;
+        }
+        addressBar.setPadding(dp(8), dp(5) + topInset, dp(8), dp(5));
+        ViewGroup.LayoutParams params = addressBar.getLayoutParams();
+        if (params != null && params.height != dp(56) + topInset) {
+            params.height = dp(56) + topInset;
+            addressBar.setLayoutParams(params);
         }
     }
 
@@ -2541,6 +2591,7 @@ public final class MainActivity extends Activity {
 
     private void hideAddressBar() {
         addressBarHandler.removeCallbacks(autoHideAddressBar);
+        hideSystemBars();
         if (addressBar != null) {
             addressBar.setVisibility(View.GONE);
         }

@@ -12,9 +12,10 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Lockable `Ctrl` and `Shift` modifiers for combinations entered with the
   on-screen keyboard, a hardware keyboard, or the supplemental keys
 - Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
-- Always fullscreen with the system bars hidden. The address bar and zoom slider appear for
-  5 seconds after each page load (not while the address is being edited); pull down from the
-  top edge of the page to show them again
+- Always fullscreen: the page fills the whole screen, status-bar area included. The address
+  bar and zoom slider appear for 5 seconds after each page load (not while the address is being
+  edited). The first pull from the top edge shows them; a second pull while they are showing
+  reveals the system status bar, which hides again with them
 - Desktop-site mode and an IME-aware supplemental key bar on both platforms
 - A translucent zoom slider under the address bar (39%–459% in 27 steps) that appears and hides
   with the bar. The virtual-viewport zoom resizes the layout in place, without reloading,
