@@ -58,13 +58,11 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.WeakHashMap;
 
 public final class MainActivity extends Activity {
@@ -98,7 +96,11 @@ public final class MainActivity extends Activity {
     private static final String KEYBOARD_BRIDGE = """
         (() => {
           const PROXY_ID = '__code_server_app_keyboard_proxy';
-          const setViewportWidth = (requestedWidth) => {
+          // fitWidth is the native view width in points. When given, the page scale is
+          // pinned to fit the new layout width for a moment, because web views keep
+          // their old scale on live viewport changes and would crop the page. If the
+          // page still does not fit, allowReload lets it fall back to one reload.
+          const setViewportWidth = (requestedWidth, fitWidth = 0, allowReload = false) => {
             const numericWidth = Number(requestedWidth) || 1280;
             const width = Math.max(400, Math.min(2400, Math.round(numericWidth)));
             let viewport = document.querySelector('meta[name="viewport"]');
@@ -107,10 +109,40 @@ public final class MainActivity extends Activity {
               viewport.setAttribute('name', 'viewport');
               (document.head || document.documentElement).appendChild(viewport);
             }
-            viewport.setAttribute(
-              'content',
-              `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`
-            );
+            const relaxedContent =
+              `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`;
+            const token = (window.__codeServerAppViewportToken || 0) + 1;
+            window.__codeServerAppViewportToken = token;
+            if (Number(fitWidth) > 0) {
+              const scale = Math.max(0.1, Math.min(5, Number(fitWidth) / width)).toFixed(4);
+              viewport.setAttribute(
+                'content',
+                `width=${width}, initial-scale=${scale}, minimum-scale=${scale}, `
+                  + `maximum-scale=${scale}, user-scalable=yes`
+              );
+              window.setTimeout(() => {
+                if (window.__codeServerAppViewportToken !== token) return;
+                viewport.setAttribute('content', relaxedContent);
+                window.dispatchEvent(new Event('resize'));
+                if (!allowReload) return;
+                window.setTimeout(() => {
+                  if (window.__codeServerAppViewportToken !== token) return;
+                  const visible = window.visualViewport ? window.visualViewport.width : width;
+                  if (Math.abs(visible - window.innerWidth) <= window.innerWidth * 0.03) return;
+                  const reloadKey = '__codeServerAppViewportReloadAt';
+                  try {
+                    const lastReload = Number(window.sessionStorage.getItem(reloadKey)) || 0;
+                    if (Date.now() - lastReload < 15000) return;
+                    window.sessionStorage.setItem(reloadKey, String(Date.now()));
+                  } catch (_) {
+                    return;
+                  }
+                  window.location.reload();
+                }, 250);
+              }, 180);
+            } else {
+              viewport.setAttribute('content', relaxedContent);
+            }
             document.documentElement.style.zoom = '1';
             if (document.body) {
               document.body.style.zoom = '1';
@@ -1536,8 +1568,6 @@ public final class MainActivity extends Activity {
     private final Map<String, ProjectSession> projectSessions = new LinkedHashMap<>();
     private final Map<WebView, Integer> appliedLayoutZoomSteps = new WeakHashMap<>();
     private final Map<WebView, String> lastFinishedUrls = new WeakHashMap<>();
-    private final Set<WebView> zoomReloadInProgress =
-        Collections.newSetFromMap(new WeakHashMap<>());
     private LinearLayout rootContainer;
     private LinearLayout addressBar;
     private EditText addressField;
@@ -2115,8 +2145,7 @@ public final class MainActivity extends Activity {
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
                 String lastFinishedUrl = lastFinishedUrls.get(view);
-                if (!zoomReloadInProgress.contains(view)
-                    && (lastFinishedUrl == null || !lastFinishedUrl.equals(url))) {
+                if (lastFinishedUrl == null || !lastFinishedUrl.equals(url)) {
                     appliedLayoutZoomSteps.remove(view);
                 }
             }
@@ -2130,7 +2159,7 @@ public final class MainActivity extends Activity {
             @Override
             public void onPageCommitVisible(WebView view, String url) {
                 super.onPageCommitVisible(view, url);
-                installKeyboardBridge(view, false, false);
+                installKeyboardBridge(view, false);
             }
 
             @Override
@@ -2138,8 +2167,7 @@ public final class MainActivity extends Activity {
                 super.onPageFinished(view, url);
                 lastFinishedUrls.put(view, url);
                 updateAddressFromWebView(view, url);
-                boolean completedZoomReload = zoomReloadInProgress.remove(view);
-                installKeyboardBridge(view, true, !completedZoomReload);
+                installKeyboardBridge(view, true);
             }
 
         });
@@ -2191,7 +2219,7 @@ public final class MainActivity extends Activity {
         );
         Toast.makeText(
             this,
-            "UI zoom " + zoomPercent + "% - reloading to fit",
+            "UI zoom " + zoomPercent + "%",
             Toast.LENGTH_SHORT
         ).show();
     }
@@ -2202,16 +2230,27 @@ public final class MainActivity extends Activity {
         );
     }
 
-    private void applyLayoutZoom(WebView target, boolean reloadAfterApply) {
+    /**
+     * Applies the layout zoom in place by changing the virtual viewport width and
+     * pinning the page scale to fit it. The page reloads only when the web view
+     * still does not fit afterwards and a fallback reload is allowed.
+     */
+    private void applyLayoutZoom(WebView target, boolean allowFallbackReload) {
         if (target == null) {
             return;
         }
         int requestedSteps = layoutZoomSteps;
         int viewportWidth = calculateLayoutViewportWidth();
+        int viewWidthPx = target.getWidth() > 0
+            ? target.getWidth()
+            : (webContainer == null ? 0 : webContainer.getWidth());
+        float fitWidthDp = viewWidthPx / getResources().getDisplayMetrics().density;
         String script = "(() => {"
             + "const width=" + viewportWidth + ";"
             + "if(window.__codeServerAppSetViewportWidth){"
-            + "return window.__codeServerAppSetViewportWidth(width);}"
+            + "return window.__codeServerAppSetViewportWidth(width,"
+            + String.format(Locale.US, "%.2f", fitWidthDp) + ","
+            + allowFallbackReload + ");}"
             + "let viewport=document.querySelector('meta[name=viewport]');"
             + "if(!viewport){viewport=document.createElement('meta');"
             + "viewport.name='viewport';"
@@ -2232,10 +2271,6 @@ public final class MainActivity extends Activity {
             appliedLayoutZoomSteps.put(target, requestedSteps);
             target.requestLayout();
             target.invalidate();
-            if (reloadAfterApply && target.getUrl() != null) {
-                zoomReloadInProgress.add(target);
-                target.reload();
-            }
         });
     }
 
@@ -2351,8 +2386,8 @@ public final class MainActivity extends Activity {
         webView.bringToFront();
         webView.onResume();
         Integer appliedSteps = appliedLayoutZoomSteps.get(webView);
-        boolean needsReload = appliedSteps != null && appliedSteps != layoutZoomSteps;
-        applyLayoutZoom(webView, needsReload);
+        boolean zoomChanged = appliedSteps != null && appliedSteps != layoutZoomSteps;
+        applyLayoutZoom(webView, zoomChanged);
         syncModifiers(webView);
         syncMouseMode(webView);
     }
@@ -2415,7 +2450,6 @@ public final class MainActivity extends Activity {
     private void destroyWebView(WebView target) {
         appliedLayoutZoomSteps.remove(target);
         lastFinishedUrls.remove(target);
-        zoomReloadInProgress.remove(target);
         if (webContainer != null) {
             webContainer.removeView(target);
         }
@@ -2635,18 +2669,16 @@ public final class MainActivity extends Activity {
         return base + suffix;
     }
 
-    private void installKeyboardBridge(
-        WebView target,
-        boolean applyZoom,
-        boolean allowZoomReload
-    ) {
-        target.evaluateJavascript(KEYBOARD_BRIDGE, value -> {
+    private void installKeyboardBridge(WebView target, boolean applyZoom) {
+        // Seed the zoomed viewport width so the first layout already uses it.
+        String script = "window.__codeServerAppViewportWidth="
+            + calculateLayoutViewportWidth() + ";" + KEYBOARD_BRIDGE;
+        target.evaluateJavascript(script, value -> {
             if (applyZoom) {
                 Integer appliedSteps = appliedLayoutZoomSteps.get(target);
-                boolean needsReload = allowZoomReload
-                    && ((appliedSteps == null && layoutZoomSteps != 0)
-                        || (appliedSteps != null && appliedSteps != layoutZoomSteps));
-                applyLayoutZoom(target, needsReload);
+                boolean zoomChanged = (appliedSteps == null && layoutZoomSteps != 0)
+                    || (appliedSteps != null && appliedSteps != layoutZoomSteps);
+                applyLayoutZoom(target, zoomChanged);
             }
             syncModifiers(target);
             syncMouseMode(target);
