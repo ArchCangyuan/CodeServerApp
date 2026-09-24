@@ -110,10 +110,27 @@
   await import('./iron-remote-desktop.js');
   await init('WARN');
 
-  const desktopSize = () => {
-    const width = Math.max(480, Math.round(document.documentElement.clientWidth / 2) * 2);
-    const height = Math.max(240, Math.round(document.documentElement.clientHeight / 2) * 2);
-    return { width, height };
+  // The space the desktop has on screen, in CSS pixels.
+  const availableSize = () => ({
+    width: Math.max(480, document.documentElement.clientWidth),
+    height: Math.max(240, document.documentElement.clientHeight)
+  });
+  // Largest size the server has shown it accepts; Windows caps the desktop
+  // (e.g. 4096 x 2048 without the graphics pipeline) and a capped dimension
+  // would leave black bars. Learned from what the server actually applies.
+  const serverLimit = { width: Infinity, height: Infinity };
+  // The desktop size to request: the available space itself, or the largest
+  // size with the same aspect ratio within the server's limit.
+  const desktopSize = (available = availableSize()) => {
+    const factor = Math.min(
+      1,
+      serverLimit.width / available.width,
+      serverLimit.height / available.height
+    );
+    return {
+      width: Math.floor(available.width * factor / 2) * 2,
+      height: Math.floor(available.height * factor)
+    };
   };
 
   const element = document.createElement('iron-remote-desktop');
@@ -125,6 +142,53 @@
   let connected = false;
   let attempts = 0;
   let connectedSize = null;
+  let fittedFor = null;
+  let checkTimer = 0;
+
+  const rendererCanvas = () => element.shadowRoot?.querySelector('canvas') || null;
+
+  // After the server applies a size, learn its limit when it shrank a
+  // dimension, and ask again for a size with the right aspect ratio.
+  const checkAppliedSize = (requested, retries = 2) => {
+    window.clearTimeout(checkTimer);
+    const started = Date.now();
+    const poll = () => {
+      if (!connected || connectedSize !== requested) return;
+      const canvas = rendererCanvas();
+      const applied = canvas ? { width: canvas.width, height: canvas.height } : null;
+      const matches = applied
+        && Math.abs(applied.width - requested.width) <= 2
+        && Math.abs(applied.height - requested.height) <= 2;
+      if (matches) return;
+      if (Date.now() - started < 4000) {
+        checkTimer = window.setTimeout(poll, 250);
+        return;
+      }
+      if (!applied || retries <= 0) return;
+      let learned = false;
+      if (applied.width < requested.width - 2 && applied.width < serverLimit.width) {
+        serverLimit.width = applied.width;
+        learned = true;
+      }
+      if (applied.height < requested.height - 2 && applied.height < serverLimit.height) {
+        serverLimit.height = applied.height;
+        learned = true;
+      }
+      if (!learned) return;
+      const size = desktopSize(fittedFor);
+      if (Math.abs(size.width - applied.width) < 4 && Math.abs(size.height - applied.height) < 4) {
+        return;
+      }
+      connectedSize = size;
+      try {
+        ui.resize(size.width, size.height);
+      } catch (_) {
+        return;
+      }
+      checkAppliedSize(size, retries - 1);
+    };
+    checkTimer = window.setTimeout(poll, 250);
+  };
 
   const errorKindNames = [
     'General', 'WrongPassword', 'LogonFailure', 'AccessDenied',
@@ -161,7 +225,8 @@
 
   async function connect() {
     if (!attempts) showStatus('Connecting…');
-    const size = desktopSize();
+    const available = availableSize();
+    const size = desktopSize(available);
     const builder = ui.configBuilder()
       .withUsername(config.username || '')
       .withPassword(config.password || '')
@@ -200,9 +265,11 @@
     connected = true;
     attempts = 0;
     connectedSize = size;
+    fittedFor = available;
     ui.setVisibility(true);
     showStatus('');
     notifyNative('connected');
+    checkAppliedSize(size);
     try {
       const termination = await session.run();
       scheduleReconnect(termination.reason());
@@ -218,14 +285,19 @@
   window.addEventListener('resize', () => {
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
-      if (!connected || !ui || !connectedSize) return;
-      const size = desktopSize();
-      if (Math.abs(size.width - connectedSize.width) < 16
-          && Math.abs(size.height - connectedSize.height) < 16) return;
+      if (!connected || !ui || !connectedSize || !fittedFor) return;
+      const available = availableSize();
+      if (Math.abs(available.width - fittedFor.width) < 16
+          && Math.abs(available.height - fittedFor.height) < 16) return;
+      fittedFor = available;
+      const size = desktopSize(available);
       connectedSize = size;
       try {
         ui.resize(size.width, size.height);
-      } catch (_) {}
+      } catch (_) {
+        return;
+      }
+      checkAppliedSize(size);
     }, 400);
   });
 
