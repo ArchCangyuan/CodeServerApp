@@ -4,12 +4,13 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - "android/**"
       - ".github/workflows/build-android.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -46,3 +47,24 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          NOTES=".github/release-notes/$TAG.md"
+          # Both platform workflows run for the same tag; whichever finishes
+          # first creates the release and the other one attaches to it.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            if [[ -f "$NOTES" ]]; then
+              gh release create "$TAG" --verify-tag --title "YourWorkspace $TAG" \
+                --notes-file "$NOTES" || true
+            else
+              gh release create "$TAG" --verify-tag --title "YourWorkspace $TAG" \
+                --generate-notes || true
+            fi
+          fi
+          gh release upload "$TAG" YourWorkspace.apk --clobber
