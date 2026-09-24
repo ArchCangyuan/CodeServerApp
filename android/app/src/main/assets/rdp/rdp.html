@@ -111,8 +111,8 @@
   await init('WARN');
 
   const desktopSize = () => {
-    const width = Math.max(640, Math.round(document.documentElement.clientWidth / 2) * 2);
-    const height = Math.max(480, Math.round(document.documentElement.clientHeight / 2) * 2);
+    const width = Math.max(480, Math.round(document.documentElement.clientWidth / 2) * 2);
+    const height = Math.max(240, Math.round(document.documentElement.clientHeight / 2) * 2);
     return { width, height };
   };
 
@@ -211,20 +211,22 @@
     }
   }
 
-  // Follow width changes (zoom, rotation) with a dynamic resize instead of a
-  // reconnect; height-only changes (address bar, keyboard) just rescale.
+  // Follow every change of the available area (zoom, rotation, keyboard,
+  // address bar) with a dynamic resize instead of a reconnect. The desktop
+  // is scaled to fit meanwhile.
   let resizeTimer = 0;
   window.addEventListener('resize', () => {
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
       if (!connected || !ui || !connectedSize) return;
       const size = desktopSize();
-      if (Math.abs(size.width - connectedSize.width) < 16) return;
+      if (Math.abs(size.width - connectedSize.width) < 16
+          && Math.abs(size.height - connectedSize.height) < 16) return;
       connectedSize = size;
       try {
         ui.resize(size.width, size.height);
       } catch (_) {}
-    }, 800);
+    }, 400);
   });
 
   element.addEventListener('ready', (event) => {
