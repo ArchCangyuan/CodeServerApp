@@ -15,6 +15,7 @@ import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -62,12 +63,15 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.WeakHashMap;
 
 public final class MainActivity extends Activity {
@@ -92,6 +96,8 @@ public final class MainActivity extends Activity {
     private static final long ADDRESS_BAR_AUTO_HIDE_MS = 5_000L;
     private static final int ACCENT = Color.rgb(103, 80, 164);
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
+    /** Height of the key bar's keys; the bar adds 3 dp above and below. */
+    private static final int KEY_HEIGHT_DP = 32;
     private static final String DESKTOP_USER_AGENT =
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -109,6 +115,13 @@ public final class MainActivity extends Activity {
           const setViewportWidth = (requestedWidth, fitWidth = 0, allowReload = false) => {
             const numericWidth = Number(requestedWidth) || 1280;
             const width = Math.max(200, Math.min(4000, Math.round(numericWidth)));
+            // The built-in remote desktop page keeps its viewport at scale 1 and
+            // turns the zoom into the remote desktop's pixel density itself.
+            if (window.__yourWorkspaceRdpPage) {
+              window.__codeServerAppViewportWidth = width;
+              window.dispatchEvent(new Event('yourworkspace-rdp-zoom'));
+              return width;
+            }
             let viewport = document.querySelector('meta[name="viewport"]');
             if (!viewport) {
               viewport = document.createElement('meta');
@@ -119,6 +132,25 @@ public final class MainActivity extends Activity {
               `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`;
             const token = (window.__codeServerAppViewportToken || 0) + 1;
             window.__codeServerAppViewportToken = token;
+            // On a web RDP page (IronRDP) a reload always reconnects the remote session,
+            // which asks for the credentials again, so there is never a fallback reload.
+            // Width changes still resize the remote desktop live, but are spaced at least
+            // 1.5 s apart (only the latest one is applied) so the session is not asked to
+            // resize repeatedly in quick succession.
+            if (Number(fitWidth) > 0 && window.__codeServerAppIsRdpPage?.()) {
+              allowReload = false;
+              const now = Date.now();
+              const nextAllowed = (window.__codeServerAppRdpResizeAt || 0) + 1500;
+              window.clearTimeout(window.__codeServerAppRdpResizeTimer);
+              if (now < nextAllowed) {
+                window.__codeServerAppRdpResizeTimer = window.setTimeout(
+                  () => setViewportWidth(requestedWidth, fitWidth, false),
+                  nextAllowed - now
+                );
+                return Number(window.__codeServerAppViewportWidth) || width;
+              }
+              window.__codeServerAppRdpResizeAt = now;
+            }
             if (Number(fitWidth) > 0) {
               const scale = Math.max(0.1, Math.min(5, Number(fitWidth) / width)).toFixed(4);
               viewport.setAttribute(
@@ -133,8 +165,11 @@ public final class MainActivity extends Activity {
                 if (!allowReload) return;
                 window.setTimeout(() => {
                   if (window.__codeServerAppViewportToken !== token) return;
-                  const visible = window.visualViewport ? window.visualViewport.width : width;
-                  if (Math.abs(visible - window.innerWidth) <= window.innerWidth * 0.03) return;
+                  // innerWidth follows the visual viewport in Chromium, so compare the
+                  // visible width against the layout width instead.
+                  const layout = document.documentElement.clientWidth || width;
+                  const visible = window.visualViewport ? window.visualViewport.width : layout;
+                  if (Math.abs(visible - layout) <= layout * 0.03) return;
                   const reloadKey = '__codeServerAppViewportReloadAt';
                   try {
                     const lastReload = Number(window.sessionStorage.getItem(reloadKey)) || 0;
@@ -196,8 +231,10 @@ public final class MainActivity extends Activity {
             return null;
           };
 
+          window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
+
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 11) {
+          if (existingBridge && existingBridge.version >= 12) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
             existingBridge.installRdpGestures?.();
             existingBridge.installDesktopGestures?.();
@@ -241,12 +278,42 @@ public final class MainActivity extends Activity {
             }));
           };
 
+          // IronRDP synchronizes the remote Caps Lock / Num Lock state from every
+          // mouseenter on its canvas. Touch-derived events can carry a stale lock state
+          // and turn Caps Lock on in the remote session, so real mouseenter events are
+          // replaced by one with Caps Lock off and Num Lock on. mouseenter reaches only
+          // the entered element, so this listens (capturing, ahead of IronRDP) on the
+          // canvas and its ancestors inside the shadow root. Pressing an actual lock key
+          // still synchronizes through the keyboard path.
+          const replaceRdpLockState = (event) => {
+            if (!event.isTrusted) return;
+            const target = event.currentTarget;
+            event.stopImmediatePropagation();
+            const eventWindow = target.ownerDocument?.defaultView || window;
+            target.dispatchEvent(new eventWindow.MouseEvent('mouseenter', {
+              bubbles: false,
+              cancelable: false,
+              composed: true,
+              view: eventWindow,
+              clientX: event.clientX,
+              clientY: event.clientY,
+              screenX: event.screenX,
+              screenY: event.screenY,
+              buttons: event.buttons,
+              modifierCapsLock: false,
+              modifierNumLock: true
+            }));
+          };
+
           const installRdpGestures = () => {
             const canvas = findIronRdpCanvas();
             if (!canvas) return false;
             state.ironRdpCanvas = canvas;
             if (state.gestureCanvas === canvas) return true;
             state.gestureCanvas = canvas;
+            for (let element = canvas; element && element.nodeType === 1; element = element.parentNode) {
+              element.addEventListener('mouseenter', replaceRdpLockState, true);
+            }
 
             // Preserve WebView panning and IronRDP's native coordinate mapping.
             canvas.style.touchAction = '';
@@ -476,6 +543,48 @@ public final class MainActivity extends Activity {
           installRdpGestures();
           installDesktopGestures();
           window.setInterval(installRdpGestures, 1000);
+
+          // Cloudflare's browser RDP keeps a short-lived token from page load. When the
+          // session reconnects after it expired, the page shows `"exp" claim timestamp
+          // check failed` although the Access login is still valid. A reload fetches a
+          // fresh token (only the Windows password is asked again), so reload
+          // automatically, at most once every 30 s. The check runs only on RDP pages
+          // and small error pages, never on large pages such as the workbench.
+          const expiredAccessTokenPattern = /claim timestamp check failed/i;
+          let webRdpPageSeen = false;
+          const collectPageText = () => {
+            const roots = [document];
+            let text = '';
+            for (let index = 0; index < roots.length && index < 64; index += 1) {
+              const root = roots[index];
+              text += ` ${(root.body || root).textContent || ''}`;
+              if (text.length > 200000 || !root.querySelectorAll) break;
+              for (const element of root.querySelectorAll('*')) {
+                if (element.shadowRoot) roots.push(element.shadowRoot);
+                if (element.tagName === 'IFRAME') {
+                  try {
+                    if (element.contentDocument) roots.push(element.contentDocument);
+                  } catch (_) {}
+                }
+              }
+            }
+            return text;
+          };
+          const reloadOnExpiredAccessToken = () => {
+            if (state.ironRdpCanvas) webRdpPageSeen = true;
+            if (!webRdpPageSeen && document.getElementsByTagName('*').length > 400) return;
+            if (!expiredAccessTokenPattern.test(collectPageText())) return;
+            const reloadKey = '__codeServerAppAccessTokenReloadAt';
+            try {
+              const lastReload = Number(window.sessionStorage.getItem(reloadKey)) || 0;
+              if (Date.now() - lastReload < 30000) return;
+              window.sessionStorage.setItem(reloadKey, String(Date.now()));
+            } catch (_) {
+              return;
+            }
+            window.location.reload();
+          };
+          window.setInterval(reloadOnExpiredAccessToken, 2000);
           const isProxy = (element) => Boolean(element && element.id === PROXY_ID);
 
           const deepestActiveElement = (rootDocument) => {
@@ -863,7 +972,8 @@ public final class MainActivity extends Activity {
             lastDownY: 0
           };
 
-          // Mouse mode: the finger positions the cursor and in-page L/R buttons click.
+          // Mouse mode: the page works like a touchpad (finger movement moves the
+          // cursor, a tap clicks at the cursor) and in-page L/R buttons click.
           // Everything runs inside real touch handlers, so clicks carry user
           // activation (clipboard writes, window.open) like a physical mouse.
           const mouseMode = {
@@ -874,6 +984,7 @@ public final class MainActivity extends Activity {
             cursor: null,
             left: null,
             right: null,
+            lockButton: null,
             touches: new Map(),
             cursorX: -1,
             cursorY: -1,
@@ -978,7 +1089,10 @@ public final class MainActivity extends Activity {
             ctrlKey: state.control,
             shiftKey: state.shift,
             altKey: false,
-            metaKey: false
+            metaKey: false,
+            // IronRDP copies lock-key state from mouseenter into the remote session.
+            modifierCapsLock: false,
+            modifierNumLock: true
           });
 
           const fireMouse = (hit, element, type, button, buttons, detail = 0, bubbles = true) => {
@@ -1254,17 +1368,20 @@ public final class MainActivity extends Activity {
               }
               .button.pressed { background: rgba(103, 80, 164, 0.67); }
               .button.locked { background: rgba(103, 80, 164, 0.86); border-color: #fff; }
+              .button.lock { font-weight: 400; }
             </style>
             <svg class="cursor" viewBox="0 0 14 22">
               <path d="M0.7 0.7 L0.7 18.5 L5.2 14.3 L8.3 21 L11.3 19.7 L8.2 13.1 L13.7 13.1 Z"
                 fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/>
             </svg>
             <div class="button left">L</div>
-            <div class="button right">R</div>`;
+            <div class="button right">R</div>
+            <div class="button lock" title="Hold the left button">🔓</div>`;
             mouseMode.host = host;
             mouseMode.cursor = root.querySelector('.cursor');
             mouseMode.left = root.querySelector('.left');
             mouseMode.right = root.querySelector('.right');
+            mouseMode.lockButton = root.querySelector('.lock');
             document.documentElement.appendChild(host);
           };
 
@@ -1286,6 +1403,8 @@ public final class MainActivity extends Activity {
             mouseMode.left.classList.toggle('locked', leftLocked);
             mouseMode.left.textContent = leftLocked ? 'L🔒' : 'L';
             mouseMode.right.classList.toggle('pressed', mouseMode.rightHeld);
+            mouseMode.lockButton.classList.toggle('locked', mouseMode.leftLocked);
+            mouseMode.lockButton.textContent = mouseMode.leftLocked ? '🔒' : '🔓';
           };
 
           const layoutMouseOverlay = () => {
@@ -1312,6 +1431,8 @@ public final class MainActivity extends Activity {
             });
             place(mouseMode.left, 68, 84, 40);
             place(mouseMode.right, 56, 16, 16);
+            place(mouseMode.lockButton, 42, 97, 120);
+            mouseMode.lockButton.style.fontSize = `${16 * scale}px`;
             if (mouseMode.cursorX < 0) {
               mouseMode.cursorX = rect.left + rect.width / 2;
               mouseMode.cursorY = rect.top + rect.height / 2;
@@ -1320,6 +1441,9 @@ public final class MainActivity extends Activity {
           };
 
           const moveMouseCursor = (x, y) => {
+            const rect = visualViewportRect();
+            x = Math.min(Math.max(x, rect.left), rect.left + rect.width - 1);
+            y = Math.min(Math.max(y, rect.top), rect.top + rect.height - 1);
             mouseMode.cursorX = x;
             mouseMode.cursorY = y;
             if (mouseMode.leftHeld) mouseMode.leftMoved = true;
@@ -1364,6 +1488,11 @@ public final class MainActivity extends Activity {
               updateMouseButtons();
               return;
             }
+            if (mouseMode.leftLocked) {
+              // Locked with the lock button while L was pressed: keep holding.
+              updateMouseButtons();
+              return;
+            }
             if (!mouseMode.leftHeld) return;
             if (!cancelled && mouseMode.leftLockArmed && !mouseMode.leftMoved) {
               // Long press without movement: keep the button down for one-finger drags.
@@ -1375,6 +1504,30 @@ public final class MainActivity extends Activity {
             mouseMode.leftHeld = false;
             mouseMode.leftLockArmed = false;
             mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+            updateMouseButtons();
+          };
+
+          // The lock button holds the left button down (for drags and selections)
+          // until it, or L, is tapped again.
+          const toggleLeftLock = () => {
+            clearLeftLockTimer();
+            mouseMode.leftLockArmed = false;
+            mouseMode.leftUnlockPending = false;
+            if (mouseMode.leftLocked) {
+              mouseMode.leftLocked = false;
+              if (mouseMode.leftHeld) {
+                mouseMode.leftHeld = false;
+                mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+              }
+            } else {
+              mouseMode.leftLocked = true;
+              if (!mouseMode.leftHeld) {
+                mouseMode.leftHeld = true;
+                mouseMode.leftMoved = false;
+                mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
+              }
+            }
+            navigator.vibrate?.(15);
             updateMouseButtons();
           };
 
@@ -1413,7 +1566,9 @@ public final class MainActivity extends Activity {
                 const pageTouches = Array.from(mouseMode.touches.values())
                   .filter((info) => info.role === 'cursor' || info.role === 'anchor');
                 let role = 'cursor';
-                if (pointInElement(mouseMode.left, x, y)) {
+                if (pointInElement(mouseMode.lockButton, x, y)) {
+                  role = 'lock';
+                } else if (pointInElement(mouseMode.left, x, y)) {
                   role = 'left';
                 } else if (pointInElement(mouseMode.right, x, y)) {
                   role = 'right';
@@ -1433,14 +1588,14 @@ public final class MainActivity extends Activity {
                   startedAt: performance.now(),
                   moved: false
                 });
-                if (role === 'left') {
+                if (role === 'lock') {
+                  toggleLeftLock();
+                } else if (role === 'left') {
                   mouseLeftDown();
                 } else if (role === 'right') {
                   mouseMode.rightHeld = true;
                   mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 2);
                   updateMouseButtons();
-                } else if (role === 'cursor') {
-                  moveMouseCursor(x, y);
                 }
                 continue;
               }
@@ -1453,7 +1608,12 @@ public final class MainActivity extends Activity {
                   info.moved = true;
                 }
                 if (info.role === 'cursor') {
-                  moveMouseCursor(x, y);
+                  // Relative movement, a little faster for quick swipes.
+                  const dx = x - info.lastX;
+                  const dy = y - info.lastY;
+                  const distance = Math.hypot(dx, dy) / (mouseMode.scale || 1);
+                  const gain = Math.min(2.5, 1 + Math.max(0, distance - 4) * 0.08);
+                  moveMouseCursor(mouseMode.cursorX + dx * gain, mouseMode.cursorY + dy * gain);
                 } else if (info.role === 'scroll') {
                   mouseWheel(mouseMode.cursorX, mouseMode.cursorY, info.lastX - x, info.lastY - y);
                 }
@@ -1477,9 +1637,9 @@ public final class MainActivity extends Activity {
                   && !info.moved
                   && !mouse.buttons
                   && performance.now() - info.startedAt < 350) {
-                // A quick tap is a left click at the finger.
-                mouseAction('down', x, y, 0);
-                mouseAction('up', x, y, 0);
+                // A quick tap is a left click at the cursor.
+                mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
+                mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
               }
             }
           };
@@ -1530,7 +1690,7 @@ public final class MainActivity extends Activity {
           };
 
           const bridge = {
-            version: 11,
+            version: 12,
             forceKeyboard,
             installRdpGestures,
             installDesktopGestures,
@@ -1578,8 +1738,14 @@ public final class MainActivity extends Activity {
     private LinearLayout addressBar;
     private EditText addressField;
     private FrameLayout webContainer;
+    private RdpConnectionPanel rdpPanel;
+    private RdpPageBridge rdpPageBridge;
+    private final Set<WebView> rdpWebViews = Collections.newSetFromMap(new WeakHashMap<>());
+    private FrameLayout contentFrame;
+    private Button disconnectButton;
     private LinearLayout zoomOverlay;
     private TextView zoomPercentLabel;
+    private SeekBar zoomSlider;
     private boolean zoomSliderTracking;
     private WebView webView;
     private String activeSessionKey;
@@ -1648,13 +1814,39 @@ public final class MainActivity extends Activity {
         configureSystemUi();
         applyKeepAliveMode();
 
+        rdpPanel = new RdpConnectionPanel(
+            this,
+            (address, username, password) -> openRdpSession(address, username, password, true)
+        );
+        rdpPageBridge = new RdpPageBridge(this, this::onRdpSessionEvent);
         String savedAddress = preferences.getString(ADDRESS_KEY, "");
         addressField.setText(savedAddress);
         if (savedAddress == null || savedAddress.trim().isEmpty()) {
             showBlankWebView();
             addressField.requestFocus();
+        } else if (RdpConnectionPanel.isRdpAddress(savedAddress)) {
+            showBlankWebView();
+            switchToProjectUrl(savedAddress);
         } else {
             switchToProjectUrl(savedAddress);
+        }
+        openRdpPanelFromIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        openRdpPanelFromIntent(intent);
+    }
+
+    /** The tunnel notification reopens the connection panel for its host. */
+    private void openRdpPanelFromIntent(Intent intent) {
+        String host = intent == null
+            ? null
+            : intent.getStringExtra(RdpTunnelService.EXTRA_OPEN_RDP_HOST);
+        if (host != null && !host.isEmpty()) {
+            intent.removeExtra(RdpTunnelService.EXTRA_OPEN_RDP_HOST);
+            rdpPanel.show("rdp://" + host);
         }
     }
 
@@ -1682,7 +1874,7 @@ public final class MainActivity extends Activity {
         addressField = new EditText(this);
         addressField.setSingleLine(true);
         addressField.setTextSize(14);
-        addressField.setHint("http://192.168.1.10:8080");
+        addressField.setHint("https://… or rdp://host");
         addressField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         addressField.setImeOptions(EditorInfo.IME_ACTION_GO);
         addressField.setOnFocusChangeListener((view, hasFocus) -> {
@@ -1712,6 +1904,12 @@ public final class MainActivity extends Activity {
         reloadButton.setOnClickListener(view -> webView.reload());
         addressBar.addView(reloadButton);
 
+        disconnectButton = createToolbarButton("⏏");
+        disconnectButton.setContentDescription("Disconnect the remote desktop");
+        disconnectButton.setOnClickListener(view -> disconnectActiveRdpSession());
+        disconnectButton.setVisibility(View.GONE);
+        addressBar.addView(disconnectButton);
+
         Button settingsButton = createToolbarButton("⚙");
         settingsButton.setContentDescription("Settings");
         settingsButton.setOnClickListener(view -> showSettings());
@@ -1724,10 +1922,12 @@ public final class MainActivity extends Activity {
                 dp(56)
             )
         );
+        // Raised so it can float above a remote desktop (see updateAddressBarOverlay).
+        addressBar.setElevation(dp(2));
 
         // The zoom slider floats above the web views in a separate frame, so
         // bringing a session's WebView to the front never covers it.
-        FrameLayout contentFrame = new FrameLayout(this);
+        contentFrame = new FrameLayout(this);
         root.addView(
             contentFrame,
             new LinearLayout.LayoutParams(
@@ -1769,7 +1969,7 @@ public final class MainActivity extends Activity {
         LinearLayout keyRow = new LinearLayout(this);
         keyRow.setOrientation(LinearLayout.HORIZONTAL);
         keyRow.setGravity(Gravity.CENTER_VERTICAL);
-        keyRow.setPadding(dp(6), dp(6), dp(6), dp(6));
+        keyRow.setPadding(dp(6), dp(3), dp(6), dp(3));
 
         Button keyboardButton = createKeyButton("KB");
         keyboardButton.setContentDescription("Force show keyboard");
@@ -1823,7 +2023,7 @@ public final class MainActivity extends Activity {
             keyboardScroll,
             new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(58)
+                dp(KEY_HEIGHT_DP + 6)
             )
         );
 
@@ -2081,6 +2281,7 @@ public final class MainActivity extends Activity {
         if (params != null && params.height != dp(56) + topInset) {
             params.height = dp(56) + topInset;
             addressBar.setLayoutParams(params);
+            updateAddressBarOverlay();
         }
     }
 
@@ -2157,6 +2358,13 @@ public final class MainActivity extends Activity {
         });
         target.setWebViewClient(new WebViewClient() {
             @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                // Remote desktop WebViews hold credentials in their JavaScript
+                // bridge, so they never leave the loopback gateway page.
+                return rdpWebViews.contains(view) && !isGatewayUrl(request.getUrl().toString());
+            }
+
+            @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
                 String lastFinishedUrl = lastFinishedUrls.get(view);
@@ -2213,6 +2421,16 @@ public final class MainActivity extends Activity {
         webView.setVisibility(View.VISIBLE);
         webView.onResume();
         activeSessionKey = null;
+        showZoomOf(null);
+    }
+
+    /** Makes the zoom slider show (and set) the zoom of the page in front. */
+    private void showZoomOf(String sessionKey) {
+        layoutZoomSteps = zoomStepsFor(sessionKey);
+        if (zoomSlider != null) {
+            zoomSlider.setProgress(layoutZoomSteps - MIN_LAYOUT_ZOOM_STEPS);
+        }
+        updateZoomPercentLabel(layoutZoomSteps);
     }
 
     private LinearLayout createZoomOverlay() {
@@ -2235,6 +2453,7 @@ public final class MainActivity extends Activity {
         overlay.addView(smaller);
 
         SeekBar slider = new SeekBar(this);
+        zoomSlider = slider;
         slider.setMax(MAX_LAYOUT_ZOOM_STEPS - MIN_LAYOUT_ZOOM_STEPS);
         slider.setProgress(layoutZoomSteps - MIN_LAYOUT_ZOOM_STEPS);
         slider.setContentDescription("UI zoom");
@@ -2296,19 +2515,46 @@ public final class MainActivity extends Activity {
     }
 
     private void setLayoutZoomSteps(int steps) {
-        int nextSteps = Math.max(MIN_LAYOUT_ZOOM_STEPS, Math.min(MAX_LAYOUT_ZOOM_STEPS, steps));
+        int nextSteps = clampZoomSteps(steps);
         if (webView == null || nextSteps == layoutZoomSteps) {
             return;
         }
         layoutZoomSteps = nextSteps;
-        preferences.edit().putInt(LAYOUT_ZOOM_STEPS_KEY, layoutZoomSteps).apply();
+        preferences.edit().putInt(zoomStepsKey(activeSessionKey), layoutZoomSteps).apply();
         applyLayoutZoom(webView, true);
     }
 
-    private int calculateLayoutViewportWidth() {
-        return (int) Math.round(
-            DESKTOP_VIEWPORT_WIDTH / Math.pow(LAYOUT_ZOOM_FACTOR, layoutZoomSteps)
-        );
+    private static int clampZoomSteps(int steps) {
+        return Math.max(MIN_LAYOUT_ZOOM_STEPS, Math.min(MAX_LAYOUT_ZOOM_STEPS, steps));
+    }
+
+    /** Each project keeps its own zoom; pages outside a project use the global one. */
+    private static String zoomStepsKey(String sessionKey) {
+        return sessionKey == null ? LAYOUT_ZOOM_STEPS_KEY : LAYOUT_ZOOM_STEPS_KEY + ":" + sessionKey;
+    }
+
+    /** A project's zoom; projects without one start from the global zoom. */
+    private int zoomStepsFor(String sessionKey) {
+        int global = preferences.getInt(LAYOUT_ZOOM_STEPS_KEY, 0);
+        return clampZoomSteps(sessionKey == null
+            ? global
+            : preferences.getInt(zoomStepsKey(sessionKey), global));
+    }
+
+    private int zoomStepsFor(WebView target) {
+        if (target == webView) {
+            return layoutZoomSteps;
+        }
+        for (Map.Entry<String, ProjectSession> entry : projectSessions.entrySet()) {
+            if (entry.getValue().webView == target) {
+                return zoomStepsFor(entry.getKey());
+            }
+        }
+        return zoomStepsFor((String) null);
+    }
+
+    private static int calculateLayoutViewportWidth(int steps) {
+        return (int) Math.round(DESKTOP_VIEWPORT_WIDTH / Math.pow(LAYOUT_ZOOM_FACTOR, steps));
     }
 
     /**
@@ -2320,8 +2566,8 @@ public final class MainActivity extends Activity {
         if (target == null) {
             return;
         }
-        int requestedSteps = layoutZoomSteps;
-        int viewportWidth = calculateLayoutViewportWidth();
+        int requestedSteps = zoomStepsFor(target);
+        int viewportWidth = calculateLayoutViewportWidth(requestedSteps);
         int viewWidthPx = target.getWidth() > 0
             ? target.getWidth()
             : (webContainer == null ? 0 : webContainer.getWidth());
@@ -2346,7 +2592,7 @@ public final class MainActivity extends Activity {
             + "return width;"
             + "})()";
         target.evaluateJavascript(script, value -> {
-            if (requestedSteps != layoutZoomSteps) {
+            if (requestedSteps != zoomStepsFor(target)) {
                 return;
             }
             appliedLayoutZoomSteps.put(target, requestedSteps);
@@ -2387,6 +2633,24 @@ public final class MainActivity extends Activity {
         if (normalized.isEmpty()) {
             return;
         }
+        if (RdpConnectionPanel.isRdpAddress(normalized)) {
+            addressField.clearFocus();
+            String host = RdpConnectionPanel.hostOf(normalized);
+            String username = AccessTokenStore.username(this, host);
+            String password = AccessTokenStore.loadPassword(this, host);
+            boolean ready = findProjectSession(normalized) != null
+                || (AccessTokenStore.loadToken(this, host) != null
+                    && !username.isEmpty()
+                    && password != null
+                    && !password.isEmpty());
+            if (ready) {
+                openRdpSession(normalized, username, password, false);
+            } else {
+                // Sign-in or credentials are missing: the panel collects them.
+                rdpPanel.show(normalized);
+            }
+            return;
+        }
 
         long now = SystemClock.elapsedRealtime();
         cleanupExpiredProjectSessions(now);
@@ -2418,12 +2682,107 @@ public final class MainActivity extends Activity {
         showAddressBarTemporarily();
     }
 
+    /**
+     * Opens (or returns to) a built-in remote desktop session. The IronRDP web
+     * client runs in a WebView restricted to the loopback {@link RdpGateway},
+     * so it shares the mouse mode, key bar, zoom and address bar with web
+     * projects. {@code reconnect} reloads an existing session with the given
+     * credentials.
+     */
+    private void openRdpSession(
+        String address,
+        String username,
+        String password,
+        boolean reconnect
+    ) {
+        String normalized = RdpConnectionPanel.normalize(address);
+        String host = RdpConnectionPanel.hostOf(normalized);
+        RdpGateway gateway;
+        try {
+            gateway = RdpGateway.get(this);
+        } catch (IOException exception) {
+            Toast.makeText(this, "Could not start the remote desktop gateway", Toast.LENGTH_LONG)
+                .show();
+            return;
+        }
+
+        long now = SystemClock.elapsedRealtime();
+        cleanupExpiredProjectSessions(now);
+        ProjectSession session = findProjectSession(normalized);
+        boolean created = session == null;
+        if (created) {
+            WebView view = createProjectWebView();
+            view.addJavascriptInterface(rdpPageBridge, "YourWorkspaceRdp");
+            rdpWebViews.add(view);
+            session = new ProjectSession(view);
+            projectSessions.put(normalized, session);
+        }
+        activateProjectSession(normalized, session, now);
+        if (created || reconnect) {
+            String user = username == null ? "" : username.trim();
+            String domain = "";
+            int separator = user.indexOf('\\');
+            if (separator > 0) {
+                domain = user.substring(0, separator);
+                user = user.substring(separator + 1);
+            }
+            String gatewayToken = gateway.newSession(host);
+            rdpPageBridge.register(
+                gatewayToken,
+                new RdpPageBridge.Session(normalized, host, user, domain, password),
+                gateway
+            );
+            session.webView.loadUrl(gateway.pageUrl(gatewayToken));
+        }
+        evictExcessProjectSessions();
+
+        addressField.setText(normalized);
+        preferences.edit().putString(ADDRESS_KEY, normalized).apply();
+        addressField.clearFocus();
+        session.webView.requestFocus();
+        showAddressBarTemporarily();
+    }
+
+    private void onRdpSessionEvent(RdpPageBridge.Session session, String event, String detail) {
+        switch (event) {
+        case "credentials_rejected":
+            AccessTokenStore.clearPassword(this, session.host);
+            rdpPanel.show(session.address, "Windows rejected the user name or password.");
+            break;
+        case "sign_in_failed":
+            rdpPanel.show(
+                session.address,
+                "The remote PC ended the connection during Windows sign-in. Check the user name "
+                    + "and the account password (not the PIN); for a Microsoft account use its "
+                    + "email address." + (detail.isEmpty() ? "" : "\n\n" + detail)
+            );
+            break;
+        case "login_required":
+            rdpPanel.show(session.address, "Cloudflare sign-in expired. Sign in again to reconnect.");
+            break;
+        case "failed":
+            Toast.makeText(
+                this,
+                "Remote desktop disconnected" + (detail.isEmpty() ? "" : ": " + detail),
+                Toast.LENGTH_LONG
+            ).show();
+            break;
+        default:
+            break;
+        }
+    }
+
+    private boolean isGatewayUrl(String url) {
+        return url != null && url.startsWith("http://127.0.0.1:");
+    }
+
     private ProjectSession findProjectSession(String address) {
         return projectSessions.get(normalizeAddress(address));
     }
 
     private void updateAddressFromWebView(WebView source, String url) {
-        if (source != webView || url == null) {
+        if (source != webView || url == null || rdpWebViews.contains(source)) {
+            // Remote desktop sessions keep showing their rdp:// address.
             return;
         }
         String normalized = normalizeAddress(url);
@@ -2464,6 +2823,7 @@ public final class MainActivity extends Activity {
         webView = targetSession.webView;
         activeSessionKey = sessionKey;
         targetSession.lastInactiveAt = 0L;
+        showZoomOf(sessionKey);
         webView.setVisibility(View.VISIBLE);
         webView.bringToFront();
         webView.onResume();
@@ -2472,6 +2832,7 @@ public final class MainActivity extends Activity {
         applyLayoutZoom(webView, zoomChanged);
         syncModifiers(webView);
         syncMouseMode(webView);
+        updateAddressBarOverlay();
     }
 
     private void cleanupExpiredProjectSessions(long now) {
@@ -2529,6 +2890,25 @@ public final class MainActivity extends Activity {
                 && now - session.lastInactiveAt < PROJECT_SESSION_TTL_MS);
     }
 
+    /**
+     * Ends the remote desktop session in front: its page is destroyed, which
+     * closes the gateway connection and the Cloudflare tunnel. The connection
+     * panel then offers to reconnect.
+     */
+    private void disconnectActiveRdpSession() {
+        WebView target = webView;
+        String address = activeSessionKey;
+        if (target == null || address == null || !rdpWebViews.contains(target)) {
+            return;
+        }
+        projectSessions.remove(address);
+        rdpWebViews.remove(target);
+        showBlankWebView();
+        destroyWebView(target);
+        updateAddressBarOverlay();
+        rdpPanel.show(address, "Disconnected from the remote desktop.");
+    }
+
     private void destroyWebView(WebView target) {
         appliedLayoutZoomSteps.remove(target);
         lastFinishedUrls.remove(target);
@@ -2557,6 +2937,7 @@ public final class MainActivity extends Activity {
         if (zoomOverlay != null) {
             zoomOverlay.setVisibility(View.VISIBLE);
         }
+        updateAddressBarOverlay();
         scheduleAddressBarAutoHide();
     }
 
@@ -2572,6 +2953,44 @@ public final class MainActivity extends Activity {
         }
         if (zoomOverlay != null) {
             zoomOverlay.setVisibility(View.GONE);
+        }
+        updateAddressBarOverlay();
+    }
+
+    /**
+     * Over a remote desktop the address bar floats above the page instead of
+     * pushing it down, so showing and auto-hiding it does not resize the
+     * remote desktop twice. Web pages keep the regular layout.
+     */
+    private void updateAddressBarOverlay() {
+        if (disconnectButton != null) {
+            boolean rdpActive = webView != null && rdpWebViews.contains(webView);
+            disconnectButton.setVisibility(rdpActive ? View.VISIBLE : View.GONE);
+        }
+        if (contentFrame == null || addressBar == null) {
+            return;
+        }
+        boolean overlay = addressBar.getVisibility() == View.VISIBLE
+            && webView != null
+            && rdpWebViews.contains(webView);
+        ViewGroup.LayoutParams barParams = addressBar.getLayoutParams();
+        int barHeight = barParams != null && barParams.height > 0 ? barParams.height : dp(56);
+        LinearLayout.LayoutParams frameParams =
+            (LinearLayout.LayoutParams) contentFrame.getLayoutParams();
+        int frameMargin = overlay ? -barHeight : 0;
+        if (frameParams != null && frameParams.topMargin != frameMargin) {
+            frameParams.topMargin = frameMargin;
+            contentFrame.setLayoutParams(frameParams);
+        }
+        if (zoomOverlay != null
+            && zoomOverlay.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+            FrameLayout.LayoutParams zoomParams =
+                (FrameLayout.LayoutParams) zoomOverlay.getLayoutParams();
+            int zoomMargin = dp(8) + (overlay ? barHeight : 0);
+            if (zoomParams.topMargin != zoomMargin) {
+                zoomParams.topMargin = zoomMargin;
+                zoomOverlay.setLayoutParams(zoomParams);
+            }
         }
     }
 
@@ -2638,7 +3057,7 @@ public final class MainActivity extends Activity {
     private void saveCurrentAsProject() {
         String url = normalizeAddress(addressField.getText().toString());
         if (url.isEmpty()) {
-            Toast.makeText(this, "Enter a code-server address first", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Enter an address first", Toast.LENGTH_SHORT).show();
             return;
         }
 
@@ -2722,7 +3141,8 @@ public final class MainActivity extends Activity {
         boolean includeUrl,
         boolean hot
     ) {
-        String suffix = hot ? "  • HOT" : "";
+        String suffix = (RdpConnectionPanel.isRdpAddress(project.url) ? "  • RDP" : "")
+            + (hot ? "  • HOT" : "");
         String text = project.name + suffix + (includeUrl ? "\n" + project.url : "");
         SpannableString styled = new SpannableString(text);
         styled.setSpan(
@@ -2741,6 +3161,9 @@ public final class MainActivity extends Activity {
         }
         if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
             return trimmed;
+        }
+        if (RdpConnectionPanel.isRdpAddress(trimmed)) {
+            return RdpConnectionPanel.normalize(trimmed);
         }
         return "http://" + trimmed;
     }
@@ -2771,13 +3194,14 @@ public final class MainActivity extends Activity {
 
     private void installKeyboardBridge(WebView target, boolean applyZoom) {
         // Seed the zoomed viewport width so the first layout already uses it.
+        int steps = zoomStepsFor(target);
         String script = "window.__codeServerAppViewportWidth="
-            + calculateLayoutViewportWidth() + ";" + KEYBOARD_BRIDGE;
+            + calculateLayoutViewportWidth(steps) + ";" + KEYBOARD_BRIDGE;
         target.evaluateJavascript(script, value -> {
             if (applyZoom) {
                 Integer appliedSteps = appliedLayoutZoomSteps.get(target);
-                boolean zoomChanged = (appliedSteps == null && layoutZoomSteps != 0)
-                    || (appliedSteps != null && appliedSteps != layoutZoomSteps);
+                boolean zoomChanged = (appliedSteps == null && steps != 0)
+                    || (appliedSteps != null && appliedSteps != steps);
                 applyLayoutZoom(target, zoomChanged);
             }
             syncModifiers(target);
@@ -3019,8 +3443,20 @@ public final class MainActivity extends Activity {
         button.setFocusableInTouchMode(false);
         button.setMinWidth(0);
         button.setMinimumWidth(0);
+        button.setMinHeight(0);
+        button.setMinimumHeight(0);
         button.setPadding(dp(6), 0, dp(6), 0);
         button.setTextColor(Color.BLACK);
+        // A flat rounded key without the default button's insets keeps the bar low.
+        GradientDrawable background = new GradientDrawable();
+        background.setCornerRadius(dp(6));
+        background.setColor(Color.WHITE);
+        button.setBackground(new RippleDrawable(
+            ColorStateList.valueOf(Color.argb(40, 0, 0, 0)),
+            background,
+            null
+        ));
+        button.setStateListAnimator(null);
         button.setBackgroundTintList(ColorStateList.valueOf(KEY_BACKGROUND));
         return button;
     }
@@ -3041,7 +3477,7 @@ public final class MainActivity extends Activity {
     }
 
     private LinearLayout.LayoutParams keyLayoutParams(int width) {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, dp(46));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, dp(KEY_HEIGHT_DP));
         params.setMarginEnd(dp(4));
         return params;
     }
@@ -3061,6 +3497,9 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        // Persist cookies (e.g. the Cloudflare Access session) right away, so the
+        // login survives if the system kills the app while it is in the background.
+        CookieManager.getInstance().flush();
         if (!keepAliveEnabled) {
             boolean activeViewIsCached = activeSessionKey != null;
             for (ProjectSession session : projectSessions.values()) {
@@ -3076,6 +3515,9 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (rdpPanel != null) {
+            rdpPanel.onResume();
+        }
         if (keepAliveEnabled) {
             applyKeepAliveMode();
         }
@@ -3091,6 +3533,9 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (rdpPanel != null) {
+            rdpPanel.dismiss();
+        }
         keepAliveHandler.removeCallbacks(sessionKeepAlivePulse);
         addressBarHandler.removeCallbacks(autoHideAddressBar);
         boolean activeViewIsCached = activeSessionKey != null;

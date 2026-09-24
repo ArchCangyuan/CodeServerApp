@@ -43,6 +43,25 @@ private let keyboardBridgeSource = #"""
       `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`;
     const token = (window.__codeServerAppViewportToken || 0) + 1;
     window.__codeServerAppViewportToken = token;
+    // On a web RDP page (IronRDP) a reload always reconnects the remote session,
+    // which asks for the credentials again, so there is never a fallback reload.
+    // Width changes still resize the remote desktop live, but are spaced at least
+    // 1.5 s apart (only the latest one is applied) so the session is not asked to
+    // resize repeatedly in quick succession.
+    if (Number(fitWidth) > 0 && window.__codeServerAppIsRdpPage?.()) {
+      allowReload = false;
+      const now = Date.now();
+      const nextAllowed = (window.__codeServerAppRdpResizeAt || 0) + 1500;
+      window.clearTimeout(window.__codeServerAppRdpResizeTimer);
+      if (now < nextAllowed) {
+        window.__codeServerAppRdpResizeTimer = window.setTimeout(
+          () => setViewportWidth(requestedWidth, fitWidth, false),
+          nextAllowed - now
+        );
+        return Number(window.__codeServerAppViewportWidth) || width;
+      }
+      window.__codeServerAppRdpResizeAt = now;
+    }
     if (Number(fitWidth) > 0) {
       const scale = Math.max(0.1, Math.min(5, Number(fitWidth) / width)).toFixed(4);
       viewport.setAttribute(
@@ -57,8 +76,11 @@ private let keyboardBridgeSource = #"""
         if (!allowReload) return;
         window.setTimeout(() => {
           if (window.__codeServerAppViewportToken !== token) return;
-          const visible = window.visualViewport ? window.visualViewport.width : width;
-          if (Math.abs(visible - window.innerWidth) <= window.innerWidth * 0.03) return;
+          // innerWidth follows the visual viewport in Chromium, so compare the
+          // visible width against the layout width instead.
+          const layout = document.documentElement.clientWidth || width;
+          const visible = window.visualViewport ? window.visualViewport.width : layout;
+          if (Math.abs(visible - layout) <= layout * 0.03) return;
           const reloadKey = '__codeServerAppViewportReloadAt';
           try {
             const lastReload = Number(window.sessionStorage.getItem(reloadKey)) || 0;
@@ -120,8 +142,10 @@ private let keyboardBridgeSource = #"""
     return null;
   };
 
+  window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
+
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 11) {
+  if (existingBridge && existingBridge.version >= 12) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
     existingBridge.installDesktopGestures?.();
@@ -160,12 +184,42 @@ private let keyboardBridgeSource = #"""
     }));
   };
 
+  // IronRDP synchronizes the remote Caps Lock / Num Lock state from every
+  // mouseenter on its canvas. Touch-derived events can carry a stale lock state
+  // and turn Caps Lock on in the remote session, so real mouseenter events are
+  // replaced by one with Caps Lock off and Num Lock on. mouseenter reaches only
+  // the entered element, so this listens (capturing, ahead of IronRDP) on the
+  // canvas and its ancestors inside the shadow root. Pressing an actual lock key
+  // still synchronizes through the keyboard path.
+  const replaceRdpLockState = (event) => {
+    if (!event.isTrusted) return;
+    const target = event.currentTarget;
+    event.stopImmediatePropagation();
+    const eventWindow = target.ownerDocument?.defaultView || window;
+    target.dispatchEvent(new eventWindow.MouseEvent('mouseenter', {
+      bubbles: false,
+      cancelable: false,
+      composed: true,
+      view: eventWindow,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      screenX: event.screenX,
+      screenY: event.screenY,
+      buttons: event.buttons,
+      modifierCapsLock: false,
+      modifierNumLock: true
+    }));
+  };
+
   const installRdpGestures = () => {
     const canvas = findIronRdpCanvas();
     if (!canvas) return false;
     state.ironRdpCanvas = canvas;
     if (state.gestureCanvas === canvas) return true;
     state.gestureCanvas = canvas;
+    for (let element = canvas; element && element.nodeType === 1; element = element.parentNode) {
+      element.addEventListener('mouseenter', replaceRdpLockState, true);
+    }
 
     // Preserve WebView panning and IronRDP's native coordinate mapping.
     canvas.style.touchAction = '';
@@ -395,6 +449,48 @@ private let keyboardBridgeSource = #"""
   installRdpGestures();
   installDesktopGestures();
   window.setInterval(installRdpGestures, 1000);
+
+  // Cloudflare's browser RDP keeps a short-lived token from page load. When the
+  // session reconnects after it expired, the page shows `"exp" claim timestamp
+  // check failed` although the Access login is still valid. A reload fetches a
+  // fresh token (only the Windows password is asked again), so reload
+  // automatically, at most once every 30 s. The check runs only on RDP pages
+  // and small error pages, never on large pages such as the workbench.
+  const expiredAccessTokenPattern = /claim timestamp check failed/i;
+  let webRdpPageSeen = false;
+  const collectPageText = () => {
+    const roots = [document];
+    let text = '';
+    for (let index = 0; index < roots.length && index < 64; index += 1) {
+      const root = roots[index];
+      text += ` ${(root.body || root).textContent || ''}`;
+      if (text.length > 200000 || !root.querySelectorAll) break;
+      for (const element of root.querySelectorAll('*')) {
+        if (element.shadowRoot) roots.push(element.shadowRoot);
+        if (element.tagName === 'IFRAME') {
+          try {
+            if (element.contentDocument) roots.push(element.contentDocument);
+          } catch (_) {}
+        }
+      }
+    }
+    return text;
+  };
+  const reloadOnExpiredAccessToken = () => {
+    if (state.ironRdpCanvas) webRdpPageSeen = true;
+    if (!webRdpPageSeen && document.getElementsByTagName('*').length > 400) return;
+    if (!expiredAccessTokenPattern.test(collectPageText())) return;
+    const reloadKey = '__codeServerAppAccessTokenReloadAt';
+    try {
+      const lastReload = Number(window.sessionStorage.getItem(reloadKey)) || 0;
+      if (Date.now() - lastReload < 30000) return;
+      window.sessionStorage.setItem(reloadKey, String(Date.now()));
+    } catch (_) {
+      return;
+    }
+    window.location.reload();
+  };
+  window.setInterval(reloadOnExpiredAccessToken, 2000);
   const deepestActiveElement = (rootDocument) => {
     let active = rootDocument.activeElement;
     for (let depth = 0; active && depth < 6; depth += 1) {
@@ -653,7 +749,8 @@ private let keyboardBridgeSource = #"""
     lastDownY: 0
   };
 
-  // Mouse mode: the finger positions the cursor and in-page L/R buttons click.
+  // Mouse mode: the page works like a touchpad (finger movement moves the
+  // cursor, a tap clicks at the cursor) and in-page L/R buttons click.
   // Everything runs inside real touch handlers, so clicks carry user
   // activation (clipboard writes, window.open) like a physical mouse.
   const mouseMode = {
@@ -664,6 +761,7 @@ private let keyboardBridgeSource = #"""
     cursor: null,
     left: null,
     right: null,
+    lockButton: null,
     touches: new Map(),
     cursorX: -1,
     cursorY: -1,
@@ -768,7 +866,10 @@ private let keyboardBridgeSource = #"""
     ctrlKey: state.control,
     shiftKey: state.shift,
     altKey: false,
-    metaKey: false
+    metaKey: false,
+    // IronRDP copies lock-key state from mouseenter into the remote session.
+    modifierCapsLock: false,
+    modifierNumLock: true
   });
 
   const fireMouse = (hit, element, type, button, buttons, detail = 0, bubbles = true) => {
@@ -1044,17 +1145,20 @@ private let keyboardBridgeSource = #"""
       }
       .button.pressed { background: rgba(103, 80, 164, 0.67); }
       .button.locked { background: rgba(103, 80, 164, 0.86); border-color: #fff; }
+      .button.lock { font-weight: 400; }
     </style>
     <svg class="cursor" viewBox="0 0 14 22">
       <path d="M0.7 0.7 L0.7 18.5 L5.2 14.3 L8.3 21 L11.3 19.7 L8.2 13.1 L13.7 13.1 Z"
         fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/>
     </svg>
     <div class="button left">L</div>
-    <div class="button right">R</div>`;
+    <div class="button right">R</div>
+    <div class="button lock" title="Hold the left button">🔓</div>`;
     mouseMode.host = host;
     mouseMode.cursor = root.querySelector('.cursor');
     mouseMode.left = root.querySelector('.left');
     mouseMode.right = root.querySelector('.right');
+    mouseMode.lockButton = root.querySelector('.lock');
     document.documentElement.appendChild(host);
   };
 
@@ -1076,6 +1180,8 @@ private let keyboardBridgeSource = #"""
     mouseMode.left.classList.toggle('locked', leftLocked);
     mouseMode.left.textContent = leftLocked ? 'L🔒' : 'L';
     mouseMode.right.classList.toggle('pressed', mouseMode.rightHeld);
+    mouseMode.lockButton.classList.toggle('locked', mouseMode.leftLocked);
+    mouseMode.lockButton.textContent = mouseMode.leftLocked ? '🔒' : '🔓';
   };
 
   const layoutMouseOverlay = () => {
@@ -1102,6 +1208,8 @@ private let keyboardBridgeSource = #"""
     });
     place(mouseMode.left, 68, 84, 40);
     place(mouseMode.right, 56, 16, 16);
+    place(mouseMode.lockButton, 42, 97, 120);
+    mouseMode.lockButton.style.fontSize = `${16 * scale}px`;
     if (mouseMode.cursorX < 0) {
       mouseMode.cursorX = rect.left + rect.width / 2;
       mouseMode.cursorY = rect.top + rect.height / 2;
@@ -1110,6 +1218,9 @@ private let keyboardBridgeSource = #"""
   };
 
   const moveMouseCursor = (x, y) => {
+    const rect = visualViewportRect();
+    x = Math.min(Math.max(x, rect.left), rect.left + rect.width - 1);
+    y = Math.min(Math.max(y, rect.top), rect.top + rect.height - 1);
     mouseMode.cursorX = x;
     mouseMode.cursorY = y;
     if (mouseMode.leftHeld) mouseMode.leftMoved = true;
@@ -1154,6 +1265,11 @@ private let keyboardBridgeSource = #"""
       updateMouseButtons();
       return;
     }
+    if (mouseMode.leftLocked) {
+      // Locked with the lock button while L was pressed: keep holding.
+      updateMouseButtons();
+      return;
+    }
     if (!mouseMode.leftHeld) return;
     if (!cancelled && mouseMode.leftLockArmed && !mouseMode.leftMoved) {
       // Long press without movement: keep the button down for one-finger drags.
@@ -1165,6 +1281,30 @@ private let keyboardBridgeSource = #"""
     mouseMode.leftHeld = false;
     mouseMode.leftLockArmed = false;
     mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+    updateMouseButtons();
+  };
+
+  // The lock button holds the left button down (for drags and selections)
+  // until it, or L, is tapped again.
+  const toggleLeftLock = () => {
+    clearLeftLockTimer();
+    mouseMode.leftLockArmed = false;
+    mouseMode.leftUnlockPending = false;
+    if (mouseMode.leftLocked) {
+      mouseMode.leftLocked = false;
+      if (mouseMode.leftHeld) {
+        mouseMode.leftHeld = false;
+        mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+      }
+    } else {
+      mouseMode.leftLocked = true;
+      if (!mouseMode.leftHeld) {
+        mouseMode.leftHeld = true;
+        mouseMode.leftMoved = false;
+        mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
+      }
+    }
+    navigator.vibrate?.(15);
     updateMouseButtons();
   };
 
@@ -1203,7 +1343,9 @@ private let keyboardBridgeSource = #"""
         const pageTouches = Array.from(mouseMode.touches.values())
           .filter((info) => info.role === 'cursor' || info.role === 'anchor');
         let role = 'cursor';
-        if (pointInElement(mouseMode.left, x, y)) {
+        if (pointInElement(mouseMode.lockButton, x, y)) {
+          role = 'lock';
+        } else if (pointInElement(mouseMode.left, x, y)) {
           role = 'left';
         } else if (pointInElement(mouseMode.right, x, y)) {
           role = 'right';
@@ -1223,14 +1365,14 @@ private let keyboardBridgeSource = #"""
           startedAt: performance.now(),
           moved: false
         });
-        if (role === 'left') {
+        if (role === 'lock') {
+          toggleLeftLock();
+        } else if (role === 'left') {
           mouseLeftDown();
         } else if (role === 'right') {
           mouseMode.rightHeld = true;
           mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 2);
           updateMouseButtons();
-        } else if (role === 'cursor') {
-          moveMouseCursor(x, y);
         }
         continue;
       }
@@ -1243,7 +1385,12 @@ private let keyboardBridgeSource = #"""
           info.moved = true;
         }
         if (info.role === 'cursor') {
-          moveMouseCursor(x, y);
+          // Relative movement, a little faster for quick swipes.
+          const dx = x - info.lastX;
+          const dy = y - info.lastY;
+          const distance = Math.hypot(dx, dy) / (mouseMode.scale || 1);
+          const gain = Math.min(2.5, 1 + Math.max(0, distance - 4) * 0.08);
+          moveMouseCursor(mouseMode.cursorX + dx * gain, mouseMode.cursorY + dy * gain);
         } else if (info.role === 'scroll') {
           mouseWheel(mouseMode.cursorX, mouseMode.cursorY, info.lastX - x, info.lastY - y);
         }
@@ -1267,9 +1414,9 @@ private let keyboardBridgeSource = #"""
           && !info.moved
           && !mouse.buttons
           && performance.now() - info.startedAt < 350) {
-        // A quick tap is a left click at the finger.
-        mouseAction('down', x, y, 0);
-        mouseAction('up', x, y, 0);
+        // A quick tap is a left click at the cursor.
+        mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
+        mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
       }
     }
   };
@@ -1320,7 +1467,7 @@ private let keyboardBridgeSource = #"""
   };
 
   const bridge = {
-    version: 11,
+    version: 12,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();
@@ -1457,7 +1604,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
             target = existing
             created = false
         } else {
-            let webView = makeWebView()
+            let webView = makeWebView(zoomSteps: savedZoomSteps(forKey: normalized))
             target = ProjectSession(key: normalized, webView: webView)
             sessions[normalized] = target
             observeURLChanges(for: target)
@@ -1481,6 +1628,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
             && !Self.addressesEquivalent(currentAddress, normalized)
 
         activeSessionKey = target.key
+        showZoom(of: target.key)
         target.lastInactiveAt = nil
         target.webView.isHidden = false
         target.webView.isUserInteractionEnabled = true
@@ -1519,10 +1667,13 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         guard nextSteps != layoutZoomSteps else { return }
 
         layoutZoomSteps = nextSteps
-        UserDefaults.standard.set(layoutZoomSteps, forKey: layoutZoomStepsKey)
+        UserDefaults.standard.set(layoutZoomSteps, forKey: Self.zoomStepsKey(forKey: activeSessionKey))
         zoomPercent = Self.zoomPercent(forSteps: layoutZoomSteps)
-        for session in sessions.values {
-            installUserScripts(in: session.webView.configuration.userContentController)
+        if let activeSession {
+            installUserScripts(
+                in: activeSession.webView.configuration.userContentController,
+                zoomSteps: layoutZoomSteps
+            )
         }
         if let activeSession {
             applyLayoutZoom(
@@ -1661,14 +1812,14 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         }
     }
 
-    private func makeWebView() -> WKWebView {
+    private func makeWebView(zoomSteps: Int) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         configuration.defaultWebpagePreferences.preferredContentMode = .desktop
-        installUserScripts(in: configuration.userContentController)
+        installUserScripts(in: configuration.userContentController, zoomSteps: zoomSteps)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         disableDoubleTapZoom(in: webView)
@@ -1688,12 +1839,12 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         return webView
     }
 
-    private func installUserScripts(in controller: WKUserContentController) {
+    private func installUserScripts(in controller: WKUserContentController, zoomSteps: Int) {
         controller.removeAllUserScripts()
         // Seed the zoomed viewport width so the first layout already uses it.
         controller.addUserScript(
             WKUserScript(
-                source: "window.__codeServerAppViewportWidth = \(viewportWidth());",
+                source: "window.__codeServerAppViewportWidth = \(viewportWidth(steps: zoomSteps));",
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: true
             )
@@ -1741,16 +1892,43 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         )
     }
 
-    private func viewportWidth() -> Int {
-        Int(round(Double(desktopViewportWidth) / pow(layoutZoomFactor, Double(layoutZoomSteps))))
+    /// Each project keeps its own zoom; the global value is the default for new ones.
+    private static func zoomStepsKey(forKey key: String?) -> String {
+        guard let key else { return layoutZoomStepsKey }
+        return "\(layoutZoomStepsKey):\(key)"
+    }
+
+    private func savedZoomSteps(forKey key: String?) -> Int {
+        let defaults = UserDefaults.standard
+        let global = defaults.integer(forKey: layoutZoomStepsKey)
+        let keyName = Self.zoomStepsKey(forKey: key)
+        let saved = defaults.object(forKey: keyName) == nil ? global : defaults.integer(forKey: keyName)
+        return min(max(saved, minimumLayoutZoomSteps), maximumLayoutZoomSteps)
+    }
+
+    private func zoomStepsOf(_ session: ProjectSession) -> Int {
+        session.key == activeSessionKey ? layoutZoomSteps : savedZoomSteps(forKey: session.key)
+    }
+
+    /// Makes the zoom slider show (and set) the zoom of the project in front.
+    private func showZoom(of key: String?) {
+        layoutZoomSteps = savedZoomSteps(forKey: key)
+        let percent = Self.zoomPercent(forSteps: layoutZoomSteps)
+        if zoomPercent != percent {
+            zoomPercent = percent
+        }
+    }
+
+    private func viewportWidth(steps: Int) -> Int {
+        Int(round(Double(desktopViewportWidth) / pow(layoutZoomFactor, Double(steps))))
     }
 
     /// Applies the layout zoom in place by changing the virtual viewport width and
     /// pinning the page scale to fit it. The page reloads only when the web view
     /// still does not fit afterwards and a fallback reload is allowed.
     private func applyLayoutZoom(to session: ProjectSession, allowFallbackReload: Bool) {
-        let requestedSteps = layoutZoomSteps
-        let requestedWidth = viewportWidth()
+        let requestedSteps = zoomStepsOf(session)
+        let requestedWidth = viewportWidth(steps: requestedSteps)
         let viewWidth = session.webView.bounds.width > 0
             ? session.webView.bounds.width
             : hostView?.bounds.width ?? 0
@@ -1781,7 +1959,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
                 guard let self,
                       let session,
                       self.sessions[session.key] === session,
-                      requestedSteps == self.layoutZoomSteps else { return }
+                      requestedSteps == self.zoomStepsOf(session) else { return }
                 session.appliedZoomSteps = requestedSteps
             }
         }
@@ -1876,8 +2054,9 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         if session.key == activeSessionKey {
             pageLoadCount += 1
         }
-        let zoomChanged = (session.appliedZoomSteps == nil && layoutZoomSteps != 0)
-            || (session.appliedZoomSteps != nil && session.appliedZoomSteps != layoutZoomSteps)
+        let steps = zoomStepsOf(session)
+        let zoomChanged = (session.appliedZoomSteps == nil && steps != 0)
+            || (session.appliedZoomSteps != nil && session.appliedZoomSteps != steps)
         applyLayoutZoom(to: session, allowFallbackReload: zoomChanged)
         syncModifiers(on: webView)
         syncMouseMode(on: webView)

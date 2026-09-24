@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes">
+<title>Remote desktop</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #1e1e1e;
+    font-family: system-ui, sans-serif;
+  }
+  iron-remote-desktop {
+    display: block;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+  }
+  #status {
+    position: fixed;
+    left: 50%;
+    top: 40%;
+    transform: translate(-50%, -50%);
+    max-width: 80%;
+    padding: 14px 20px;
+    border-radius: 14px;
+    background: rgba(243, 243, 243, 0.92);
+    color: #222;
+    font-size: 15px;
+    text-align: center;
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+    pointer-events: none;
+  }
+  #status[hidden] {
+    display: none;
+  }
+  #status small {
+    display: block;
+    margin-top: 6px;
+    color: #666;
+    font-size: 12px;
+    word-break: break-word;
+  }
+</style>
+</head>
+<body>
+<div id="status">Connecting…</div>
+<script>
+  // Tells the app's page bridge to leave the viewport alone (see rdp zoom).
+  window.__yourWorkspaceRdpPage = true;
+</script>
+<script type="module">
+  const nativeBridge = window.YourWorkspaceRdp || null;
+  const sessionToken = decodeURIComponent(location.hash.slice(1));
+  const statusElement = document.getElementById('status');
+
+  const showStatus = (text, detail = '') => {
+    statusElement.textContent = text;
+    if (detail) {
+      const small = document.createElement('small');
+      small.textContent = detail;
+      statusElement.appendChild(small);
+    }
+    statusElement.hidden = !text;
+  };
+  // Where the gateway got to on the latest attempt: {stage, error}.
+  const gatewayStatus = () => {
+    try {
+      return JSON.parse(nativeBridge ? nativeBridge.gatewayStatus(sessionToken) : '{}');
+    } catch (_) {
+      return {};
+    }
+  };
+  const shortReason = (text) => String(text || '')
+    .replace(/\[[^\]]*@ [^\]]*\]\s*/g, '')
+    .slice(0, 160);
+  const notifyNative = (event, detail = '') => {
+    try {
+      nativeBridge?.onSessionEvent(sessionToken, event, String(detail));
+    } catch (_) {}
+  };
+
+  // IronRDP synchronizes the clipboard through navigator.clipboard, which a
+  // WebView cannot read. Back it with the Android clipboard instead.
+  if (nativeBridge) {
+    const readText = async () => nativeBridge.clipboardText() || '';
+    const textType = (types) => types.find((type) => type.startsWith('text/plain'))
+      || types.find((type) => type.startsWith('text/'));
+    const writeText = async (text) => nativeBridge.setClipboardText(String(text ?? ''));
+    const clipboard = {
+      readText,
+      writeText,
+      async read() {
+        const text = await readText();
+        return [new ClipboardItem({ 'text/plain': new Blob([text], { type: 'text/plain' }) })];
+      },
+      async write(items) {
+        for (const item of items) {
+          const type = textType(item.types);
+          if (type) {
+            await writeText(await (await item.getType(type)).text());
+            return;
+          }
+        }
+      }
+    };
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, get: () => clipboard });
+    // The WebView reports clipboard permissions as denied, which would make
+    // IronRDP fall back to manual, text-only clipboard handling.
+    const permissions = navigator.permissions;
+    if (permissions?.query) {
+      const query = permissions.query.bind(permissions);
+      permissions.query = (descriptor) => String(descriptor?.name || '').startsWith('clipboard')
+        ? Promise.resolve({ state: 'granted', name: descriptor.name, onchange: null })
+        : query(descriptor);
+    }
+  }
+
+  const config = JSON.parse(
+    nativeBridge ? nativeBridge.config(sessionToken) : (window.__rdpTestConfig || '{}')
+  );
+
+  const { init, Backend, displayControl } = await import('./iron-remote-desktop-rdp.js');
+  await import('./iron-remote-desktop.js');
+  await init('WARN');
+
+  // The page stays at scale 1, so CSS pixels map to the WebView at all
+  // times. The app's zoom sets the desktop's pixel density instead (see
+  // desktopScale); a changing page scale would make the size unreliable.
+  const viewportMeta = document.querySelector('meta[name="viewport"]');
+  const FIXED_VIEWPORT =
+    'width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no';
+  const lockViewport = () => {
+    if (viewportMeta.getAttribute('content') !== FIXED_VIEWPORT) {
+      viewportMeta.setAttribute('content', FIXED_VIEWPORT);
+    }
+  };
+  lockViewport();
+  new MutationObserver(lockViewport).observe(viewportMeta, { attributes: true });
+
+  // The space the desktop has on screen, in CSS pixels.
+  const availableSize = () => ({
+    width: Math.max(1, document.documentElement.clientWidth),
+    height: Math.max(1, document.documentElement.clientHeight)
+  });
+  // Desktop pixels per CSS pixel. The app's zoom gives a layout width for
+  // the screen's long side (1280 at 100%), so rotating keeps the density.
+  const desktopScale = () => {
+    const zoomWidth = Number(window.__codeServerAppViewportWidth) || 1280;
+    return zoomWidth / Math.max(screen.width, screen.height, 1);
+  };
+  // Largest size the server has shown it accepts; Windows caps the desktop
+  // (e.g. 4096 x 2048 without the graphics pipeline) and a capped dimension
+  // would leave black bars. Learned from what the server actually applies.
+  const serverLimit = { width: Infinity, height: Infinity };
+  // The desktop size to request: the available space at the zoom's density,
+  // kept within the server's limit with the same aspect ratio.
+  const desktopSize = (available = availableSize()) => {
+    let width = available.width * desktopScale();
+    let height = available.height * desktopScale();
+    const grow = Math.max(1, 200 / width, 200 / height);
+    width *= grow;
+    height *= grow;
+    const shrink = Math.min(1, serverLimit.width / width, serverLimit.height / height);
+    return {
+      width: Math.max(200, Math.floor(width * shrink / 2) * 2),
+      height: Math.max(200, Math.floor(height * shrink))
+    };
+  };
+
+  const element = document.createElement('iron-remote-desktop');
+  element.setAttribute('scale', 'fit');
+  element.setAttribute('flexcenter', 'false');
+  element.module = Backend;
+
+  let ui = null;
+  let connected = false;
+  let attempts = 0;
+  let connectedSize = null;
+  let checkTimer = 0;
+
+  const rendererCanvas = () => element.shadowRoot?.querySelector('canvas') || null;
+
+  // The page scales the desktop itself: it fills the available area once the
+  // server applies a size, and keeps its scale (anchored top left) while a
+  // resize is pending instead of shrinking the old frame to fit.
+  const fitDisplay = () => {
+    const canvas = rendererCanvas();
+    if (!canvas || !canvas.width || !canvas.height) return;
+    const available = availableSize();
+    const scale = Math.max(canvas.width / available.width, canvas.height / available.height);
+    element.style.setProperty('--rdp-width', `${canvas.width / scale}px`);
+    element.style.setProperty('--rdp-height', `${canvas.height / scale}px`);
+  };
+  const takeOverScaling = () => {
+    const root = element.shadowRoot;
+    const canvas = rendererCanvas();
+    if (!root || !canvas || root.getElementById('your-workspace-scaling')) return;
+    const style = document.createElement('style');
+    style.id = 'your-workspace-scaling';
+    style.textContent = `.screen-viewer {
+      width: var(--rdp-width, 100%) !important;
+      height: var(--rdp-height, 100%) !important;
+      min-width: 0 !important; min-height: 0 !important;
+      max-width: none !important; max-height: none !important;
+    }`;
+    root.appendChild(style);
+    new MutationObserver(fitDisplay).observe(canvas, { attributes: true, attributeFilter: ['width', 'height'] });
+    fitDisplay();
+  };
+
+  const requestSize = (size) => {
+    connectedSize = size;
+    try {
+      ui.resize(size.width, size.height);
+    } catch (_) {
+      fitDisplay();
+      return;
+    }
+    checkAppliedSize(size);
+  };
+
+  // After the server applies a size, learn its limit when it shrank a
+  // dimension, and ask again for a size with the right aspect ratio. When
+  // the server does not follow, fit what it sends.
+  const checkAppliedSize = (requested, retries = 2, atConnect = false) => {
+    window.clearTimeout(checkTimer);
+    const started = Date.now();
+    // At connect the canvas already has the server's choice.
+    const initial = atConnect ? null : rendererCanvas();
+    const before = initial ? { width: initial.width, height: initial.height } : null;
+    const poll = () => {
+      if (!connected || connectedSize !== requested) return;
+      const canvas = rendererCanvas();
+      const applied = canvas ? { width: canvas.width, height: canvas.height } : null;
+      const matches = applied
+        && Math.abs(applied.width - requested.width) <= 2
+        && Math.abs(applied.height - requested.height) <= 2;
+      if (matches) {
+        fitDisplay();
+        return;
+      }
+      if (Date.now() - started < 4000) {
+        checkTimer = window.setTimeout(poll, 250);
+        return;
+      }
+      fitDisplay();
+      if (!applied || retries <= 0) return;
+      // A server that ignored the request tells nothing about its limit.
+      if (before && applied.width === before.width && applied.height === before.height) return;
+      let learned = false;
+      if (applied.width < requested.width - 2 && applied.width < serverLimit.width) {
+        serverLimit.width = applied.width;
+        learned = true;
+      }
+      if (applied.height < requested.height - 2 && applied.height < serverLimit.height) {
+        serverLimit.height = applied.height;
+        learned = true;
+      }
+      if (!learned) return;
+      const size = desktopSize();
+      if (Math.abs(size.width - applied.width) < 4 && Math.abs(size.height - applied.height) < 4) {
+        return;
+      }
+      connectedSize = size;
+      try {
+        ui.resize(size.width, size.height);
+      } catch (_) {
+        return;
+      }
+      checkAppliedSize(size, retries - 1);
+    };
+    checkTimer = window.setTimeout(poll, 250);
+  };
+
+  const errorKindNames = [
+    'General', 'WrongPassword', 'LogonFailure', 'AccessDenied',
+    'RDCleanPath', 'ProxyConnect', 'NegotiationFailure'
+  ];
+
+  const describeError = (error) => {
+    if (error && typeof error.kind === 'function') {
+      const kind = errorKindNames[error.kind()] || 'General';
+      let detail = '';
+      try {
+        detail = error.backtrace();
+      } catch (_) {}
+      const status = error.rdcleanpathDetails?.()?.httpStatusCode;
+      return { kind, detail, status };
+    }
+    return { kind: 'General', detail: String(error?.message || error), status: undefined };
+  };
+
+  const scheduleReconnect = (reason) => {
+    console.warn('rdp disconnected:', reason);
+    connected = false;
+    attempts += 1;
+    if (attempts > 5) {
+      showStatus('Disconnected. Tap Reload to try again.', shortReason(reason));
+      notifyNative('failed', shortReason(reason));
+      return;
+    }
+    const delay = Math.min(10000, 1000 * attempts);
+    showStatus(`Reconnecting… (${attempts}/5)`, shortReason(reason));
+    notifyNative('reconnecting', reason);
+    setTimeout(connect, delay);
+  };
+
+  async function connect() {
+    if (!attempts) showStatus('Connecting…');
+    const size = desktopSize();
+    const builder = ui.configBuilder()
+      .withUsername(config.username || '')
+      .withPassword(config.password || '')
+      .withDestination(config.destination)
+      .withProxyAddress(config.proxyAddress)
+      .withAuthToken(sessionToken)
+      .withDesktopSize(size)
+      .withExtension(displayControl(true));
+    if (config.domain) builder.withServerDomain(config.domain);
+    let session;
+    try {
+      session = await ui.connect(builder.build());
+    } catch (error) {
+      const { kind, detail, status } = describeError(error);
+      if (kind === 'WrongPassword' || kind === 'LogonFailure' || kind === 'AccessDenied') {
+        showStatus('Windows rejected the user name or password.');
+        notifyNative('credentials_rejected', kind);
+        return;
+      }
+      if (status === 401) {
+        showStatus('Cloudflare sign-in expired.');
+        notifyNative('login_required');
+        return;
+      }
+      const gateway = gatewayStatus();
+      if (gateway.stage === 'relay' && kind === 'General') {
+        // TLS to the PC worked but the connection ended during CredSSP/NLA:
+        // almost always a rejected sign-in. Retrying could lock the account.
+        showStatus('Windows sign-in failed.', shortReason(detail));
+        notifyNative('sign_in_failed', shortReason(detail));
+        return;
+      }
+      scheduleReconnect(gateway.error || `${kind}: ${detail}`);
+      return;
+    }
+    connected = true;
+    attempts = 0;
+    connectedSize = size;
+    ui.setVisibility(true);
+    takeOverScaling();
+    checkAppliedSize(size, 2, true);
+    showStatus('');
+    notifyNative('connected');
+    try {
+      const termination = await session.run();
+      scheduleReconnect(termination.reason());
+    } catch (error) {
+      scheduleReconnect(describeError(error).detail);
+    }
+  }
+
+  // Follow every change of the available area (rotation, keyboard, address
+  // bar) and of the app's zoom with a dynamic resize instead of a reconnect.
+  let resizeTimer = 0;
+  const onAreaChanged = () => {
+    window.clearTimeout(resizeTimer);
+    resizeTimer = window.setTimeout(() => {
+      if (!connected || !ui || !connectedSize) return;
+      const size = desktopSize();
+      if (Math.abs(size.width - connectedSize.width) < 8
+          && Math.abs(size.height - connectedSize.height) < 8) {
+        fitDisplay();
+        return;
+      }
+      requestSize(size);
+    }, 150);
+  };
+  window.addEventListener('resize', onAreaChanged);
+  window.addEventListener('yourworkspace-rdp-zoom', onAreaChanged);
+
+  element.addEventListener('ready', (event) => {
+    ui = event.detail.irgUserInteraction;
+    ui.setEnableClipboard(true);
+    ui.setEnableAutoClipboard(true);
+    // The component sets up its clipboard handlers right after this event;
+    // connecting synchronously would build the session without them.
+    window.setTimeout(connect, 100);
+  });
+  document.body.appendChild(element);
+  window.__rdpReconnect = () => {
+    attempts = 0;
+    connect();
+  };
+</script>
+</body>
+</html>

@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - "android/**"
+      - "tools/fetch_rdp_client.sh"
       - ".github/workflows/build-android.yml"
 
 permissions:
@@ -32,6 +33,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: "9.5.0"
+
+      - name: Fetch built-in remote desktop client
+        run: ./tools/fetch_rdp_client.sh
 
       - name: Build debug APK
         run: gradle --no-daemon -p android clean assembleDebug
