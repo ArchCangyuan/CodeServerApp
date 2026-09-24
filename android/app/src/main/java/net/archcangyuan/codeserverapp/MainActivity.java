@@ -15,6 +15,7 @@ import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -231,7 +232,7 @@ public final class MainActivity extends Activity {
           window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
 
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 11) {
+          if (existingBridge && existingBridge.version >= 12) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
             existingBridge.installRdpGestures?.();
             existingBridge.installDesktopGestures?.();
@@ -969,7 +970,8 @@ public final class MainActivity extends Activity {
             lastDownY: 0
           };
 
-          // Mouse mode: the finger positions the cursor and in-page L/R buttons click.
+          // Mouse mode: the page works like a touchpad (finger movement moves the
+          // cursor, a tap clicks at the cursor) and in-page L/R buttons click.
           // Everything runs inside real touch handlers, so clicks carry user
           // activation (clipboard writes, window.open) like a physical mouse.
           const mouseMode = {
@@ -980,6 +982,7 @@ public final class MainActivity extends Activity {
             cursor: null,
             left: null,
             right: null,
+            lockButton: null,
             touches: new Map(),
             cursorX: -1,
             cursorY: -1,
@@ -1363,17 +1366,20 @@ public final class MainActivity extends Activity {
               }
               .button.pressed { background: rgba(103, 80, 164, 0.67); }
               .button.locked { background: rgba(103, 80, 164, 0.86); border-color: #fff; }
+              .button.lock { font-weight: 400; }
             </style>
             <svg class="cursor" viewBox="0 0 14 22">
               <path d="M0.7 0.7 L0.7 18.5 L5.2 14.3 L8.3 21 L11.3 19.7 L8.2 13.1 L13.7 13.1 Z"
                 fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/>
             </svg>
             <div class="button left">L</div>
-            <div class="button right">R</div>`;
+            <div class="button right">R</div>
+            <div class="button lock" title="Hold the left button">🔓</div>`;
             mouseMode.host = host;
             mouseMode.cursor = root.querySelector('.cursor');
             mouseMode.left = root.querySelector('.left');
             mouseMode.right = root.querySelector('.right');
+            mouseMode.lockButton = root.querySelector('.lock');
             document.documentElement.appendChild(host);
           };
 
@@ -1395,6 +1401,8 @@ public final class MainActivity extends Activity {
             mouseMode.left.classList.toggle('locked', leftLocked);
             mouseMode.left.textContent = leftLocked ? 'L🔒' : 'L';
             mouseMode.right.classList.toggle('pressed', mouseMode.rightHeld);
+            mouseMode.lockButton.classList.toggle('locked', mouseMode.leftLocked);
+            mouseMode.lockButton.textContent = mouseMode.leftLocked ? '🔒' : '🔓';
           };
 
           const layoutMouseOverlay = () => {
@@ -1421,6 +1429,8 @@ public final class MainActivity extends Activity {
             });
             place(mouseMode.left, 68, 84, 40);
             place(mouseMode.right, 56, 16, 16);
+            place(mouseMode.lockButton, 42, 97, 120);
+            mouseMode.lockButton.style.fontSize = `${16 * scale}px`;
             if (mouseMode.cursorX < 0) {
               mouseMode.cursorX = rect.left + rect.width / 2;
               mouseMode.cursorY = rect.top + rect.height / 2;
@@ -1429,6 +1439,9 @@ public final class MainActivity extends Activity {
           };
 
           const moveMouseCursor = (x, y) => {
+            const rect = visualViewportRect();
+            x = Math.min(Math.max(x, rect.left), rect.left + rect.width - 1);
+            y = Math.min(Math.max(y, rect.top), rect.top + rect.height - 1);
             mouseMode.cursorX = x;
             mouseMode.cursorY = y;
             if (mouseMode.leftHeld) mouseMode.leftMoved = true;
@@ -1473,6 +1486,11 @@ public final class MainActivity extends Activity {
               updateMouseButtons();
               return;
             }
+            if (mouseMode.leftLocked) {
+              // Locked with the lock button while L was pressed: keep holding.
+              updateMouseButtons();
+              return;
+            }
             if (!mouseMode.leftHeld) return;
             if (!cancelled && mouseMode.leftLockArmed && !mouseMode.leftMoved) {
               // Long press without movement: keep the button down for one-finger drags.
@@ -1484,6 +1502,30 @@ public final class MainActivity extends Activity {
             mouseMode.leftHeld = false;
             mouseMode.leftLockArmed = false;
             mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+            updateMouseButtons();
+          };
+
+          // The lock button holds the left button down (for drags and selections)
+          // until it, or L, is tapped again.
+          const toggleLeftLock = () => {
+            clearLeftLockTimer();
+            mouseMode.leftLockArmed = false;
+            mouseMode.leftUnlockPending = false;
+            if (mouseMode.leftLocked) {
+              mouseMode.leftLocked = false;
+              if (mouseMode.leftHeld) {
+                mouseMode.leftHeld = false;
+                mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+              }
+            } else {
+              mouseMode.leftLocked = true;
+              if (!mouseMode.leftHeld) {
+                mouseMode.leftHeld = true;
+                mouseMode.leftMoved = false;
+                mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
+              }
+            }
+            navigator.vibrate?.(15);
             updateMouseButtons();
           };
 
@@ -1522,7 +1564,9 @@ public final class MainActivity extends Activity {
                 const pageTouches = Array.from(mouseMode.touches.values())
                   .filter((info) => info.role === 'cursor' || info.role === 'anchor');
                 let role = 'cursor';
-                if (pointInElement(mouseMode.left, x, y)) {
+                if (pointInElement(mouseMode.lockButton, x, y)) {
+                  role = 'lock';
+                } else if (pointInElement(mouseMode.left, x, y)) {
                   role = 'left';
                 } else if (pointInElement(mouseMode.right, x, y)) {
                   role = 'right';
@@ -1542,14 +1586,14 @@ public final class MainActivity extends Activity {
                   startedAt: performance.now(),
                   moved: false
                 });
-                if (role === 'left') {
+                if (role === 'lock') {
+                  toggleLeftLock();
+                } else if (role === 'left') {
                   mouseLeftDown();
                 } else if (role === 'right') {
                   mouseMode.rightHeld = true;
                   mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 2);
                   updateMouseButtons();
-                } else if (role === 'cursor') {
-                  moveMouseCursor(x, y);
                 }
                 continue;
               }
@@ -1562,7 +1606,12 @@ public final class MainActivity extends Activity {
                   info.moved = true;
                 }
                 if (info.role === 'cursor') {
-                  moveMouseCursor(x, y);
+                  // Relative movement, a little faster for quick swipes.
+                  const dx = x - info.lastX;
+                  const dy = y - info.lastY;
+                  const distance = Math.hypot(dx, dy) / (mouseMode.scale || 1);
+                  const gain = Math.min(2.5, 1 + Math.max(0, distance - 4) * 0.08);
+                  moveMouseCursor(mouseMode.cursorX + dx * gain, mouseMode.cursorY + dy * gain);
                 } else if (info.role === 'scroll') {
                   mouseWheel(mouseMode.cursorX, mouseMode.cursorY, info.lastX - x, info.lastY - y);
                 }
@@ -1586,9 +1635,9 @@ public final class MainActivity extends Activity {
                   && !info.moved
                   && !mouse.buttons
                   && performance.now() - info.startedAt < 350) {
-                // A quick tap is a left click at the finger.
-                mouseAction('down', x, y, 0);
-                mouseAction('up', x, y, 0);
+                // A quick tap is a left click at the cursor.
+                mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
+                mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
               }
             }
           };
@@ -1639,7 +1688,7 @@ public final class MainActivity extends Activity {
           };
 
           const bridge = {
-            version: 11,
+            version: 12,
             forceKeyboard,
             installRdpGestures,
             installDesktopGestures,
@@ -1910,7 +1959,7 @@ public final class MainActivity extends Activity {
         LinearLayout keyRow = new LinearLayout(this);
         keyRow.setOrientation(LinearLayout.HORIZONTAL);
         keyRow.setGravity(Gravity.CENTER_VERTICAL);
-        keyRow.setPadding(dp(6), dp(6), dp(6), dp(6));
+        keyRow.setPadding(dp(6), dp(3), dp(6), dp(3));
 
         Button keyboardButton = createKeyButton("KB");
         keyboardButton.setContentDescription("Force show keyboard");
@@ -3321,8 +3370,20 @@ public final class MainActivity extends Activity {
         button.setFocusableInTouchMode(false);
         button.setMinWidth(0);
         button.setMinimumWidth(0);
+        button.setMinHeight(0);
+        button.setMinimumHeight(0);
         button.setPadding(dp(6), 0, dp(6), 0);
         button.setTextColor(Color.BLACK);
+        // A flat rounded key without the default button's insets keeps the bar low.
+        GradientDrawable background = new GradientDrawable();
+        background.setCornerRadius(dp(6));
+        background.setColor(Color.WHITE);
+        button.setBackground(new RippleDrawable(
+            ColorStateList.valueOf(Color.argb(40, 0, 0, 0)),
+            background,
+            null
+        ));
+        button.setStateListAnimator(null);
         button.setBackgroundTintList(ColorStateList.valueOf(KEY_BACKGROUND));
         return button;
     }
@@ -3343,7 +3404,7 @@ public final class MainActivity extends Activity {
     }
 
     private LinearLayout.LayoutParams keyLayoutParams(int width) {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, dp(46));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(width, dp(34));
         params.setMarginEnd(dp(4));
         return params;
     }

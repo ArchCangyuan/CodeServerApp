@@ -87,6 +87,8 @@
   // WebView cannot read. Back it with the Android clipboard instead.
   if (nativeBridge) {
     const readText = async () => nativeBridge.clipboardText() || '';
+    const textType = (types) => types.find((type) => type.startsWith('text/plain'))
+      || types.find((type) => type.startsWith('text/'));
     const writeText = async (text) => nativeBridge.setClipboardText(String(text ?? ''));
     const clipboard = {
       readText,
@@ -97,14 +99,24 @@
       },
       async write(items) {
         for (const item of items) {
-          if (item.types.includes('text/plain')) {
-            await writeText(await (await item.getType('text/plain')).text());
+          const type = textType(item.types);
+          if (type) {
+            await writeText(await (await item.getType(type)).text());
             return;
           }
         }
       }
     };
     Object.defineProperty(navigator, 'clipboard', { configurable: true, get: () => clipboard });
+    // The WebView reports clipboard permissions as denied, which would make
+    // IronRDP fall back to manual, text-only clipboard handling.
+    const permissions = navigator.permissions;
+    if (permissions?.query) {
+      const query = permissions.query.bind(permissions);
+      permissions.query = (descriptor) => String(descriptor?.name || '').startsWith('clipboard')
+        ? Promise.resolve({ state: 'granted', name: descriptor.name, onchange: null })
+        : query(descriptor);
+    }
   }
 
   const config = JSON.parse(
@@ -374,7 +386,9 @@
     ui = event.detail.irgUserInteraction;
     ui.setEnableClipboard(true);
     ui.setEnableAutoClipboard(true);
-    connect();
+    // The component sets up its clipboard handlers right after this event;
+    // connecting synchronously would build the session without them.
+    window.setTimeout(connect, 100);
   });
   document.body.appendChild(element);
   window.__rdpReconnect = () => {
