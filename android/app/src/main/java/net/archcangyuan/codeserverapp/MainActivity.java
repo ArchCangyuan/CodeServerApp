@@ -530,6 +530,48 @@ public final class MainActivity extends Activity {
           installRdpGestures();
           installDesktopGestures();
           window.setInterval(installRdpGestures, 1000);
+
+          // Cloudflare's browser RDP keeps a short-lived token from page load. When the
+          // session reconnects after it expired, the page shows `"exp" claim timestamp
+          // check failed` although the Access login is still valid. A reload fetches a
+          // fresh token (only the Windows password is asked again), so reload
+          // automatically, at most once every 30 s. The check runs only on RDP pages
+          // and small error pages, never on large pages such as the workbench.
+          const expiredAccessTokenPattern = /claim timestamp check failed/i;
+          let webRdpPageSeen = false;
+          const collectPageText = () => {
+            const roots = [document];
+            let text = '';
+            for (let index = 0; index < roots.length && index < 64; index += 1) {
+              const root = roots[index];
+              text += ` ${(root.body || root).textContent || ''}`;
+              if (text.length > 200000 || !root.querySelectorAll) break;
+              for (const element of root.querySelectorAll('*')) {
+                if (element.shadowRoot) roots.push(element.shadowRoot);
+                if (element.tagName === 'IFRAME') {
+                  try {
+                    if (element.contentDocument) roots.push(element.contentDocument);
+                  } catch (_) {}
+                }
+              }
+            }
+            return text;
+          };
+          const reloadOnExpiredAccessToken = () => {
+            if (state.ironRdpCanvas) webRdpPageSeen = true;
+            if (!webRdpPageSeen && document.getElementsByTagName('*').length > 400) return;
+            if (!expiredAccessTokenPattern.test(collectPageText())) return;
+            const reloadKey = '__codeServerAppAccessTokenReloadAt';
+            try {
+              const lastReload = Number(window.sessionStorage.getItem(reloadKey)) || 0;
+              if (Date.now() - lastReload < 30000) return;
+              window.sessionStorage.setItem(reloadKey, String(Date.now()));
+            } catch (_) {
+              return;
+            }
+            window.location.reload();
+          };
+          window.setInterval(reloadOnExpiredAccessToken, 2000);
           const isProxy = (element) => Boolean(element && element.id === PROXY_ID);
 
           const deepestActiveElement = (rootDocument) => {
