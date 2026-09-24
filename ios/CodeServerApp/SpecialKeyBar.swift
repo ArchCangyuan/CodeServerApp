@@ -73,9 +73,11 @@ enum CodeServerKey: String, CaseIterable, Identifiable {
 struct SpecialKeyBar: View {
     @Binding var controlLocked: Bool
     @Binding var shiftLocked: Bool
+    @Binding var mouseModeEnabled: Bool
     @State private var repeatTask: Task<Void, Never>? = nil
 
     let onKeyboard: () -> Void
+    let onMouseModeChanged: (Bool) -> Void
     let onKey: (CodeServerKey) -> Void
     let onControlC: () -> Void
     let onModifiersChanged: (_ control: Bool, _ shift: Bool) -> Void
@@ -86,6 +88,8 @@ struct SpecialKeyBar: View {
                 keyButton(label: "KB", accessibilityLabel: "Force show keyboard") {
                     onKeyboard()
                 }
+
+                mouseModeButton
 
                 modifierButton(label: "Ctrl", isLocked: controlLocked) {
                     controlLocked.toggle()
@@ -164,6 +168,25 @@ struct SpecialKeyBar: View {
     private func stopRepeating() {
         repeatTask?.cancel()
         repeatTask = nil
+    }
+
+    private var mouseModeButton: some View {
+        Button {
+            mouseModeEnabled.toggle()
+            onMouseModeChanged(mouseModeEnabled)
+        } label: {
+            Image(systemName: "cursorarrow")
+                .font(.system(.subheadline).weight(.semibold))
+                .frame(minWidth: 38, minHeight: 34)
+                .padding(.horizontal, 3)
+                .foregroundColor(mouseModeEnabled ? .white : .primary)
+                .background(
+                    mouseModeEnabled ? Color.accentColor : Color(uiColor: .tertiarySystemFill)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Mouse mode \(mouseModeEnabled ? "on" : "off")")
     }
 
     private func modifierButton(

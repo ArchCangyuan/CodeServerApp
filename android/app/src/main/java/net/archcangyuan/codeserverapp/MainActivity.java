@@ -10,8 +10,11 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Insets;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
@@ -28,6 +31,7 @@ import android.text.Spanned;
 import android.text.InputType;
 import android.text.style.StyleSpan;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -69,6 +73,7 @@ public final class MainActivity extends Activity {
     private static final String ADDRESS_KEY = "server_address";
     private static final String PROJECTS_KEY = "saved_projects";
     private static final String KEEP_ALIVE_KEY = "keep_alive_enabled";
+    private static final String MOUSE_MODE_KEY = "mouse_mode_enabled";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 2001;
     private static final int OVERLAY_PERMISSION_REQUEST = 2002;
     private static final long SESSION_KEEP_ALIVE_PULSE_MS = 10_000L;
@@ -155,7 +160,7 @@ public final class MainActivity extends Activity {
           };
 
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 9) {
+          if (existingBridge && existingBridge.version >= 10) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
             existingBridge.installRdpGestures?.();
             existingBridge.installDesktopGestures?.();
@@ -802,8 +807,292 @@ public final class MainActivity extends Activity {
           document.addEventListener('keydown', redispatchWithLockedModifiers, true);
           document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
+          // Real mice use pointerId 1 in Chromium, which would let pages capture a
+          // pointer that never delivers the synthetic moves. Use a private id and
+          // emulate setPointerCapture for it instead.
+          const SYNTHETIC_POINTER_ID = 7331;
+
+          const mouse = {
+            buttons: 0,
+            captureTarget: null,
+            lastFx: 0.5,
+            lastFy: 0.5,
+            lastHit: null,
+            hoverPath: [],
+            downTargets: {},
+            clickCount: 0,
+            lastDownAt: 0,
+            lastDownX: 0,
+            lastDownY: 0
+          };
+
+          const installPointerCapture = (eventWindow) => {
+            const prototype = eventWindow?.Element?.prototype;
+            if (!prototype || prototype.__codeServerAppPointerCapture) return;
+            const nativeSet = prototype.setPointerCapture;
+            const nativeRelease = prototype.releasePointerCapture;
+            const nativeHas = prototype.hasPointerCapture;
+            prototype.setPointerCapture = function (pointerId) {
+              if (pointerId !== SYNTHETIC_POINTER_ID) return nativeSet.call(this, pointerId);
+              mouse.captureTarget = this;
+            };
+            prototype.releasePointerCapture = function (pointerId) {
+              if (pointerId !== SYNTHETIC_POINTER_ID) return nativeRelease.call(this, pointerId);
+              if (mouse.captureTarget === this) mouse.captureTarget = null;
+            };
+            prototype.hasPointerCapture = function (pointerId) {
+              if (pointerId !== SYNTHETIC_POINTER_ID) return nativeHas.call(this, pointerId);
+              return mouse.captureTarget === this;
+            };
+            Object.defineProperty(prototype, '__codeServerAppPointerCapture', { value: true });
+          };
+          installPointerCapture(window);
+
+          const mouseButtonMask = (button) => {
+            if (button === 2) return 2;
+            if (button === 1) return 4;
+            return 1;
+          };
+
+          const viewportPoint = (fx, fy) => {
+            const viewport = window.visualViewport;
+            const width = viewport ? viewport.width : window.innerWidth;
+            const height = viewport ? viewport.height : window.innerHeight;
+            const left = viewport ? viewport.offsetLeft : 0;
+            const top = viewport ? viewport.offsetTop : 0;
+            const clamp = (value) => Math.max(0, Math.min(1, Number(value) || 0));
+            return {
+              x: left + Math.min(width - 1, clamp(fx) * width),
+              y: top + Math.min(height - 1, clamp(fy) * height)
+            };
+          };
+
+          // Resolve the deepest element under the cursor, descending into open
+          // shadow roots (IronRDP) and same-origin iframes.
+          const mouseHitTest = (x, y) => {
+            let root = document;
+            let localX = x;
+            let localY = y;
+            let hit = null;
+            for (let depth = 0; depth < 8; depth += 1) {
+              let element = root.elementFromPoint(localX, localY);
+              for (let level = 0; element?.shadowRoot && level < 16; level += 1) {
+                const inner = element.shadowRoot.elementFromPoint(localX, localY);
+                if (!inner || inner === element) break;
+                element = inner;
+              }
+              if (!element) break;
+              hit = {
+                element,
+                clientX: localX,
+                clientY: localY,
+                view: element.ownerDocument?.defaultView || window
+              };
+              if (element.tagName !== 'IFRAME') break;
+              let childDocument = null;
+              try {
+                childDocument = element.contentDocument;
+              } catch (_) {}
+              if (!childDocument) break;
+              const rect = element.getBoundingClientRect();
+              localX -= rect.left + element.clientLeft;
+              localY -= rect.top + element.clientTop;
+              root = childDocument;
+            }
+            return hit;
+          };
+
+          const composedAncestors = (element) => {
+            const chain = [];
+            for (let node = element; node && chain.length < 128;) {
+              if (node.nodeType === 1) chain.push(node);
+              node = node.parentNode || node.host || null;
+            }
+            return chain;
+          };
+
+          const mouseEventInit = (hit, button, buttons, detail, bubbles) => ({
+            bubbles,
+            cancelable: bubbles,
+            composed: true,
+            view: hit.view,
+            detail,
+            clientX: hit.clientX,
+            clientY: hit.clientY,
+            screenX: hit.clientX,
+            screenY: hit.clientY,
+            button,
+            buttons,
+            ctrlKey: state.control,
+            shiftKey: state.shift,
+            altKey: false,
+            metaKey: false
+          });
+
+          const fireMouse = (hit, element, type, button, buttons, detail = 0, bubbles = true) => {
+            const eventWindow = element.ownerDocument?.defaultView || hit.view;
+            return element.dispatchEvent(new eventWindow.MouseEvent(
+              type,
+              mouseEventInit(hit, button, buttons, detail, bubbles)
+            ));
+          };
+
+          const firePointer = (hit, element, type, button, buttons, bubbles = true) => {
+            const eventWindow = element.ownerDocument?.defaultView || hit.view;
+            if (typeof eventWindow.PointerEvent !== 'function') return true;
+            return element.dispatchEvent(new eventWindow.PointerEvent(type, {
+              ...mouseEventInit(hit, button, buttons, 0, bubbles),
+              pointerId: SYNTHETIC_POINTER_ID,
+              pointerType: 'mouse',
+              isPrimary: true,
+              width: 1,
+              height: 1,
+              pressure: buttons ? 0.5 : 0
+            }));
+          };
+
+          const updateMouseHover = (hit) => {
+            const previousPath = mouse.hoverPath;
+            const nextPath = composedAncestors(hit.element);
+            const previous = previousPath[0] || null;
+            const next = nextPath[0] || null;
+            if (previous === next) return;
+            const leaveHit = mouse.lastHit || hit;
+            if (previous && previous.isConnected) {
+              firePointer(leaveHit, previous, 'pointerout', 0, mouse.buttons);
+              fireMouse(leaveHit, previous, 'mouseout', 0, mouse.buttons);
+              for (const element of previousPath) {
+                if (nextPath.includes(element)) break;
+                firePointer(leaveHit, element, 'pointerleave', 0, mouse.buttons, false);
+                fireMouse(leaveHit, element, 'mouseleave', 0, mouse.buttons, 0, false);
+              }
+            }
+            if (next) {
+              firePointer(hit, next, 'pointerover', 0, mouse.buttons);
+              fireMouse(hit, next, 'mouseover', 0, mouse.buttons);
+              const entering = [];
+              for (const element of nextPath) {
+                if (previousPath.includes(element)) break;
+                entering.push(element);
+              }
+              for (const element of entering.reverse()) {
+                firePointer(hit, element, 'pointerenter', 0, mouse.buttons, false);
+                fireMouse(hit, element, 'mouseenter', 0, mouse.buttons, 0, false);
+              }
+            }
+            mouse.hoverPath = nextPath;
+          };
+
+          const focusFromMouse = (target) => {
+            const selector = 'input, textarea, select, button, a[href], [tabindex], '
+              + '[contenteditable=""], [contenteditable="true"]';
+            for (const element of composedAncestors(target)) {
+              if (!element.matches?.(selector) || element.disabled) continue;
+              try {
+                element.focus({ preventScroll: true });
+              } catch (_) {}
+              return;
+            }
+          };
+
+          const commonMouseTarget = (first, second) => {
+            if (!first || !second || !first.isConnected) return null;
+            for (const element of composedAncestors(first)) {
+              if (element === second || element.contains(second)) return element;
+            }
+            return null;
+          };
+
+          const mouseAction = (action, fx, fy, button) => {
+            if (action === 'release') {
+              for (const held of [0, 2, 1]) {
+                if (mouse.buttons & mouseButtonMask(held)) {
+                  mouseAction('up', mouse.lastFx, mouse.lastFy, held);
+                }
+              }
+              return true;
+            }
+
+            mouse.lastFx = fx;
+            mouse.lastFy = fy;
+            const point = viewportPoint(fx, fy);
+            const hit = mouseHitTest(point.x, point.y)
+              || (mouse.lastHit?.element?.isConnected ? mouse.lastHit : null);
+            if (!hit) {
+              if (action === 'up') mouse.buttons &= ~mouseButtonMask(button);
+              return false;
+            }
+            installPointerCapture(hit.view);
+            const captured = mouse.captureTarget?.isConnected ? mouse.captureTarget : null;
+            if (!captured) updateMouseHover(hit);
+            mouse.lastHit = hit;
+            const target = captured || hit.element;
+
+            if (action === 'move') {
+              firePointer(hit, target, 'pointermove', -1, mouse.buttons);
+              fireMouse(hit, target, 'mousemove', 0, mouse.buttons);
+              return true;
+            }
+
+            if (action === 'down') {
+              if (button === 0) {
+                const now = performance.now();
+                const nearPrevious = Math.hypot(
+                  point.x - mouse.lastDownX,
+                  point.y - mouse.lastDownY
+                ) < 8;
+                mouse.clickCount = nearPrevious && now - mouse.lastDownAt < 500
+                  ? Math.min(mouse.clickCount + 1, 3)
+                  : 1;
+                mouse.lastDownAt = now;
+                mouse.lastDownX = point.x;
+                mouse.lastDownY = point.y;
+              }
+              mouse.captureTarget = null;
+              mouse.buttons |= mouseButtonMask(button);
+              mouse.downTargets[button] = target;
+              rememberTarget(target);
+              const detail = button === 0 ? mouse.clickCount : 1;
+              const pointerAllowed = firePointer(hit, target, 'pointerdown', button, mouse.buttons);
+              const mouseAllowed = fireMouse(
+                hit,
+                target,
+                'mousedown',
+                button,
+                mouse.buttons,
+                detail
+              );
+              if (button === 0 && pointerAllowed && mouseAllowed) focusFromMouse(target);
+              return true;
+            }
+
+            if (action === 'up') {
+              if (!(mouse.buttons & mouseButtonMask(button))) return false;
+              mouse.buttons &= ~mouseButtonMask(button);
+              const detail = button === 0 ? mouse.clickCount : 1;
+              firePointer(hit, target, 'pointerup', button, mouse.buttons);
+              fireMouse(hit, target, 'mouseup', button, mouse.buttons, detail);
+              if (!mouse.buttons) mouse.captureTarget = null;
+              const downTarget = mouse.downTargets[button];
+              delete mouse.downTargets[button];
+              if (button === 0) {
+                const clickTarget = commonMouseTarget(downTarget, target);
+                if (clickTarget) {
+                  fireMouse(hit, clickTarget, 'click', 0, mouse.buttons, detail);
+                  if (detail === 2) {
+                    fireMouse(hit, clickTarget, 'dblclick', 0, mouse.buttons, 2);
+                  }
+                }
+              } else if (button === 2) {
+                fireMouse(hit, target, 'contextmenu', 2, mouse.buttons, 1);
+              }
+              return true;
+            }
+            return false;
+          };
+
           const bridge = {
-            version: 9,
+            version: 10,
             forceKeyboard,
             installRdpGestures,
             installDesktopGestures,
@@ -817,6 +1106,14 @@ public final class MainActivity extends Activity {
             },
             sendShortcut(key, code, keyCode, control, shift) {
               return dispatchShortcut(key, code, keyCode, control, shift);
+            },
+            mouse(action, fx, fy, button) {
+              return mouseAction(
+                String(action),
+                Number(fx),
+                Number(fy),
+                Number(button) || 0
+              );
             },
             setModifiers(control, shift) {
               const nextControl = Boolean(control);
@@ -855,10 +1152,13 @@ public final class MainActivity extends Activity {
     private Button controlButton;
     private Button shiftButton;
     private Button fullscreenButton;
+    private Button mouseModeButton;
+    private MouseOverlay mouseOverlay;
     private boolean controlLocked;
     private boolean shiftLocked;
     private boolean fullscreen;
     private boolean keepAliveEnabled;
+    private boolean mouseModeEnabled;
     private int layoutZoomSteps;
     private final Handler keepAliveHandler = new Handler(Looper.getMainLooper());
     private final Runnable sessionKeepAlivePulse = new Runnable() {
@@ -897,6 +1197,7 @@ public final class MainActivity extends Activity {
             )
         );
         keepAliveEnabled = preferences.getBoolean(KEEP_ALIVE_KEY, false);
+        mouseModeEnabled = preferences.getBoolean(MOUSE_MODE_KEY, false);
         loadProjects();
         setContentView(createContentView());
         configureSystemUi();
@@ -1001,6 +1302,15 @@ public final class MainActivity extends Activity {
             )
         );
 
+        mouseOverlay = new MouseOverlay(this);
+        webContainer.addView(
+            mouseOverlay,
+            new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        );
+
         HorizontalScrollView keyboardScroll = new HorizontalScrollView(this);
         keyboardScroll.setHorizontalScrollBarEnabled(false);
         keyboardScroll.setFillViewport(false);
@@ -1015,6 +1325,10 @@ public final class MainActivity extends Activity {
         keyboardButton.setContentDescription("Force show keyboard");
         keyboardButton.setOnClickListener(view -> forceShowKeyboard());
         keyRow.addView(keyboardButton, keyLayoutParams(dp(54)));
+
+        mouseModeButton = createKeyButton("🖱");
+        mouseModeButton.setOnClickListener(view -> setMouseModeEnabled(!mouseModeEnabled));
+        keyRow.addView(mouseModeButton, keyLayoutParams(dp(54)));
 
         controlButton = createKeyButton("Ctrl 🔓");
         controlButton.setOnClickListener(view -> {
@@ -1060,6 +1374,7 @@ public final class MainActivity extends Activity {
         );
 
         updateModifierButtons();
+        applyMouseMode();
         return root;
     }
 
@@ -1398,6 +1713,7 @@ public final class MainActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         );
+        raiseMouseOverlay();
         return target;
     }
 
@@ -1570,6 +1886,9 @@ public final class MainActivity extends Activity {
         }
 
         if (webView != null) {
+            if (mouseOverlay != null) {
+                mouseOverlay.releaseButtons();
+            }
             if (activeSessionKey == null) {
                 destroyWebView(webView);
             } else {
@@ -1588,6 +1907,7 @@ public final class MainActivity extends Activity {
         targetSession.lastInactiveAt = 0L;
         webView.setVisibility(View.VISIBLE);
         webView.bringToFront();
+        raiseMouseOverlay();
         webView.onResume();
         Integer appliedSteps = appliedLayoutZoomSteps.get(webView);
         boolean needsReload = appliedSteps != null && appliedSteps != layoutZoomSteps;
@@ -1964,6 +2284,70 @@ public final class MainActivity extends Activity {
             + "'c','KeyC',67,true,false) : false";
         webView.evaluateJavascript(script, null);
         webView.requestFocus();
+    }
+
+    private void setMouseModeEnabled(boolean enabled) {
+        if (mouseModeEnabled == enabled) {
+            return;
+        }
+        mouseModeEnabled = enabled;
+        preferences.edit().putBoolean(MOUSE_MODE_KEY, enabled).apply();
+        applyMouseMode();
+        Toast.makeText(
+            this,
+            enabled
+                ? "Mouse mode: joystick moves, L/R click, hold L to lock drag"
+                : "Mouse mode off",
+            Toast.LENGTH_SHORT
+        ).show();
+    }
+
+    private void applyMouseMode() {
+        if (mouseOverlay != null) {
+            if (mouseModeEnabled) {
+                mouseOverlay.setVisibility(View.VISIBLE);
+                raiseMouseOverlay();
+                mouseOverlay.sendCursorPosition();
+            } else {
+                mouseOverlay.releaseButtons();
+                mouseOverlay.setVisibility(View.GONE);
+            }
+        }
+        if (mouseModeButton != null) {
+            mouseModeButton.setContentDescription(
+                mouseModeEnabled ? "Disable mouse mode" : "Enable mouse mode"
+            );
+            mouseModeButton.setTextColor(mouseModeEnabled ? Color.WHITE : Color.BLACK);
+            mouseModeButton.setBackgroundTintList(
+                ColorStateList.valueOf(mouseModeEnabled ? ACCENT : KEY_BACKGROUND)
+            );
+        }
+    }
+
+    private void raiseMouseOverlay() {
+        if (mouseOverlay != null) {
+            mouseOverlay.bringToFront();
+        }
+    }
+
+    private void sendMouse(String action, float fx, float fy, int button) {
+        if (webView == null) {
+            return;
+        }
+        String script = String.format(
+            Locale.US,
+            "window.__codeServerAppKeyboard"
+                + " && typeof window.__codeServerAppKeyboard.mouse === 'function'"
+                + " ? window.__codeServerAppKeyboard.mouse('%s',%.5f,%.5f,%d) : false",
+            action,
+            fx,
+            fy,
+            button
+        );
+        webView.evaluateJavascript(script, null);
+        if ("down".equals(action)) {
+            webView.requestFocus();
+        }
     }
 
     private void addKey(
@@ -2476,6 +2860,441 @@ public final class MainActivity extends Activity {
             public boolean performEditorAction(int actionCode) {
                 dispatchNativeKey(KeyEvent.KEYCODE_ENTER);
                 return true;
+            }
+        }
+    }
+
+    /**
+     * Floating mouse controls drawn above the active WebView. Only the joystick and
+     * the L/R buttons consume touches; everything else falls through to the page.
+     * Each control tracks its own pointer, so the joystick can move the cursor while
+     * L is held to drag or select.
+     */
+    private final class MouseOverlay extends FrameLayout {
+        private static final float MAX_SPEED_DP_PER_SECOND = 700f;
+        private static final float DEAD_ZONE = 0.08f;
+        private static final long DRAG_LOCK_DELAY_MS = 500L;
+
+        private final CursorView cursorView;
+        private final JoystickView joystick;
+        private final MouseButtonView leftButton;
+        private final MouseButtonView rightButton;
+        private float cursorX = -1f;
+        private float cursorY = -1f;
+        private long lastFrameNanos;
+        private boolean ticking;
+        private boolean leftHeld;
+        private boolean leftLocked;
+        private boolean leftLockArmed;
+        private boolean leftMovedWhileHeld;
+        private boolean leftUnlockPending;
+        private boolean rightHeld;
+
+        private final Runnable frame = new Runnable() {
+            @Override
+            public void run() {
+                if (!ticking) {
+                    return;
+                }
+                long now = System.nanoTime();
+                float seconds = Math.min(0.05f, (now - lastFrameNanos) / 1_000_000_000f);
+                lastFrameNanos = now;
+                stepCursor(seconds);
+                postOnAnimation(this);
+            }
+        };
+
+        private final Runnable armDragLock = () -> {
+            if (leftHeld && !leftMovedWhileHeld) {
+                leftLockArmed = true;
+                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                updateButtonStates();
+            }
+        };
+
+        MouseOverlay(Context context) {
+            super(context);
+            setClickable(false);
+            setFocusable(false);
+            setMotionEventSplittingEnabled(true);
+            setVisibility(View.GONE);
+
+            cursorView = new CursorView(context);
+            addView(cursorView, new LayoutParams(
+                LayoutParams.MATCH_PARENT,
+                LayoutParams.MATCH_PARENT
+            ));
+
+            joystick = new JoystickView(context);
+            LayoutParams joystickParams = new LayoutParams(dp(128), dp(128));
+            joystickParams.gravity = Gravity.BOTTOM | Gravity.START;
+            joystickParams.setMargins(dp(16), 0, 0, dp(16));
+            addView(joystick, joystickParams);
+
+            rightButton = new MouseButtonView(context, "R");
+            LayoutParams rightParams = new LayoutParams(dp(56), dp(56));
+            rightParams.gravity = Gravity.BOTTOM | Gravity.END;
+            rightParams.setMargins(0, 0, dp(16), dp(16));
+            addView(rightButton, rightParams);
+
+            leftButton = new MouseButtonView(context, "L");
+            LayoutParams leftParams = new LayoutParams(dp(68), dp(68));
+            leftParams.gravity = Gravity.BOTTOM | Gravity.END;
+            leftParams.setMargins(0, 0, dp(84), dp(40));
+            addView(leftButton, leftParams);
+        }
+
+        @Override
+        protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
+            super.onSizeChanged(width, height, oldWidth, oldHeight);
+            if (width <= 0 || height <= 0) {
+                return;
+            }
+            if (cursorX < 0f || cursorY < 0f) {
+                cursorX = width / 2f;
+                cursorY = height / 2f;
+            } else {
+                cursorX = Math.max(0f, Math.min(width - 1f, cursorX));
+                cursorY = Math.max(0f, Math.min(height - 1f, cursorY));
+            }
+            cursorView.invalidate();
+        }
+
+        @Override
+        protected void onDetachedFromWindow() {
+            stopTicking();
+            removeCallbacks(armDragLock);
+            super.onDetachedFromWindow();
+        }
+
+        void sendCursorPosition() {
+            send("move", 0);
+        }
+
+        void releaseButtons() {
+            removeCallbacks(armDragLock);
+            if (leftHeld || leftLocked || leftUnlockPending) {
+                send("up", 0);
+            }
+            if (rightHeld) {
+                send("up", 2);
+            }
+            leftHeld = false;
+            leftLocked = false;
+            leftLockArmed = false;
+            leftUnlockPending = false;
+            rightHeld = false;
+            joystick.reset();
+            stopTicking();
+            updateButtonStates();
+        }
+
+        private void send(String action, int button) {
+            int width = getWidth();
+            int height = getHeight();
+            if (width <= 0 || height <= 0 || cursorX < 0f) {
+                return;
+            }
+            sendMouse(action, cursorX / width, cursorY / height, button);
+        }
+
+        private void startTicking() {
+            if (ticking) {
+                return;
+            }
+            ticking = true;
+            lastFrameNanos = System.nanoTime();
+            postOnAnimation(frame);
+        }
+
+        private void stopTicking() {
+            ticking = false;
+            removeCallbacks(frame);
+        }
+
+        private void stepCursor(float seconds) {
+            float magnitude = (float) Math.hypot(joystick.vectorX, joystick.vectorY);
+            if (magnitude <= DEAD_ZONE || getWidth() <= 0) {
+                return;
+            }
+            float normalized = (Math.min(1f, magnitude) - DEAD_ZONE) / (1f - DEAD_ZONE);
+            // Quadratic response: small deflections give precise, slow movement.
+            float speed = MAX_SPEED_DP_PER_SECOND
+                * getResources().getDisplayMetrics().density
+                * normalized
+                * normalized;
+            float nextX = cursorX + joystick.vectorX / magnitude * speed * seconds;
+            float nextY = cursorY + joystick.vectorY / magnitude * speed * seconds;
+            nextX = Math.max(0f, Math.min(getWidth() - 1f, nextX));
+            nextY = Math.max(0f, Math.min(getHeight() - 1f, nextY));
+            if (Math.abs(nextX - cursorX) < 0.01f && Math.abs(nextY - cursorY) < 0.01f) {
+                return;
+            }
+            cursorX = nextX;
+            cursorY = nextY;
+            if (leftHeld) {
+                leftMovedWhileHeld = true;
+            }
+            cursorView.invalidate();
+            send("move", 0);
+        }
+
+        private void onLeftDown() {
+            if (leftLocked) {
+                // Tap while drag-locked: release the button when this tap ends.
+                leftLocked = false;
+                leftUnlockPending = true;
+                updateButtonStates();
+                return;
+            }
+            leftHeld = true;
+            leftLockArmed = false;
+            leftMovedWhileHeld = false;
+            send("down", 0);
+            postDelayed(armDragLock, DRAG_LOCK_DELAY_MS);
+            updateButtonStates();
+        }
+
+        private void onLeftUp(boolean cancelled) {
+            removeCallbacks(armDragLock);
+            if (leftUnlockPending) {
+                leftUnlockPending = false;
+                leftHeld = false;
+                send("up", 0);
+                updateButtonStates();
+                return;
+            }
+            if (!leftHeld) {
+                return;
+            }
+            if (!cancelled && leftLockArmed && !leftMovedWhileHeld) {
+                // Long press without movement: keep the button down for one-finger drags.
+                leftLockArmed = false;
+                leftLocked = true;
+                updateButtonStates();
+                return;
+            }
+            leftHeld = false;
+            leftLockArmed = false;
+            send("up", 0);
+            updateButtonStates();
+        }
+
+        private void onRightDown() {
+            rightHeld = true;
+            send("down", 2);
+            updateButtonStates();
+        }
+
+        private void onRightUp() {
+            if (!rightHeld) {
+                return;
+            }
+            rightHeld = false;
+            send("up", 2);
+            updateButtonStates();
+        }
+
+        private void updateButtonStates() {
+            leftButton.setState(leftHeld || leftUnlockPending, leftLocked || leftLockArmed);
+            rightButton.setState(rightHeld, false);
+        }
+
+        private final class CursorView extends View {
+            private final Path arrow = new Path();
+            private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+            CursorView(Context context) {
+                super(context);
+                setClickable(false);
+                setFocusable(false);
+                setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+                float unit = getResources().getDisplayMetrics().density;
+                arrow.moveTo(0f, 0f);
+                arrow.lineTo(0f, 18f * unit);
+                arrow.lineTo(4.5f * unit, 13.8f * unit);
+                arrow.lineTo(7.6f * unit, 20.5f * unit);
+                arrow.lineTo(10.6f * unit, 19.2f * unit);
+                arrow.lineTo(7.5f * unit, 12.6f * unit);
+                arrow.lineTo(13f * unit, 12.6f * unit);
+                arrow.close();
+                fill.setColor(Color.WHITE);
+                fill.setStyle(Paint.Style.FILL);
+                stroke.setColor(Color.BLACK);
+                stroke.setStyle(Paint.Style.STROKE);
+                stroke.setStrokeWidth(1.4f * unit);
+                stroke.setStrokeJoin(Paint.Join.ROUND);
+            }
+
+            @Override
+            protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                if (cursorX < 0f) {
+                    return;
+                }
+                canvas.save();
+                canvas.translate(cursorX, cursorY);
+                canvas.drawPath(arrow, fill);
+                canvas.drawPath(arrow, stroke);
+                canvas.restore();
+            }
+        }
+
+        private final class JoystickView extends View {
+            private final Paint basePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private final Paint ringPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private final Paint knobPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private int activePointerId = -1;
+            float vectorX;
+            float vectorY;
+
+            JoystickView(Context context) {
+                super(context);
+                setContentDescription("Mouse cursor joystick");
+                basePaint.setColor(Color.argb(60, 0, 0, 0));
+                ringPaint.setColor(Color.argb(150, 255, 255, 255));
+                ringPaint.setStyle(Paint.Style.STROKE);
+                ringPaint.setStrokeWidth(dp(2));
+            }
+
+            void reset() {
+                activePointerId = -1;
+                vectorX = 0f;
+                vectorY = 0f;
+                invalidate();
+            }
+
+            @Override
+            protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                float centerX = getWidth() / 2f;
+                float centerY = getHeight() / 2f;
+                float radius = Math.min(centerX, centerY) - dp(2);
+                float knobRadius = radius * 0.38f;
+                float travel = radius - knobRadius;
+                canvas.drawCircle(centerX, centerY, radius, basePaint);
+                canvas.drawCircle(centerX, centerY, radius, ringPaint);
+                knobPaint.setColor(Color.argb(activePointerId >= 0 ? 200 : 120, 255, 255, 255));
+                canvas.drawCircle(
+                    centerX + vectorX * travel,
+                    centerY + vectorY * travel,
+                    knobRadius,
+                    knobPaint
+                );
+            }
+
+            @Override
+            public boolean onTouchEvent(MotionEvent event) {
+                switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    activePointerId = event.getPointerId(0);
+                    updateVector(event.getX(0), event.getY(0));
+                    startTicking();
+                    return true;
+                case MotionEvent.ACTION_MOVE: {
+                    int index = event.findPointerIndex(activePointerId);
+                    if (index >= 0) {
+                        updateVector(event.getX(index), event.getY(index));
+                    }
+                    return true;
+                }
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    reset();
+                    stopTicking();
+                    return true;
+                default:
+                    return true;
+                }
+            }
+
+            private void updateVector(float x, float y) {
+                float centerX = getWidth() / 2f;
+                float centerY = getHeight() / 2f;
+                float radius = Math.max(1f, Math.min(centerX, centerY) * 0.62f);
+                float dx = (x - centerX) / radius;
+                float dy = (y - centerY) / radius;
+                float length = (float) Math.hypot(dx, dy);
+                if (length > 1f) {
+                    dx /= length;
+                    dy /= length;
+                }
+                vectorX = dx;
+                vectorY = dy;
+                invalidate();
+            }
+        }
+
+        private final class MouseButtonView extends View {
+            private final String label;
+            private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private final Paint ringPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private boolean pressed;
+            private boolean locked;
+
+            MouseButtonView(Context context, String label) {
+                super(context);
+                this.label = label;
+                setContentDescription("L".equals(label) ? "Left click" : "Right click");
+                ringPaint.setStyle(Paint.Style.STROKE);
+                ringPaint.setStrokeWidth(dp(2));
+                textPaint.setColor(Color.WHITE);
+                textPaint.setTextAlign(Paint.Align.CENTER);
+                textPaint.setTypeface(Typeface.DEFAULT_BOLD);
+                textPaint.setTextSize(dp(18));
+            }
+
+            void setState(boolean pressed, boolean locked) {
+                this.pressed = pressed;
+                this.locked = locked;
+                invalidate();
+            }
+
+            @Override
+            protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                float centerX = getWidth() / 2f;
+                float centerY = getHeight() / 2f;
+                float radius = Math.min(centerX, centerY) - dp(2);
+                if (locked) {
+                    fillPaint.setColor(Color.argb(220, 103, 80, 164));
+                } else if (pressed) {
+                    fillPaint.setColor(Color.argb(170, 103, 80, 164));
+                } else {
+                    fillPaint.setColor(Color.argb(80, 0, 0, 0));
+                }
+                ringPaint.setColor(Color.argb(locked ? 255 : 150, 255, 255, 255));
+                canvas.drawCircle(centerX, centerY, radius, fillPaint);
+                canvas.drawCircle(centerX, centerY, radius, ringPaint);
+                float baseline = centerY - (textPaint.descent() + textPaint.ascent()) / 2f;
+                canvas.drawText(locked ? label + "🔒" : label, centerX, baseline, textPaint);
+            }
+
+            @Override
+            public boolean onTouchEvent(MotionEvent event) {
+                boolean left = "L".equals(label);
+                switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    if (left) {
+                        onLeftDown();
+                    } else {
+                        onRightDown();
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    boolean cancelled = event.getActionMasked() == MotionEvent.ACTION_CANCEL;
+                    if (left) {
+                        onLeftUp(cancelled);
+                    } else {
+                        onRightUp();
+                    }
+                    return true;
+                default:
+                    return true;
+                }
             }
         }
     }

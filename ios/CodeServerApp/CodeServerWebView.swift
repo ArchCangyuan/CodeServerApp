@@ -78,7 +78,7 @@ private let keyboardBridgeSource = #"""
   };
 
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 9) {
+  if (existingBridge && existingBridge.version >= 10) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
     existingBridge.installDesktopGestures?.();
@@ -591,8 +591,292 @@ private let keyboardBridgeSource = #"""
   document.addEventListener('keydown', redispatchWithLockedModifiers, true);
   document.addEventListener('keyup', redispatchWithLockedModifiers, true);
 
+  // Real mice use pointerId 1 in Chromium, which would let pages capture a
+  // pointer that never delivers the synthetic moves. Use a private id and
+  // emulate setPointerCapture for it instead.
+  const SYNTHETIC_POINTER_ID = 7331;
+
+  const mouse = {
+    buttons: 0,
+    captureTarget: null,
+    lastFx: 0.5,
+    lastFy: 0.5,
+    lastHit: null,
+    hoverPath: [],
+    downTargets: {},
+    clickCount: 0,
+    lastDownAt: 0,
+    lastDownX: 0,
+    lastDownY: 0
+  };
+
+  const installPointerCapture = (eventWindow) => {
+    const prototype = eventWindow?.Element?.prototype;
+    if (!prototype || prototype.__codeServerAppPointerCapture) return;
+    const nativeSet = prototype.setPointerCapture;
+    const nativeRelease = prototype.releasePointerCapture;
+    const nativeHas = prototype.hasPointerCapture;
+    prototype.setPointerCapture = function (pointerId) {
+      if (pointerId !== SYNTHETIC_POINTER_ID) return nativeSet.call(this, pointerId);
+      mouse.captureTarget = this;
+    };
+    prototype.releasePointerCapture = function (pointerId) {
+      if (pointerId !== SYNTHETIC_POINTER_ID) return nativeRelease.call(this, pointerId);
+      if (mouse.captureTarget === this) mouse.captureTarget = null;
+    };
+    prototype.hasPointerCapture = function (pointerId) {
+      if (pointerId !== SYNTHETIC_POINTER_ID) return nativeHas.call(this, pointerId);
+      return mouse.captureTarget === this;
+    };
+    Object.defineProperty(prototype, '__codeServerAppPointerCapture', { value: true });
+  };
+  installPointerCapture(window);
+
+  const mouseButtonMask = (button) => {
+    if (button === 2) return 2;
+    if (button === 1) return 4;
+    return 1;
+  };
+
+  const viewportPoint = (fx, fy) => {
+    const viewport = window.visualViewport;
+    const width = viewport ? viewport.width : window.innerWidth;
+    const height = viewport ? viewport.height : window.innerHeight;
+    const left = viewport ? viewport.offsetLeft : 0;
+    const top = viewport ? viewport.offsetTop : 0;
+    const clamp = (value) => Math.max(0, Math.min(1, Number(value) || 0));
+    return {
+      x: left + Math.min(width - 1, clamp(fx) * width),
+      y: top + Math.min(height - 1, clamp(fy) * height)
+    };
+  };
+
+  // Resolve the deepest element under the cursor, descending into open
+  // shadow roots (IronRDP) and same-origin iframes.
+  const mouseHitTest = (x, y) => {
+    let root = document;
+    let localX = x;
+    let localY = y;
+    let hit = null;
+    for (let depth = 0; depth < 8; depth += 1) {
+      let element = root.elementFromPoint(localX, localY);
+      for (let level = 0; element?.shadowRoot && level < 16; level += 1) {
+        const inner = element.shadowRoot.elementFromPoint(localX, localY);
+        if (!inner || inner === element) break;
+        element = inner;
+      }
+      if (!element) break;
+      hit = {
+        element,
+        clientX: localX,
+        clientY: localY,
+        view: element.ownerDocument?.defaultView || window
+      };
+      if (element.tagName !== 'IFRAME') break;
+      let childDocument = null;
+      try {
+        childDocument = element.contentDocument;
+      } catch (_) {}
+      if (!childDocument) break;
+      const rect = element.getBoundingClientRect();
+      localX -= rect.left + element.clientLeft;
+      localY -= rect.top + element.clientTop;
+      root = childDocument;
+    }
+    return hit;
+  };
+
+  const composedAncestors = (element) => {
+    const chain = [];
+    for (let node = element; node && chain.length < 128;) {
+      if (node.nodeType === 1) chain.push(node);
+      node = node.parentNode || node.host || null;
+    }
+    return chain;
+  };
+
+  const mouseEventInit = (hit, button, buttons, detail, bubbles) => ({
+    bubbles,
+    cancelable: bubbles,
+    composed: true,
+    view: hit.view,
+    detail,
+    clientX: hit.clientX,
+    clientY: hit.clientY,
+    screenX: hit.clientX,
+    screenY: hit.clientY,
+    button,
+    buttons,
+    ctrlKey: state.control,
+    shiftKey: state.shift,
+    altKey: false,
+    metaKey: false
+  });
+
+  const fireMouse = (hit, element, type, button, buttons, detail = 0, bubbles = true) => {
+    const eventWindow = element.ownerDocument?.defaultView || hit.view;
+    return element.dispatchEvent(new eventWindow.MouseEvent(
+      type,
+      mouseEventInit(hit, button, buttons, detail, bubbles)
+    ));
+  };
+
+  const firePointer = (hit, element, type, button, buttons, bubbles = true) => {
+    const eventWindow = element.ownerDocument?.defaultView || hit.view;
+    if (typeof eventWindow.PointerEvent !== 'function') return true;
+    return element.dispatchEvent(new eventWindow.PointerEvent(type, {
+      ...mouseEventInit(hit, button, buttons, 0, bubbles),
+      pointerId: SYNTHETIC_POINTER_ID,
+      pointerType: 'mouse',
+      isPrimary: true,
+      width: 1,
+      height: 1,
+      pressure: buttons ? 0.5 : 0
+    }));
+  };
+
+  const updateMouseHover = (hit) => {
+    const previousPath = mouse.hoverPath;
+    const nextPath = composedAncestors(hit.element);
+    const previous = previousPath[0] || null;
+    const next = nextPath[0] || null;
+    if (previous === next) return;
+    const leaveHit = mouse.lastHit || hit;
+    if (previous && previous.isConnected) {
+      firePointer(leaveHit, previous, 'pointerout', 0, mouse.buttons);
+      fireMouse(leaveHit, previous, 'mouseout', 0, mouse.buttons);
+      for (const element of previousPath) {
+        if (nextPath.includes(element)) break;
+        firePointer(leaveHit, element, 'pointerleave', 0, mouse.buttons, false);
+        fireMouse(leaveHit, element, 'mouseleave', 0, mouse.buttons, 0, false);
+      }
+    }
+    if (next) {
+      firePointer(hit, next, 'pointerover', 0, mouse.buttons);
+      fireMouse(hit, next, 'mouseover', 0, mouse.buttons);
+      const entering = [];
+      for (const element of nextPath) {
+        if (previousPath.includes(element)) break;
+        entering.push(element);
+      }
+      for (const element of entering.reverse()) {
+        firePointer(hit, element, 'pointerenter', 0, mouse.buttons, false);
+        fireMouse(hit, element, 'mouseenter', 0, mouse.buttons, 0, false);
+      }
+    }
+    mouse.hoverPath = nextPath;
+  };
+
+  const focusFromMouse = (target) => {
+    const selector = 'input, textarea, select, button, a[href], [tabindex], '
+      + '[contenteditable=""], [contenteditable="true"]';
+    for (const element of composedAncestors(target)) {
+      if (!element.matches?.(selector) || element.disabled) continue;
+      try {
+        element.focus({ preventScroll: true });
+      } catch (_) {}
+      return;
+    }
+  };
+
+  const commonMouseTarget = (first, second) => {
+    if (!first || !second || !first.isConnected) return null;
+    for (const element of composedAncestors(first)) {
+      if (element === second || element.contains(second)) return element;
+    }
+    return null;
+  };
+
+  const mouseAction = (action, fx, fy, button) => {
+    if (action === 'release') {
+      for (const held of [0, 2, 1]) {
+        if (mouse.buttons & mouseButtonMask(held)) {
+          mouseAction('up', mouse.lastFx, mouse.lastFy, held);
+        }
+      }
+      return true;
+    }
+
+    mouse.lastFx = fx;
+    mouse.lastFy = fy;
+    const point = viewportPoint(fx, fy);
+    const hit = mouseHitTest(point.x, point.y)
+      || (mouse.lastHit?.element?.isConnected ? mouse.lastHit : null);
+    if (!hit) {
+      if (action === 'up') mouse.buttons &= ~mouseButtonMask(button);
+      return false;
+    }
+    installPointerCapture(hit.view);
+    const captured = mouse.captureTarget?.isConnected ? mouse.captureTarget : null;
+    if (!captured) updateMouseHover(hit);
+    mouse.lastHit = hit;
+    const target = captured || hit.element;
+
+    if (action === 'move') {
+      firePointer(hit, target, 'pointermove', -1, mouse.buttons);
+      fireMouse(hit, target, 'mousemove', 0, mouse.buttons);
+      return true;
+    }
+
+    if (action === 'down') {
+      if (button === 0) {
+        const now = performance.now();
+        const nearPrevious = Math.hypot(
+          point.x - mouse.lastDownX,
+          point.y - mouse.lastDownY
+        ) < 8;
+        mouse.clickCount = nearPrevious && now - mouse.lastDownAt < 500
+          ? Math.min(mouse.clickCount + 1, 3)
+          : 1;
+        mouse.lastDownAt = now;
+        mouse.lastDownX = point.x;
+        mouse.lastDownY = point.y;
+      }
+      mouse.captureTarget = null;
+      mouse.buttons |= mouseButtonMask(button);
+      mouse.downTargets[button] = target;
+      rememberTarget(target);
+      const detail = button === 0 ? mouse.clickCount : 1;
+      const pointerAllowed = firePointer(hit, target, 'pointerdown', button, mouse.buttons);
+      const mouseAllowed = fireMouse(
+        hit,
+        target,
+        'mousedown',
+        button,
+        mouse.buttons,
+        detail
+      );
+      if (button === 0 && pointerAllowed && mouseAllowed) focusFromMouse(target);
+      return true;
+    }
+
+    if (action === 'up') {
+      if (!(mouse.buttons & mouseButtonMask(button))) return false;
+      mouse.buttons &= ~mouseButtonMask(button);
+      const detail = button === 0 ? mouse.clickCount : 1;
+      firePointer(hit, target, 'pointerup', button, mouse.buttons);
+      fireMouse(hit, target, 'mouseup', button, mouse.buttons, detail);
+      if (!mouse.buttons) mouse.captureTarget = null;
+      const downTarget = mouse.downTargets[button];
+      delete mouse.downTargets[button];
+      if (button === 0) {
+        const clickTarget = commonMouseTarget(downTarget, target);
+        if (clickTarget) {
+          fireMouse(hit, clickTarget, 'click', 0, mouse.buttons, detail);
+          if (detail === 2) {
+            fireMouse(hit, clickTarget, 'dblclick', 0, mouse.buttons, 2);
+          }
+        }
+      } else if (button === 2) {
+        fireMouse(hit, target, 'contextmenu', 2, mouse.buttons, 1);
+      }
+      return true;
+    }
+    return false;
+  };
+
   const bridge = {
-    version: 9,
+    version: 10,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();
@@ -615,6 +899,9 @@ private let keyboardBridgeSource = #"""
     },
     sendShortcut(key, code, keyCode, control, shift) {
       return dispatchShortcut(key, code, keyCode, control, shift);
+    },
+    mouse(action, fx, fy, button) {
+      return mouseAction(String(action), Number(fx), Number(fy), Number(button) || 0);
     },
     setModifiers(control, shift) {
       const nextControl = Boolean(control);
@@ -693,6 +980,9 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         view.onEnter = { [weak self] in
             self?.send(.enter)
         }
+        view.onMouse = { [weak self] action, point, button in
+            self?.sendMouse(action, at: point, button: button)
+        }
         for session in sessions.values {
             view.install(session.webView)
         }
@@ -727,6 +1017,8 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         if let activeSessionKey,
            activeSessionKey != target.key,
            let current = sessions[activeSessionKey] {
+            // Release held mouse buttons on the page that is being left.
+            hostView.releaseMouseButtons()
             current.lastInactiveAt = now
             // Keep the inactive WKWebView visible behind the active one so WebKit
             // does not suspend its RDP/WebSocket session. It cannot receive input.
@@ -837,6 +1129,23 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         guard let webView = activeSession?.webView else { return }
         webView.evaluateJavaScript(
             "window.__codeServerAppKeyboard?.sendShortcut('c', 'KeyC', 67, true, false) ?? false;"
+        )
+    }
+
+    func sendMouse(_ action: MouseAction, at point: CGPoint, button: Int) {
+        guard let webView = activeSession?.webView else { return }
+        let x = min(max(Double(point.x), 0), 1)
+        let y = min(max(Double(point.y), 0), 1)
+        webView.evaluateJavaScript(
+            "window.__codeServerAppKeyboard?.mouse?.('\(action.rawValue)', \(x), \(y), \(button)) ?? false;"
+        )
+    }
+
+    func announceMouseMode(_ enabled: Bool) {
+        showStatus(
+            enabled
+                ? "Mouse mode: joystick moves, L/R click, hold L to lock drag"
+                : "Mouse mode off"
         )
     }
 
@@ -1086,6 +1395,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
 struct CodeServerWebView: UIViewRepresentable {
     let address: String
     let store: CodeServerWebViewStore
+    let mouseModeEnabled: Bool
 
     func makeUIView(context: Context) -> WebViewSessionContainerView {
         let view = WebViewSessionContainerView()
@@ -1096,6 +1406,7 @@ struct CodeServerWebView: UIViewRepresentable {
     func updateUIView(_ view: WebViewSessionContainerView, context: Context) {
         store.attach(to: view)
         store.activate(address: address)
+        view.setMouseModeEnabled(mouseModeEnabled)
     }
 }
 
@@ -1109,12 +1420,17 @@ final class WebViewSessionContainerView: UIView {
     var onEnter: (() -> Void)? {
         didSet { keyboardCapture.onEnter = onEnter }
     }
+    var onMouse: ((MouseAction, CGPoint, Int) -> Void)? {
+        didSet { mouseOverlay.onMouse = onMouse }
+    }
 
     private let keyboardCapture = KeyboardCaptureTextView()
+    private let mouseOverlay = MouseOverlayView()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .systemBackground
+        addSubview(mouseOverlay)
         addSubview(keyboardCapture)
     }
 
@@ -1127,12 +1443,22 @@ final class WebViewSessionContainerView: UIView {
             addSubview(webView)
         }
         webView.frame = bounds
+        bringSubviewToFront(mouseOverlay)
         bringSubviewToFront(keyboardCapture)
     }
 
     func bringWebViewToFront(_ webView: WKWebView) {
         bringSubviewToFront(webView)
+        bringSubviewToFront(mouseOverlay)
         bringSubviewToFront(keyboardCapture)
+    }
+
+    func setMouseModeEnabled(_ enabled: Bool) {
+        mouseOverlay.setEnabled(enabled)
+    }
+
+    func releaseMouseButtons() {
+        mouseOverlay.releaseButtons()
     }
 
     func activateKeyboardCapture() {
