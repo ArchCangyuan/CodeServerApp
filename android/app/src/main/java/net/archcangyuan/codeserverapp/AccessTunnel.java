@@ -64,7 +64,12 @@ final class AccessTunnel implements AutoCloseable {
             ServerSocket server = new ServerSocket();
             try {
                 server.setReuseAddress(true);
-                server.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), preferredPort + offset));
+                // Bind IPv4 loopback explicitly: on Android getLoopbackAddress()
+                // is ::1, which clients connecting to 127.0.0.1 cannot reach.
+                server.bind(new InetSocketAddress(
+                    InetAddress.getByAddress(new byte[] { 127, 0, 0, 1 }),
+                    preferredPort + offset
+                ));
                 AccessTunnel tunnel = new AccessTunnel(server, connector, listener);
                 tunnel.startThreads();
                 return tunnel;
