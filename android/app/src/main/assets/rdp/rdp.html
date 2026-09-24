@@ -36,6 +36,13 @@
   #status[hidden] {
     display: none;
   }
+  #status small {
+    display: block;
+    margin-top: 6px;
+    color: #666;
+    font-size: 12px;
+    word-break: break-word;
+  }
 </style>
 </head>
 <body>
@@ -45,10 +52,26 @@
   const sessionToken = decodeURIComponent(location.hash.slice(1));
   const statusElement = document.getElementById('status');
 
-  const showStatus = (text) => {
+  const showStatus = (text, detail = '') => {
     statusElement.textContent = text;
+    if (detail) {
+      const small = document.createElement('small');
+      small.textContent = detail;
+      statusElement.appendChild(small);
+    }
     statusElement.hidden = !text;
   };
+  // Where the gateway got to on the latest attempt: {stage, error}.
+  const gatewayStatus = () => {
+    try {
+      return JSON.parse(nativeBridge ? nativeBridge.gatewayStatus(sessionToken) : '{}');
+    } catch (_) {
+      return {};
+    }
+  };
+  const shortReason = (text) => String(text || '')
+    .replace(/\[[^\]]*@ [^\]]*\]\s*/g, '')
+    .slice(0, 160);
   const notifyNative = (event, detail = '') => {
     try {
       nativeBridge?.onSessionEvent(sessionToken, event, String(detail));
@@ -122,21 +145,22 @@
   };
 
   const scheduleReconnect = (reason) => {
+    console.warn('rdp disconnected:', reason);
     connected = false;
     attempts += 1;
     if (attempts > 5) {
-      showStatus('Disconnected. Tap Reload to try again.');
-      notifyNative('failed', reason);
+      showStatus('Disconnected. Tap Reload to try again.', shortReason(reason));
+      notifyNative('failed', shortReason(reason));
       return;
     }
     const delay = Math.min(10000, 1000 * attempts);
-    showStatus(`Reconnecting…`);
+    showStatus(`Reconnecting… (${attempts}/5)`, shortReason(reason));
     notifyNative('reconnecting', reason);
     setTimeout(connect, delay);
   };
 
   async function connect() {
-    showStatus(attempts ? 'Reconnecting…' : 'Connecting…');
+    if (!attempts) showStatus('Connecting…');
     const size = desktopSize();
     const builder = ui.configBuilder()
       .withUsername(config.username || '')
@@ -162,7 +186,15 @@
         notifyNative('login_required');
         return;
       }
-      scheduleReconnect(`${kind}: ${detail}`.slice(0, 300));
+      const gateway = gatewayStatus();
+      if (gateway.stage === 'relay' && kind === 'General') {
+        // TLS to the PC worked but the connection ended during CredSSP/NLA:
+        // almost always a rejected sign-in. Retrying could lock the account.
+        showStatus('Windows sign-in failed.', shortReason(detail));
+        notifyNative('sign_in_failed', shortReason(detail));
+        return;
+      }
+      scheduleReconnect(gateway.error || `${kind}: ${detail}`);
       return;
     }
     connected = true;

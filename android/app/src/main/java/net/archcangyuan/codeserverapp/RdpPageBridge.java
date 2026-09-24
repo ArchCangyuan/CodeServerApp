@@ -50,16 +50,16 @@ final class RdpPageBridge {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
     private final Listener listener;
-    private volatile String proxyAddress;
+    private volatile RdpGateway gateway;
 
     RdpPageBridge(Activity activity, Listener listener) {
         this.activity = activity;
         this.listener = listener;
     }
 
-    void register(String gatewayToken, Session session, String proxyAddress) {
+    void register(String gatewayToken, Session session, RdpGateway gateway) {
         sessions.put(gatewayToken, session);
-        this.proxyAddress = proxyAddress;
+        this.gateway = gateway;
     }
 
     @JavascriptInterface
@@ -74,11 +74,18 @@ final class RdpPageBridge {
             config.put("domain", session.domain);
             config.put("password", session.password);
             config.put("destination", session.host + ":3389");
-            config.put("proxyAddress", proxyAddress);
+            config.put("proxyAddress", gateway == null ? "" : gateway.proxyAddress());
         } catch (Exception ignored) {
             // Fields are plain strings.
         }
         return config.toString();
+    }
+
+    /** The gateway's view of the latest connection attempt; see {@link RdpGateway#status}. */
+    @JavascriptInterface
+    public String gatewayStatus(String gatewayToken) {
+        RdpGateway current = gateway;
+        return current == null || !sessions.containsKey(gatewayToken) ? "{}" : current.status(gatewayToken);
     }
 
     @JavascriptInterface

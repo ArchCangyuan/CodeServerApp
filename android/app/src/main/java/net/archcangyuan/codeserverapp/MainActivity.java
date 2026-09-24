@@ -2622,7 +2622,7 @@ public final class MainActivity extends Activity {
             rdpPageBridge.register(
                 gatewayToken,
                 new RdpPageBridge.Session(normalized, host, user, domain, password),
-                gateway.proxyAddress()
+                gateway
             );
             session.webView.loadUrl(gateway.pageUrl(gatewayToken));
         }
@@ -2640,6 +2640,14 @@ public final class MainActivity extends Activity {
         case "credentials_rejected":
             AccessTokenStore.clearPassword(this, session.host);
             rdpPanel.show(session.address, "Windows rejected the user name or password.");
+            break;
+        case "sign_in_failed":
+            rdpPanel.show(
+                session.address,
+                "The remote PC ended the connection during Windows sign-in. Check the user name "
+                    + "and the account password (not the PIN); for a Microsoft account use its "
+                    + "email address." + (detail.isEmpty() ? "" : "\n\n" + detail)
+            );
             break;
         case "login_required":
             rdpPanel.show(session.address, "Cloudflare sign-in expired. Sign in again to reconnect.");

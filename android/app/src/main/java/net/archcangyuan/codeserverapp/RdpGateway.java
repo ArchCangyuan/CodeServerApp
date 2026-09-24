@@ -61,6 +61,8 @@ final class RdpGateway {
     private final Environment environment;
     private final ServerSocket server;
     private final Map<String, String> sessionHosts = new ConcurrentHashMap<>();
+    private final Map<String, String> sessionStages = new ConcurrentHashMap<>();
+    private final Map<String, String> sessionErrors = new ConcurrentHashMap<>();
     private final SecureRandom random = new SecureRandom();
     private volatile Listener listener;
 
@@ -126,6 +128,40 @@ final class RdpGateway {
         String token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
         sessionHosts.put(token, host.toLowerCase(Locale.US));
         return token;
+    }
+
+    /**
+     * Describes the latest connection attempt of a session as JSON: the stage
+     * it reached ({@code tunnel}, {@code negotiate}, {@code tls}, {@code relay})
+     * and the gateway-side error, if any, so the page can explain failures.
+     */
+    String status(String sessionToken) {
+        org.json.JSONObject status = new org.json.JSONObject();
+        try {
+            status.put("stage", sessionStages.getOrDefault(sessionToken, ""));
+            status.put("error", sessionErrors.getOrDefault(sessionToken, ""));
+        } catch (org.json.JSONException ignored) {
+            // Fields are plain strings.
+        }
+        return status.toString();
+    }
+
+    private void setStage(String sessionToken, String stage) {
+        sessionStages.put(sessionToken, stage);
+    }
+
+    private void setError(String sessionToken, String error) {
+        if (error == null) {
+            sessionErrors.remove(sessionToken);
+        } else {
+            sessionErrors.put(sessionToken, error);
+        }
+    }
+
+    private static String describe(Exception exception) {
+        String message = exception.getMessage();
+        String name = exception.getClass().getSimpleName();
+        return message == null || message.isEmpty() ? name : name + ": " + message;
     }
 
     String pageUrl(String sessionToken) {
@@ -228,6 +264,7 @@ final class RdpGateway {
         Socket[] pair = null;
         SSLSocket tls = null;
         String host = null;
+        String sessionToken = null;
         try {
             RdCleanPath.Request request = readRequest(client);
             host = sessionHosts.get(request.proxyAuth);
@@ -235,8 +272,12 @@ final class RdpGateway {
                 sendPdu(client, RdCleanPath.encodeGeneralError(403));
                 return;
             }
+            sessionToken = request.proxyAuth;
+            setStage(sessionToken, "tunnel");
+            setError(sessionToken, null);
             String token = environment.loadToken(host);
             if (token == null) {
+                setError(sessionToken, "Cloudflare sign-in required");
                 notifyLoginRequired(host);
                 sendPdu(client, RdCleanPath.encodeGeneralError(401));
                 return;
@@ -244,24 +285,29 @@ final class RdpGateway {
             try {
                 tunnel = environment.openTunnel(host, token);
             } catch (AccessWebSocket.LoginRequiredException exception) {
+                setError(sessionToken, "Cloudflare sign-in required");
                 environment.clearToken(host);
                 notifyLoginRequired(host);
                 sendPdu(client, RdCleanPath.encodeGeneralError(401));
                 return;
             } catch (IOException exception) {
+                setError(sessionToken, "Cloudflare tunnel failed: " + describe(exception));
                 sendPdu(client, RdCleanPath.encodeGeneralError(502));
                 return;
             }
 
+            setStage(sessionToken, "negotiate");
             TunnelInputStream tunnelInput = new TunnelInputStream(tunnel);
             tunnel.sendBinary(request.x224ConnectionRequest, 0, request.x224ConnectionRequest.length);
             byte[] x224Response = readTpkt(tunnelInput);
             if (x224Response.length >= 12 && (x224Response[11] & 0xFF) == 0x03) {
                 // RDP_NEG_FAILURE: let the client explain (e.g. CredSSP required).
+                setError(sessionToken, "The remote PC refused the security protocol");
                 sendPdu(client, RdCleanPath.encodeNegotiationError(x224Response));
                 return;
             }
 
+            setStage(sessionToken, "tls");
             pair = socketPair();
             pump(tunnelInput, pair[1], tunnel);
             tls = (SSLSocket) trustAllContext().getSocketFactory()
@@ -273,8 +319,12 @@ final class RdpGateway {
             }
             sendPdu(client, RdCleanPath.encodeResponse(host + ":" + TLS_PORT, x224Response, chain));
 
+            setStage(sessionToken, "relay");
             relay(client, tls);
         } catch (Exception exception) {
+            if (sessionToken != null && !"relay".equals(sessionStages.get(sessionToken))) {
+                setError(sessionToken, describe(exception));
+            }
             try {
                 sendPdu(client, RdCleanPath.encodeGeneralError(null));
             } catch (IOException ignored) {
