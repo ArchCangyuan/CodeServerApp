@@ -16,7 +16,8 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - The address bar hides itself 5 seconds after each page load (not while the address is being edited);
   pull down from the top edge of the page to show it for another 5 seconds
 - Desktop-site mode and an IME-aware supplemental key bar on both platforms
-- Persistent virtual-viewport zoom controls that resize the layout in place, without reloading,
+- A translucent zoom slider under the address bar (39%–459% in 27 steps) that appears and hides
+  with the bar. The virtual-viewport zoom resizes the layout in place, without reloading,
   by pinning the page scale to fit the new width. They fall back to one reload only when the
   web view still does not fit
 - A force-keyboard button backed by native Android and iOS input capture, keeping

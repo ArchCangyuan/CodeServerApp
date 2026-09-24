@@ -3,8 +3,8 @@ import UIKit
 import WebKit
 
 private let desktopViewportWidth = 1280
-private let minimumLayoutZoomSteps = -6
-private let maximumLayoutZoomSteps = 12
+private let minimumLayoutZoomSteps = -10
+private let maximumLayoutZoomSteps = 16
 private let layoutZoomFactor = 1.1
 private let projectSessionTTL: TimeInterval = 30 * 60
 private let maximumHotProjectSessions = 10
@@ -32,7 +32,7 @@ private let keyboardBridgeSource = #"""
   // page still does not fit, allowReload lets it fall back to one reload.
   const setViewportWidth = (requestedWidth, fitWidth = 0, allowReload = false) => {
     const numericWidth = Number(requestedWidth) || 1280;
-    const width = Math.max(400, Math.min(2400, Math.round(numericWidth)));
+    const width = Math.max(200, Math.min(4000, Math.round(numericWidth)));
     let viewport = document.querySelector('meta[name="viewport"]');
     if (!viewport) {
       viewport = document.createElement('meta');
@@ -1506,17 +1506,21 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         activeSession?.webView.reload()
     }
 
-    func changeZoom(by direction: Int) {
-        guard direction != 0 else { return }
-        let nextSteps = min(
-            max(layoutZoomSteps + direction, minimumLayoutZoomSteps),
-            maximumLayoutZoomSteps
-        )
+    nonisolated static let zoomStepRange = minimumLayoutZoomSteps...maximumLayoutZoomSteps
+
+    nonisolated static func zoomPercent(forSteps steps: Int) -> Int {
+        Int(round(pow(layoutZoomFactor, Double(steps)) * 100))
+    }
+
+    var zoomSteps: Int { layoutZoomSteps }
+
+    func setZoom(steps: Int) {
+        let nextSteps = min(max(steps, minimumLayoutZoomSteps), maximumLayoutZoomSteps)
         guard nextSteps != layoutZoomSteps else { return }
 
         layoutZoomSteps = nextSteps
         UserDefaults.standard.set(layoutZoomSteps, forKey: layoutZoomStepsKey)
-        zoomPercent = Int(round(pow(layoutZoomFactor, Double(layoutZoomSteps)) * 100))
+        zoomPercent = Self.zoomPercent(forSteps: layoutZoomSteps)
         for session in sessions.values {
             installUserScripts(in: session.webView.configuration.userContentController)
         }
@@ -1526,7 +1530,6 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
                 allowFallbackReload: activeSession.webView.url != nil
             )
         }
-        showStatus("UI zoom \(zoomPercent)%")
     }
 
     func isSessionHot(_ address: String) -> Bool {
