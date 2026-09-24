@@ -13,6 +13,8 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
   on-screen keyboard, a hardware keyboard, or the supplemental keys
 - Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
 - Safe-area handling with an optional immersive fullscreen toggle; pull down from the top edge to exit fullscreen
+- The address bar hides itself 5 seconds after each page load (not while the address is being edited);
+  pull down from the top edge of the page to show it for another 5 seconds
 - Desktop-site mode and an IME-aware supplemental key bar on both platforms
 - Persistent virtual-viewport zoom controls that resize the layout in place, without reloading,
   by pinning the page scale to fit the new width. They fall back to one reload only when the
