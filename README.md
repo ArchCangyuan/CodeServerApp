@@ -21,13 +21,13 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
   renderer and sends text, Backspace, Delete, and Enter through its key handler
 - Desktop-style code-server gestures: hold and drag to select text, or hold and
   release to open the right-click context menu for copy and paste
-- Optional mouse mode (cursor button in the key bar): a semi-transparent joystick
-  moves an on-screen cursor, and floating L/R buttons send left and right clicks.
-  Controls are multi-touch, so hold L while steering the joystick to drag or select.
-  Long-press L without moving to lock it down for one-finger drags, then tap L to
-  release. Clicks carry the locked `Ctrl`/`Shift` state, so Shift lock + L click
-  extends the editor selection. Double clicks select words. Touches outside the
-  controls still reach the page, so scrolling works as before
+- Optional mouse mode (cursor button in the key bar): the finger is the cursor and a
+  quick tap is a left click. Floating L/R buttons press the mouse buttons at the cursor,
+  so hold L while dragging a finger to select. Long-press L without moving to lock it
+  for one-finger drags, then tap L to release. Two fingers scroll. Clicks carry the
+  locked `Ctrl`/`Shift` state and run inside real touch events, so clipboard copies
+  and link opening work. The system keyboard stays hidden unless `KB` is pressed
+- Links opened by the page (`window.open`) open in the system browser
 - Saved project profiles with bold titles and up to ten hot WebView sessions retained for 30 minutes on both platforms
 - Optional session keep-alive setting. Android uses a foreground service and
   persistent notification, partial wake lock, native WebView pulses, and an optional
