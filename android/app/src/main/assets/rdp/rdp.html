@@ -17,6 +17,7 @@
     display: block;
     width: 100%;
     height: 100%;
+    overflow: hidden;
   }
   #status {
     position: fixed;
@@ -47,6 +48,10 @@
 </head>
 <body>
 <div id="status">Connecting…</div>
+<script>
+  // Tells the app's page bridge to leave the viewport alone (see rdp zoom).
+  window.__yourWorkspaceRdpPage = true;
+</script>
 <script type="module">
   const nativeBridge = window.YourWorkspaceRdp || null;
   const sessionToken = decodeURIComponent(location.hash.slice(1));
@@ -110,48 +115,111 @@
   await import('./iron-remote-desktop.js');
   await init('WARN');
 
+  // The page stays at scale 1, so CSS pixels map to the WebView at all
+  // times. The app's zoom sets the desktop's pixel density instead (see
+  // desktopScale); a changing page scale would make the size unreliable.
+  const viewportMeta = document.querySelector('meta[name="viewport"]');
+  const FIXED_VIEWPORT =
+    'width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no';
+  const lockViewport = () => {
+    if (viewportMeta.getAttribute('content') !== FIXED_VIEWPORT) {
+      viewportMeta.setAttribute('content', FIXED_VIEWPORT);
+    }
+  };
+  lockViewport();
+  new MutationObserver(lockViewport).observe(viewportMeta, { attributes: true });
+
   // The space the desktop has on screen, in CSS pixels.
   const availableSize = () => ({
-    width: Math.max(480, document.documentElement.clientWidth),
-    height: Math.max(240, document.documentElement.clientHeight)
+    width: Math.max(1, document.documentElement.clientWidth),
+    height: Math.max(1, document.documentElement.clientHeight)
   });
+  // Desktop pixels per CSS pixel. The app's zoom gives a layout width for
+  // the screen's long side (1280 at 100%), so rotating keeps the density.
+  const desktopScale = () => {
+    const zoomWidth = Number(window.__codeServerAppViewportWidth) || 1280;
+    return zoomWidth / Math.max(screen.width, screen.height, 1);
+  };
   // Largest size the server has shown it accepts; Windows caps the desktop
   // (e.g. 4096 x 2048 without the graphics pipeline) and a capped dimension
   // would leave black bars. Learned from what the server actually applies.
   const serverLimit = { width: Infinity, height: Infinity };
-  // The desktop size to request: the available space itself, or the largest
-  // size with the same aspect ratio within the server's limit.
+  // The desktop size to request: the available space at the zoom's density,
+  // kept within the server's limit with the same aspect ratio.
   const desktopSize = (available = availableSize()) => {
-    const factor = Math.min(
-      1,
-      serverLimit.width / available.width,
-      serverLimit.height / available.height
-    );
+    let width = available.width * desktopScale();
+    let height = available.height * desktopScale();
+    const grow = Math.max(1, 200 / width, 200 / height);
+    width *= grow;
+    height *= grow;
+    const shrink = Math.min(1, serverLimit.width / width, serverLimit.height / height);
     return {
-      width: Math.floor(available.width * factor / 2) * 2,
-      height: Math.floor(available.height * factor)
+      width: Math.max(200, Math.floor(width * shrink / 2) * 2),
+      height: Math.max(200, Math.floor(height * shrink))
     };
   };
 
   const element = document.createElement('iron-remote-desktop');
   element.setAttribute('scale', 'fit');
-  element.setAttribute('flexcenter', 'true');
+  element.setAttribute('flexcenter', 'false');
   element.module = Backend;
 
   let ui = null;
   let connected = false;
   let attempts = 0;
   let connectedSize = null;
-  let fittedFor = null;
   let checkTimer = 0;
 
   const rendererCanvas = () => element.shadowRoot?.querySelector('canvas') || null;
 
+  // The page scales the desktop itself: it fills the available area once the
+  // server applies a size, and keeps its scale (anchored top left) while a
+  // resize is pending instead of shrinking the old frame to fit.
+  const fitDisplay = () => {
+    const canvas = rendererCanvas();
+    if (!canvas || !canvas.width || !canvas.height) return;
+    const available = availableSize();
+    const scale = Math.max(canvas.width / available.width, canvas.height / available.height);
+    element.style.setProperty('--rdp-width', `${canvas.width / scale}px`);
+    element.style.setProperty('--rdp-height', `${canvas.height / scale}px`);
+  };
+  const takeOverScaling = () => {
+    const root = element.shadowRoot;
+    const canvas = rendererCanvas();
+    if (!root || !canvas || root.getElementById('your-workspace-scaling')) return;
+    const style = document.createElement('style');
+    style.id = 'your-workspace-scaling';
+    style.textContent = `.screen-viewer {
+      width: var(--rdp-width, 100%) !important;
+      height: var(--rdp-height, 100%) !important;
+      min-width: 0 !important; min-height: 0 !important;
+      max-width: none !important; max-height: none !important;
+    }`;
+    root.appendChild(style);
+    new MutationObserver(fitDisplay).observe(canvas, { attributes: true, attributeFilter: ['width', 'height'] });
+    fitDisplay();
+  };
+
+  const requestSize = (size) => {
+    connectedSize = size;
+    try {
+      ui.resize(size.width, size.height);
+    } catch (_) {
+      fitDisplay();
+      return;
+    }
+    checkAppliedSize(size);
+  };
+
   // After the server applies a size, learn its limit when it shrank a
-  // dimension, and ask again for a size with the right aspect ratio.
-  const checkAppliedSize = (requested, retries = 2) => {
+  // dimension, and ask again for a size with the right aspect ratio. When
+  // the server does not follow, fit what it sends.
+  const checkAppliedSize = (requested, retries = 2, atConnect = false) => {
     window.clearTimeout(checkTimer);
     const started = Date.now();
+    // At connect the canvas already has the server's choice.
+    const initial = atConnect ? null : rendererCanvas();
+    const before = initial ? { width: initial.width, height: initial.height } : null;
     const poll = () => {
       if (!connected || connectedSize !== requested) return;
       const canvas = rendererCanvas();
@@ -159,12 +227,18 @@
       const matches = applied
         && Math.abs(applied.width - requested.width) <= 2
         && Math.abs(applied.height - requested.height) <= 2;
-      if (matches) return;
+      if (matches) {
+        fitDisplay();
+        return;
+      }
       if (Date.now() - started < 4000) {
         checkTimer = window.setTimeout(poll, 250);
         return;
       }
+      fitDisplay();
       if (!applied || retries <= 0) return;
+      // A server that ignored the request tells nothing about its limit.
+      if (before && applied.width === before.width && applied.height === before.height) return;
       let learned = false;
       if (applied.width < requested.width - 2 && applied.width < serverLimit.width) {
         serverLimit.width = applied.width;
@@ -175,7 +249,7 @@
         learned = true;
       }
       if (!learned) return;
-      const size = desktopSize(fittedFor);
+      const size = desktopSize();
       if (Math.abs(size.width - applied.width) < 4 && Math.abs(size.height - applied.height) < 4) {
         return;
       }
@@ -225,8 +299,7 @@
 
   async function connect() {
     if (!attempts) showStatus('Connecting…');
-    const available = availableSize();
-    const size = desktopSize(available);
+    const size = desktopSize();
     const builder = ui.configBuilder()
       .withUsername(config.username || '')
       .withPassword(config.password || '')
@@ -265,11 +338,11 @@
     connected = true;
     attempts = 0;
     connectedSize = size;
-    fittedFor = available;
     ui.setVisibility(true);
+    takeOverScaling();
+    checkAppliedSize(size, 2, true);
     showStatus('');
     notifyNative('connected');
-    checkAppliedSize(size);
     try {
       const termination = await session.run();
       scheduleReconnect(termination.reason());
@@ -278,28 +351,24 @@
     }
   }
 
-  // Follow every change of the available area (zoom, rotation, keyboard,
-  // address bar) with a dynamic resize instead of a reconnect. The desktop
-  // is scaled to fit meanwhile.
+  // Follow every change of the available area (rotation, keyboard, address
+  // bar) and of the app's zoom with a dynamic resize instead of a reconnect.
   let resizeTimer = 0;
-  window.addEventListener('resize', () => {
+  const onAreaChanged = () => {
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
-      if (!connected || !ui || !connectedSize || !fittedFor) return;
-      const available = availableSize();
-      if (Math.abs(available.width - fittedFor.width) < 16
-          && Math.abs(available.height - fittedFor.height) < 16) return;
-      fittedFor = available;
-      const size = desktopSize(available);
-      connectedSize = size;
-      try {
-        ui.resize(size.width, size.height);
-      } catch (_) {
+      if (!connected || !ui || !connectedSize) return;
+      const size = desktopSize();
+      if (Math.abs(size.width - connectedSize.width) < 8
+          && Math.abs(size.height - connectedSize.height) < 8) {
+        fitDisplay();
         return;
       }
-      checkAppliedSize(size);
-    }, 400);
-  });
+      requestSize(size);
+    }, 150);
+  };
+  window.addEventListener('resize', onAreaChanged);
+  window.addEventListener('yourworkspace-rdp-zoom', onAreaChanged);
 
   element.addEventListener('ready', (event) => {
     ui = event.detail.irgUserInteraction;

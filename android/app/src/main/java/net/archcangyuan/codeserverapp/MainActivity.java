@@ -112,6 +112,13 @@ public final class MainActivity extends Activity {
           const setViewportWidth = (requestedWidth, fitWidth = 0, allowReload = false) => {
             const numericWidth = Number(requestedWidth) || 1280;
             const width = Math.max(200, Math.min(4000, Math.round(numericWidth)));
+            // The built-in remote desktop page keeps its viewport at scale 1 and
+            // turns the zoom into the remote desktop's pixel density itself.
+            if (window.__yourWorkspaceRdpPage) {
+              window.__codeServerAppViewportWidth = width;
+              window.dispatchEvent(new Event('yourworkspace-rdp-zoom'));
+              return width;
+            }
             let viewport = document.querySelector('meta[name="viewport"]');
             if (!viewport) {
               viewport = document.createElement('meta');
