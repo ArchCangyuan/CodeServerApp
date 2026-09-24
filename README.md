@@ -34,6 +34,12 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
   locked `Ctrl`/`Shift` state and run inside real touch events, so clipboard copies
   and link opening work. The system keyboard stays hidden unless `KB` is pressed
 - Links opened by the page (`window.open`) open in the system browser
+- Remote desktop through Cloudflare Access (Android): enter or save an `rdp://host` address (for
+  example `rdp://home.example.com`, optionally `rdp://user@host`) to open a connection panel.
+  Sign in to Cloudflare Access in an embedded page (e.g. with an emailed code). The app keeps the
+  token encrypted, shows when it expires, and runs a local tunnel on `127.0.0.1:3390` (next free
+  port if taken), like `cloudflared access rdp`. Connect then opens your remote desktop client
+  (e.g. Microsoft Windows App) on that address
 - Saved project profiles with bold titles and up to ten hot WebView sessions retained for 30 minutes on both platforms
 - Optional session keep-alive setting. Android uses a foreground service and
   persistent notification, partial wake lock, native WebView pulses, and an optional

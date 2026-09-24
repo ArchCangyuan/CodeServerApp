@@ -37,6 +37,14 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Maintains user-enabled remote workspace connections" />
         </service>
+        <service
+            android:name=".RdpTunnelService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local tunnel to a user-configured remote desktop through Cloudflare Access" />
+        </service>
         <receiver
             android:name=".KeepAliveRestartReceiver"
             android:exported="true">

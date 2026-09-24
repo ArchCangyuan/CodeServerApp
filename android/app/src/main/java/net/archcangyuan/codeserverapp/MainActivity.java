@@ -1677,6 +1677,7 @@ public final class MainActivity extends Activity {
     private LinearLayout addressBar;
     private EditText addressField;
     private FrameLayout webContainer;
+    private RdpConnectionPanel rdpPanel;
     private LinearLayout zoomOverlay;
     private TextView zoomPercentLabel;
     private boolean zoomSliderTracking;
@@ -1747,13 +1748,34 @@ public final class MainActivity extends Activity {
         configureSystemUi();
         applyKeepAliveMode();
 
+        rdpPanel = new RdpConnectionPanel(this);
         String savedAddress = preferences.getString(ADDRESS_KEY, "");
         addressField.setText(savedAddress);
-        if (savedAddress == null || savedAddress.trim().isEmpty()) {
+        if (savedAddress == null
+            || savedAddress.trim().isEmpty()
+            || RdpConnectionPanel.isRdpAddress(savedAddress)) {
             showBlankWebView();
             addressField.requestFocus();
         } else {
             switchToProjectUrl(savedAddress);
+        }
+        openRdpPanelFromIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        openRdpPanelFromIntent(intent);
+    }
+
+    /** The tunnel notification reopens the connection panel for its host. */
+    private void openRdpPanelFromIntent(Intent intent) {
+        String host = intent == null
+            ? null
+            : intent.getStringExtra(RdpTunnelService.EXTRA_OPEN_RDP_HOST);
+        if (host != null && !host.isEmpty()) {
+            intent.removeExtra(RdpTunnelService.EXTRA_OPEN_RDP_HOST);
+            rdpPanel.show("rdp://" + host);
         }
     }
 
@@ -1781,7 +1803,7 @@ public final class MainActivity extends Activity {
         addressField = new EditText(this);
         addressField.setSingleLine(true);
         addressField.setTextSize(14);
-        addressField.setHint("http://192.168.1.10:8080");
+        addressField.setHint("https://… or rdp://host");
         addressField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         addressField.setImeOptions(EditorInfo.IME_ACTION_GO);
         addressField.setOnFocusChangeListener((view, hasFocus) -> {
@@ -2486,6 +2508,13 @@ public final class MainActivity extends Activity {
         if (normalized.isEmpty()) {
             return;
         }
+        if (RdpConnectionPanel.isRdpAddress(normalized)) {
+            // Remote desktop addresses open the connection panel and leave the
+            // current web session in place.
+            addressField.clearFocus();
+            rdpPanel.show(normalized);
+            return;
+        }
 
         long now = SystemClock.elapsedRealtime();
         cleanupExpiredProjectSessions(now);
@@ -2737,7 +2766,7 @@ public final class MainActivity extends Activity {
     private void saveCurrentAsProject() {
         String url = normalizeAddress(addressField.getText().toString());
         if (url.isEmpty()) {
-            Toast.makeText(this, "Enter a code-server address first", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Enter an address first", Toast.LENGTH_SHORT).show();
             return;
         }
 
@@ -2821,7 +2850,8 @@ public final class MainActivity extends Activity {
         boolean includeUrl,
         boolean hot
     ) {
-        String suffix = hot ? "  • HOT" : "";
+        String suffix = (RdpConnectionPanel.isRdpAddress(project.url) ? "  • RDP" : "")
+            + (hot ? "  • HOT" : "");
         String text = project.name + suffix + (includeUrl ? "\n" + project.url : "");
         SpannableString styled = new SpannableString(text);
         styled.setSpan(
@@ -2840,6 +2870,9 @@ public final class MainActivity extends Activity {
         }
         if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
             return trimmed;
+        }
+        if (RdpConnectionPanel.isRdpAddress(trimmed)) {
+            return RdpConnectionPanel.normalize(trimmed);
         }
         return "http://" + trimmed;
     }
@@ -3178,6 +3211,9 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (rdpPanel != null) {
+            rdpPanel.onResume();
+        }
         if (keepAliveEnabled) {
             applyKeepAliveMode();
         }
@@ -3193,6 +3229,9 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (rdpPanel != null) {
+            rdpPanel.dismiss();
+        }
         keepAliveHandler.removeCallbacks(sessionKeepAlivePulse);
         addressBarHandler.removeCallbacks(autoHideAddressBar);
         boolean activeViewIsCached = activeSessionKey != null;
