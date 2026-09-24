@@ -184,12 +184,42 @@ private let keyboardBridgeSource = #"""
     }));
   };
 
+  // IronRDP synchronizes the remote Caps Lock / Num Lock state from every
+  // mouseenter on its canvas. Touch-derived events can carry a stale lock state
+  // and turn Caps Lock on in the remote session, so real mouseenter events are
+  // replaced by one with Caps Lock off and Num Lock on. mouseenter reaches only
+  // the entered element, so this listens (capturing, ahead of IronRDP) on the
+  // canvas and its ancestors inside the shadow root. Pressing an actual lock key
+  // still synchronizes through the keyboard path.
+  const replaceRdpLockState = (event) => {
+    if (!event.isTrusted) return;
+    const target = event.currentTarget;
+    event.stopImmediatePropagation();
+    const eventWindow = target.ownerDocument?.defaultView || window;
+    target.dispatchEvent(new eventWindow.MouseEvent('mouseenter', {
+      bubbles: false,
+      cancelable: false,
+      composed: true,
+      view: eventWindow,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      screenX: event.screenX,
+      screenY: event.screenY,
+      buttons: event.buttons,
+      modifierCapsLock: false,
+      modifierNumLock: true
+    }));
+  };
+
   const installRdpGestures = () => {
     const canvas = findIronRdpCanvas();
     if (!canvas) return false;
     state.ironRdpCanvas = canvas;
     if (state.gestureCanvas === canvas) return true;
     state.gestureCanvas = canvas;
+    for (let element = canvas; element && element.nodeType === 1; element = element.parentNode) {
+      element.addEventListener('mouseenter', replaceRdpLockState, true);
+    }
 
     // Preserve WebView panning and IronRDP's native coordinate mapping.
     canvas.style.touchAction = '';
@@ -792,7 +822,10 @@ private let keyboardBridgeSource = #"""
     ctrlKey: state.control,
     shiftKey: state.shift,
     altKey: false,
-    metaKey: false
+    metaKey: false,
+    // IronRDP copies lock-key state from mouseenter into the remote session.
+    modifierCapsLock: false,
+    modifierNumLock: true
   });
 
   const fireMouse = (hit, element, type, button, buttons, detail = 0, bubbles = true) => {
