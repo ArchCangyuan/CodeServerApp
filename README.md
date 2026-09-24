@@ -35,11 +35,14 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
   and link opening work. The system keyboard stays hidden unless `KB` is pressed
 - Links opened by the page (`window.open`) open in the system browser
 - Remote desktop through Cloudflare Access (Android): enter or save an `rdp://host` address (for
-  example `rdp://home.example.com`, optionally `rdp://user@host`) to open a connection panel.
-  Sign in to Cloudflare Access in an embedded page (e.g. with an emailed code). The app keeps the
-  token encrypted, shows when it expires, and runs a local tunnel on `127.0.0.1:3390` (next free
-  port if taken), like `cloudflared access rdp`. Connect then opens your remote desktop client
-  (e.g. Microsoft Windows App) on that address
+  example `rdp://home.example.com`, optionally `rdp://user@host`). The first time, a connection
+  panel signs in to Cloudflare Access in an embedded page (e.g. with an emailed code) and asks for
+  the Windows user name and password; the token and a remembered password are kept encrypted with
+  the Android Keystore. The built-in client runs the IronRDP web client in the app through a
+  loopback RDCleanPath gateway that tunnels to the host like `cloudflared access rdp`. It shares
+  the mouse mode, key bar, zoom slider and address bar with web projects, syncs the clipboard both
+  ways, and reconnects on its own. **Other app** instead runs a local tunnel on `127.0.0.1:3390` for
+  clients such as Microsoft Windows App. Run `tools/fetch_rdp_client.sh` before local builds
 - Saved project profiles with bold titles and up to ten hot WebView sessions retained for 30 minutes on both platforms
 - Optional session keep-alive setting. Android uses a foreground service and
   persistent notification, partial wake lock, native WebView pulses, and an optional

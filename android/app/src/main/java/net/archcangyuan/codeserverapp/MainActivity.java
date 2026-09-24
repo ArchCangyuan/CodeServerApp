@@ -62,12 +62,15 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.WeakHashMap;
 
 public final class MainActivity extends Activity {
@@ -1678,6 +1681,8 @@ public final class MainActivity extends Activity {
     private EditText addressField;
     private FrameLayout webContainer;
     private RdpConnectionPanel rdpPanel;
+    private RdpPageBridge rdpPageBridge;
+    private final Set<WebView> rdpWebViews = Collections.newSetFromMap(new WeakHashMap<>());
     private LinearLayout zoomOverlay;
     private TextView zoomPercentLabel;
     private boolean zoomSliderTracking;
@@ -1748,14 +1753,19 @@ public final class MainActivity extends Activity {
         configureSystemUi();
         applyKeepAliveMode();
 
-        rdpPanel = new RdpConnectionPanel(this);
+        rdpPanel = new RdpConnectionPanel(
+            this,
+            (address, username, password) -> openRdpSession(address, username, password, true)
+        );
+        rdpPageBridge = new RdpPageBridge(this, this::onRdpSessionEvent);
         String savedAddress = preferences.getString(ADDRESS_KEY, "");
         addressField.setText(savedAddress);
-        if (savedAddress == null
-            || savedAddress.trim().isEmpty()
-            || RdpConnectionPanel.isRdpAddress(savedAddress)) {
+        if (savedAddress == null || savedAddress.trim().isEmpty()) {
             showBlankWebView();
             addressField.requestFocus();
+        } else if (RdpConnectionPanel.isRdpAddress(savedAddress)) {
+            showBlankWebView();
+            switchToProjectUrl(savedAddress);
         } else {
             switchToProjectUrl(savedAddress);
         }
@@ -2278,6 +2288,13 @@ public final class MainActivity extends Activity {
         });
         target.setWebViewClient(new WebViewClient() {
             @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                // Remote desktop WebViews hold credentials in their JavaScript
+                // bridge, so they never leave the loopback gateway page.
+                return rdpWebViews.contains(view) && !isGatewayUrl(request.getUrl().toString());
+            }
+
+            @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
                 String lastFinishedUrl = lastFinishedUrls.get(view);
@@ -2509,10 +2526,21 @@ public final class MainActivity extends Activity {
             return;
         }
         if (RdpConnectionPanel.isRdpAddress(normalized)) {
-            // Remote desktop addresses open the connection panel and leave the
-            // current web session in place.
             addressField.clearFocus();
-            rdpPanel.show(normalized);
+            String host = RdpConnectionPanel.hostOf(normalized);
+            String username = AccessTokenStore.username(this, host);
+            String password = AccessTokenStore.loadPassword(this, host);
+            boolean ready = findProjectSession(normalized) != null
+                || (AccessTokenStore.loadToken(this, host) != null
+                    && !username.isEmpty()
+                    && password != null
+                    && !password.isEmpty());
+            if (ready) {
+                openRdpSession(normalized, username, password, false);
+            } else {
+                // Sign-in or credentials are missing: the panel collects them.
+                rdpPanel.show(normalized);
+            }
             return;
         }
 
@@ -2546,12 +2574,99 @@ public final class MainActivity extends Activity {
         showAddressBarTemporarily();
     }
 
+    /**
+     * Opens (or returns to) a built-in remote desktop session. The IronRDP web
+     * client runs in a WebView restricted to the loopback {@link RdpGateway},
+     * so it shares the mouse mode, key bar, zoom and address bar with web
+     * projects. {@code reconnect} reloads an existing session with the given
+     * credentials.
+     */
+    private void openRdpSession(
+        String address,
+        String username,
+        String password,
+        boolean reconnect
+    ) {
+        String normalized = RdpConnectionPanel.normalize(address);
+        String host = RdpConnectionPanel.hostOf(normalized);
+        RdpGateway gateway;
+        try {
+            gateway = RdpGateway.get(this);
+        } catch (IOException exception) {
+            Toast.makeText(this, "Could not start the remote desktop gateway", Toast.LENGTH_LONG)
+                .show();
+            return;
+        }
+
+        long now = SystemClock.elapsedRealtime();
+        cleanupExpiredProjectSessions(now);
+        ProjectSession session = findProjectSession(normalized);
+        boolean created = session == null;
+        if (created) {
+            WebView view = createProjectWebView();
+            view.addJavascriptInterface(rdpPageBridge, "YourWorkspaceRdp");
+            rdpWebViews.add(view);
+            session = new ProjectSession(view);
+            projectSessions.put(normalized, session);
+        }
+        activateProjectSession(normalized, session, now);
+        if (created || reconnect) {
+            String user = username == null ? "" : username.trim();
+            String domain = "";
+            int separator = user.indexOf('\\');
+            if (separator > 0) {
+                domain = user.substring(0, separator);
+                user = user.substring(separator + 1);
+            }
+            String gatewayToken = gateway.newSession(host);
+            rdpPageBridge.register(
+                gatewayToken,
+                new RdpPageBridge.Session(normalized, host, user, domain, password),
+                gateway.proxyAddress()
+            );
+            session.webView.loadUrl(gateway.pageUrl(gatewayToken));
+        }
+        evictExcessProjectSessions();
+
+        addressField.setText(normalized);
+        preferences.edit().putString(ADDRESS_KEY, normalized).apply();
+        addressField.clearFocus();
+        session.webView.requestFocus();
+        showAddressBarTemporarily();
+    }
+
+    private void onRdpSessionEvent(RdpPageBridge.Session session, String event, String detail) {
+        switch (event) {
+        case "credentials_rejected":
+            AccessTokenStore.clearPassword(this, session.host);
+            rdpPanel.show(session.address, "Windows rejected the user name or password.");
+            break;
+        case "login_required":
+            rdpPanel.show(session.address, "Cloudflare sign-in expired. Sign in again to reconnect.");
+            break;
+        case "failed":
+            Toast.makeText(
+                this,
+                "Remote desktop disconnected" + (detail.isEmpty() ? "" : ": " + detail),
+                Toast.LENGTH_LONG
+            ).show();
+            break;
+        default:
+            break;
+        }
+    }
+
+    private boolean isGatewayUrl(String url) {
+        return url != null && url.startsWith("http://127.0.0.1:");
+    }
+
     private ProjectSession findProjectSession(String address) {
         return projectSessions.get(normalizeAddress(address));
     }
 
     private void updateAddressFromWebView(WebView source, String url) {
-        if (source != webView || url == null) {
+        if (source != webView || url == null || rdpWebViews.contains(source)) {
+            // Remote desktop sessions keep showing their rdp:// address.
             return;
         }
         String normalized = normalizeAddress(url);

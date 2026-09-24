@@ -23,6 +23,7 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -34,10 +35,15 @@ import java.util.Locale;
 
 /**
  * Connection panel for {@code rdp://host} addresses: Cloudflare Access sign-in,
- * the saved Windows user name, and a local tunnel that remote desktop clients
- * connect to.
+ * the Windows credentials, the built-in client, and a local tunnel for other
+ * remote desktop apps.
  */
 final class RdpConnectionPanel {
+    /** Opens the built-in remote desktop session. */
+    interface Host {
+        void openBuiltInSession(String address, String username, String password);
+    }
+
     private static final int ACCENT = Color.rgb(103, 80, 164);
     private static final int SIGNED_IN = Color.rgb(46, 125, 50);
     private static final int MUTED = Color.rgb(96, 96, 96);
@@ -45,19 +51,26 @@ final class RdpConnectionPanel {
     private static final long LOGIN_POLL_MS = 700L;
 
     private final Activity activity;
+    private final Host sessionHost;
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private String address;
     private AlertDialog dialog;
     private String host;
     private TextView accessStatus;
     private Button accessButton;
     private EditText usernameField;
+    private EditText passwordField;
+    private CheckBox rememberPassword;
+    private TextView messageText;
     private TextView tunnelStatus;
     private Button copyButton;
+    private Button stopButton;
     private TextView probeResult;
     private boolean openClientWhenRunning;
 
-    RdpConnectionPanel(Activity activity) {
+    RdpConnectionPanel(Activity activity, Host sessionHost) {
         this.activity = activity;
+        this.sessionHost = sessionHost;
     }
 
     static boolean isRdpAddress(String address) {
@@ -101,6 +114,11 @@ final class RdpConnectionPanel {
     }
 
     void show(String address) {
+        show(address, null);
+    }
+
+    /** Shows the panel, optionally with a message such as a rejected password. */
+    void show(String address, String message) {
         String requestedHost = hostOf(address);
         if (requestedHost.isEmpty()) {
             Toast.makeText(activity, "Enter a host, e.g. rdp://desktop.example.com", Toast.LENGTH_SHORT)
@@ -111,6 +129,7 @@ final class RdpConnectionPanel {
             dialog.dismiss();
         }
         host = requestedHost;
+        this.address = normalize(address);
         String addressUser = userOf(address);
         if (!addressUser.isEmpty()) {
             AccessTokenStore.saveUsername(activity, host, addressUser);
@@ -127,6 +146,14 @@ final class RdpConnectionPanel {
         subtitle.setTextSize(13);
         content.addView(subtitle);
 
+        messageText = new TextView(activity);
+        messageText.setTextSize(13);
+        messageText.setTextColor(Color.rgb(183, 28, 28));
+        messageText.setPadding(0, dp(8), 0, 0);
+        messageText.setText(message == null ? "" : message);
+        messageText.setVisibility(message == null ? View.GONE : View.VISIBLE);
+        content.addView(messageText);
+
         LinearLayout accessCard = card(content, "Cloudflare");
         LinearLayout accessRow = row(accessCard);
         accessStatus = statusText(accessRow);
@@ -139,7 +166,7 @@ final class RdpConnectionPanel {
             }
         });
 
-        LinearLayout userCard = card(content, "Windows user");
+        LinearLayout userCard = card(content, "Windows sign-in");
         usernameField = new EditText(activity);
         usernameField.setSingleLine(true);
         usernameField.setTextSize(15);
@@ -147,14 +174,36 @@ final class RdpConnectionPanel {
         usernameField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         usernameField.setText(AccessTokenStore.username(activity, host));
         userCard.addView(usernameField);
+        passwordField = new EditText(activity);
+        passwordField.setSingleLine(true);
+        passwordField.setTextSize(15);
+        passwordField.setHint("Password");
+        passwordField.setInputType(
+            InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
+        );
+        String savedPassword = AccessTokenStore.loadPassword(activity, host);
+        if (savedPassword != null) {
+            passwordField.setText(savedPassword);
+        }
+        userCard.addView(passwordField);
+        rememberPassword = new CheckBox(activity);
+        rememberPassword.setText("Remember password (encrypted on this device)");
+        rememberPassword.setTextSize(13);
+        rememberPassword.setChecked(true);
+        userCard.addView(rememberPassword);
 
-        LinearLayout tunnelCard = card(content, "Tunnel");
+        LinearLayout tunnelCard = card(content, "Tunnel for other apps");
         LinearLayout tunnelRow = row(tunnelCard);
         tunnelStatus = statusText(tunnelRow);
         copyButton = smallButton(tunnelRow, "Copy");
         copyButton.setOnClickListener(view -> copyLocalAddress(true));
         Button probeButton = smallButton(tunnelRow, "Test");
         probeButton.setOnClickListener(view -> probe());
+        stopButton = smallButton(tunnelRow, "Stop");
+        stopButton.setOnClickListener(view -> {
+            openClientWhenRunning = false;
+            RdpTunnelService.stop(activity);
+        });
         probeResult = new TextView(activity);
         probeResult.setTextSize(12);
         probeResult.setTextColor(MUTED);
@@ -165,15 +214,12 @@ final class RdpConnectionPanel {
             .setTitle(boldText(host))
             .setView(content)
             .setPositiveButton("Connect", null)
-            .setNeutralButton("Stop tunnel", null)
+            .setNeutralButton("Other app", null)
             .setNegativeButton("Close", null)
             .create();
         dialog.setOnShowListener(shown -> {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> connect());
-            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
-                openClientWhenRunning = false;
-                RdpTunnelService.stop(activity);
-            });
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> connectBuiltIn());
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> connect());
         });
         dialog.setOnDismissListener(dismissed -> {
             saveUsername();
@@ -199,6 +245,35 @@ final class RdpConnectionPanel {
         }
     }
 
+    /** Connects with the built-in client after making sure sign-in and credentials exist. */
+    private void connectBuiltIn() {
+        saveUsername();
+        String username = usernameField.getText().toString().trim();
+        String password = passwordField.getText().toString();
+        if (username.isEmpty() || password.isEmpty()) {
+            showMessage("Enter the Windows user name and password.");
+            return;
+        }
+        if (rememberPassword.isChecked()) {
+            AccessTokenStore.savePassword(activity, host, password);
+        } else {
+            AccessTokenStore.clearPassword(activity, host);
+        }
+        if (AccessTokenStore.loadToken(activity, host) == null) {
+            showLogin(this::connectBuiltIn);
+            return;
+        }
+        String sessionAddress = address;
+        dialog.dismiss();
+        sessionHost.openBuiltInSession(sessionAddress, username, password);
+    }
+
+    private void showMessage(String message) {
+        messageText.setText(message);
+        messageText.setVisibility(View.VISIBLE);
+    }
+
+    /** Uses another remote desktop app through the local tunnel. */
     private void connect() {
         saveUsername();
         if (AccessTokenStore.loadToken(activity, host) == null) {
@@ -284,10 +359,7 @@ final class RdpConnectionPanel {
             tunnelStatus.setTextColor(MUTED);
         }
         copyButton.setEnabled(running);
-        Button stopButton = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
-        if (stopButton != null) {
-            stopButton.setVisibility(running ? View.VISIBLE : View.GONE);
-        }
+        stopButton.setVisibility(running ? View.VISIBLE : View.GONE);
     }
 
     private void saveUsername() {

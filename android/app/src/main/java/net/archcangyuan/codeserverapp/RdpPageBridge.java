@@ -1,0 +1,129 @@
+package net.archcangyuan.codeserverapp;
+
+import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.os.Handler;
+import android.os.Looper;
+import android.webkit.JavascriptInterface;
+
+import org.json.JSONObject;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * JavaScript interface ({@code window.YourWorkspaceRdp}) for the built-in
+ * remote desktop page served by {@link RdpGateway}. It hands the page its
+ * session configuration, backs the page's clipboard with the Android
+ * clipboard, and reports session events to the app. It is only added to
+ * WebViews that are restricted to the gateway's origin.
+ */
+final class RdpPageBridge {
+    /** Session details for one gateway token. */
+    static final class Session {
+        final String address;
+        final String host;
+        final String username;
+        final String domain;
+        final String password;
+
+        Session(String address, String host, String username, String domain, String password) {
+            this.address = address;
+            this.host = host;
+            this.username = username;
+            this.domain = domain;
+            this.password = password;
+        }
+    }
+
+    /** Receives page events on the main thread. */
+    interface Listener {
+        void onRdpSessionEvent(Session session, String event, String detail);
+    }
+
+    private static final String CLIPBOARD_LABEL = "Remote desktop";
+
+    private final Activity activity;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Map<String, Session> sessions = new ConcurrentHashMap<>();
+    private final Listener listener;
+    private volatile String proxyAddress;
+
+    RdpPageBridge(Activity activity, Listener listener) {
+        this.activity = activity;
+        this.listener = listener;
+    }
+
+    void register(String gatewayToken, Session session, String proxyAddress) {
+        sessions.put(gatewayToken, session);
+        this.proxyAddress = proxyAddress;
+    }
+
+    @JavascriptInterface
+    public String config(String gatewayToken) {
+        Session session = sessions.get(gatewayToken);
+        JSONObject config = new JSONObject();
+        if (session == null) {
+            return config.toString();
+        }
+        try {
+            config.put("username", session.username);
+            config.put("domain", session.domain);
+            config.put("password", session.password);
+            config.put("destination", session.host + ":3389");
+            config.put("proxyAddress", proxyAddress);
+        } catch (Exception ignored) {
+            // Fields are plain strings.
+        }
+        return config.toString();
+    }
+
+    @JavascriptInterface
+    public String clipboardText() {
+        FutureTask<String> read = new FutureTask<>(() -> {
+            ClipboardManager clipboard = activity.getSystemService(ClipboardManager.class);
+            ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) {
+                return "";
+            }
+            CharSequence text = clip.getItemAt(0).coerceToText(activity);
+            return text == null ? "" : text.toString();
+        });
+        handler.post(read);
+        try {
+            return read.get(2, TimeUnit.SECONDS);
+        } catch (Exception exception) {
+            return "";
+        }
+    }
+
+    @JavascriptInterface
+    public void setClipboardText(String text) {
+        handler.post(() -> {
+            ClipboardManager clipboard = activity.getSystemService(ClipboardManager.class);
+            if (clipboard == null) {
+                return;
+            }
+            ClipData current = clipboard.getPrimaryClip();
+            CharSequence existing = current == null || current.getItemCount() == 0
+                ? null
+                : current.getItemAt(0).getText();
+            if (existing != null && existing.toString().equals(text)) {
+                return;
+            }
+            clipboard.setPrimaryClip(ClipData.newPlainText(CLIPBOARD_LABEL, text == null ? "" : text));
+        });
+    }
+
+    @JavascriptInterface
+    public void onSessionEvent(String gatewayToken, String event, String detail) {
+        Session session = sessions.get(gatewayToken);
+        if (session == null) {
+            return;
+        }
+        handler.post(() -> listener.onRdpSessionEvent(session, event, detail));
+    }
+}

@@ -19,29 +19,21 @@ import javax.crypto.spec.GCMParameterSpec;
 
 /**
  * Stores Cloudflare Access application tokens (the {@code CF_Authorization}
- * JWT) per hostname, encrypted with a key held in the Android Keystore, plus
- * the remote desktop user name for each hostname.
+ * JWT) and remembered Windows passwords per hostname, encrypted with a key held
+ * in the Android Keystore, plus the remote desktop user name for each hostname.
  */
 final class AccessTokenStore {
     private static final String PREFERENCES = "cloudflare_access";
     private static final String KEY_ALIAS = "your_workspace_access_tokens";
     private static final String TOKEN_PREFIX = "token:";
     private static final String USERNAME_PREFIX = "rdp_username:";
+    private static final String PASSWORD_PREFIX = "rdp_password:";
     private static final int GCM_TAG_BITS = 128;
 
     private AccessTokenStore() {}
 
     static void saveToken(Context context, String host, String token) {
-        try {
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey());
-            byte[] encrypted = cipher.doFinal(token.getBytes(StandardCharsets.UTF_8));
-            String value = Base64.getEncoder().encodeToString(cipher.getIV())
-                + ":" + Base64.getEncoder().encodeToString(encrypted);
-            preferences(context).edit().putString(TOKEN_PREFIX + key(host), value).apply();
-        } catch (Exception exception) {
-            throw new IllegalStateException("Could not store the Cloudflare token", exception);
-        }
+        preferences(context).edit().putString(TOKEN_PREFIX + key(host), encrypt(token)).apply();
     }
 
     /** Returns the stored token, or {@code null} when it is missing or expired. */
@@ -51,17 +43,7 @@ final class AccessTokenStore {
             return null;
         }
         try {
-            String[] parts = value.split(":", 2);
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(
-                Cipher.DECRYPT_MODE,
-                secretKey(),
-                new GCMParameterSpec(GCM_TAG_BITS, Base64.getDecoder().decode(parts[0]))
-            );
-            String token = new String(
-                cipher.doFinal(Base64.getDecoder().decode(parts[1])),
-                StandardCharsets.UTF_8
-            );
+            String token = decrypt(value);
             long expiresAt = expiresAtMillis(token);
             if (expiresAt > 0 && expiresAt <= System.currentTimeMillis()) {
                 clearToken(context, host);
@@ -93,6 +75,53 @@ final class AccessTokenStore {
         } catch (Exception exception) {
             return 0L;
         }
+    }
+
+    static void savePassword(Context context, String host, String password) {
+        preferences(context).edit()
+            .putString(PASSWORD_PREFIX + key(host), encrypt(password == null ? "" : password))
+            .apply();
+    }
+
+    /** Returns the remembered Windows password, or {@code null} when none is saved. */
+    static String loadPassword(Context context, String host) {
+        String value = preferences(context).getString(PASSWORD_PREFIX + key(host), null);
+        if (value == null) {
+            return null;
+        }
+        try {
+            return decrypt(value);
+        } catch (Exception exception) {
+            clearPassword(context, host);
+            return null;
+        }
+    }
+
+    static void clearPassword(Context context, String host) {
+        preferences(context).edit().remove(PASSWORD_PREFIX + key(host)).apply();
+    }
+
+    private static String encrypt(String plainText) {
+        try {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey());
+            byte[] encrypted = cipher.doFinal(plainText.getBytes(StandardCharsets.UTF_8));
+            return Base64.getEncoder().encodeToString(cipher.getIV())
+                + ":" + Base64.getEncoder().encodeToString(encrypted);
+        } catch (Exception exception) {
+            throw new IllegalStateException("Could not encrypt the credential", exception);
+        }
+    }
+
+    private static String decrypt(String value) throws Exception {
+        String[] parts = value.split(":", 2);
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(
+            Cipher.DECRYPT_MODE,
+            secretKey(),
+            new GCMParameterSpec(GCM_TAG_BITS, Base64.getDecoder().decode(parts[0]))
+        );
+        return new String(cipher.doFinal(Base64.getDecoder().decode(parts[1])), StandardCharsets.UTF_8);
     }
 
     static String username(Context context, String host) {

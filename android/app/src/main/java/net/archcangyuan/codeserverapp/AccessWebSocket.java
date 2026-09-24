@@ -45,14 +45,36 @@ final class AccessWebSocket implements AutoCloseable {
     private final Socket socket;
     private final InputStream input;
     private final OutputStream output;
+    /** Clients mask the frames they send; servers must not. */
+    private final boolean client;
     private final SecureRandom random = new SecureRandom();
     private final Object writeLock = new Object();
     private volatile boolean closed;
 
-    private AccessWebSocket(Socket socket, InputStream input, OutputStream output) {
+    private AccessWebSocket(Socket socket, InputStream input, OutputStream output, boolean client) {
         this.socket = socket;
         this.input = input;
         this.output = output;
+        this.client = client;
+    }
+
+    /**
+     * Completes the server side of a WebSocket upgrade whose request headers
+     * have already been read from {@code input}.
+     */
+    static AccessWebSocket acceptServer(Socket socket, InputStream input, String key)
+        throws IOException {
+        OutputStream output = socket.getOutputStream();
+        String response = "HTTP/1.1 101 Switching Protocols\r\n"
+            + "Upgrade: websocket\r\n"
+            + "Connection: Upgrade\r\n"
+            + "Sec-WebSocket-Accept: " + expectedAccept(key) + "\r\n"
+            + "\r\n";
+        output.write(response.getBytes(StandardCharsets.US_ASCII));
+        output.flush();
+        socket.setTcpNoDelay(true);
+        socket.setSoTimeout(0);
+        return new AccessWebSocket(socket, input, output, false);
     }
 
     /** Opens {@code wss://host:443/} with the given Access token. */
@@ -140,7 +162,7 @@ final class AccessWebSocket implements AutoCloseable {
             throw new IOException("Tunnel handshake failed: invalid Sec-WebSocket-Accept");
         }
         socket.setSoTimeout(0);
-        return new AccessWebSocket(socket, input, output);
+        return new AccessWebSocket(socket, input, output, true);
     }
 
     private static int parseStatus(String value) {
@@ -224,32 +246,43 @@ final class AccessWebSocket implements AutoCloseable {
     }
 
     private void sendFrame(int opcode, byte[] data, int offset, int length) throws IOException {
-        byte[] mask = new byte[4];
-        random.nextBytes(mask);
+        int maskBit = client ? 0x80 : 0;
         byte[] header;
         if (length < 126) {
-            header = new byte[] { (byte) (0x80 | opcode), (byte) (0x80 | length) };
+            header = new byte[] { (byte) (0x80 | opcode), (byte) (maskBit | length) };
         } else if (length < 65_536) {
             header = new byte[] {
-                (byte) (0x80 | opcode), (byte) (0x80 | 126),
+                (byte) (0x80 | opcode), (byte) (maskBit | 126),
                 (byte) (length >>> 8), (byte) length
             };
         } else {
             header = new byte[10];
             header[0] = (byte) (0x80 | opcode);
-            header[1] = (byte) (0x80 | 127);
+            header[1] = (byte) (maskBit | 127);
             for (int index = 0; index < 8; index++) {
                 header[2 + index] = (byte) (((long) length) >>> (56 - 8 * index));
             }
         }
-        byte[] payload = new byte[length];
-        for (int index = 0; index < length; index++) {
-            payload[index] = (byte) (data[offset + index] ^ mask[index & 3]);
+        byte[] mask = null;
+        byte[] payload;
+        if (client) {
+            mask = new byte[4];
+            random.nextBytes(mask);
+            payload = new byte[length];
+            for (int index = 0; index < length; index++) {
+                payload[index] = (byte) (data[offset + index] ^ mask[index & 3]);
+            }
+        } else {
+            payload = data;
         }
         synchronized (writeLock) {
             output.write(header);
-            output.write(mask);
-            output.write(payload);
+            if (mask != null) {
+                output.write(mask);
+                output.write(payload, 0, length);
+            } else {
+                output.write(payload, offset, length);
+            }
             output.flush();
         }
     }
@@ -358,7 +391,9 @@ final class AccessWebSocket implements AutoCloseable {
         closed = true;
         try {
             synchronized (writeLock) {
-                output.write(new byte[] { (byte) (0x80 | OPCODE_CLOSE), (byte) 0x80, 0, 0, 0, 0 });
+                output.write(client
+                    ? new byte[] { (byte) (0x80 | OPCODE_CLOSE), (byte) 0x80, 0, 0, 0, 0 }
+                    : new byte[] { (byte) (0x80 | OPCODE_CLOSE), 0 });
                 output.flush();
             }
         } catch (IOException ignored) {
