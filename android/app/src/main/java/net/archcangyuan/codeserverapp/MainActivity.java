@@ -119,6 +119,37 @@ public final class MainActivity extends Activity {
               `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`;
             const token = (window.__codeServerAppViewportToken || 0) + 1;
             window.__codeServerAppViewportToken = token;
+            // On a web RDP page (IronRDP) a layout resize makes the remote desktop resize
+            // or reconnect the session, and a reload always reconnects; both ask for the
+            // credentials again. There, zoom only changes the page scale: the layout width
+            // the session started with is kept and the page never reloads.
+            if (Number(fitWidth) > 0 && window.__codeServerAppIsRdpPage?.()) {
+              const layoutWidth = Math.max(
+                200,
+                Math.round(
+                  Number(window.__codeServerAppViewportWidth)
+                    || document.documentElement.clientWidth
+                    || width
+                )
+              );
+              const rdpScale = Math.max(
+                0.1,
+                Math.min(5, Math.max(Number(fitWidth) / layoutWidth, Number(fitWidth) / width))
+              ).toFixed(4);
+              viewport.setAttribute(
+                'content',
+                `width=${layoutWidth}, initial-scale=${rdpScale}, minimum-scale=${rdpScale}, `
+                  + `maximum-scale=${rdpScale}, user-scalable=yes`
+              );
+              window.setTimeout(() => {
+                if (window.__codeServerAppViewportToken !== token) return;
+                viewport.setAttribute(
+                  'content',
+                  `width=${layoutWidth}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`
+                );
+              }, 180);
+              return layoutWidth;
+            }
             if (Number(fitWidth) > 0) {
               const scale = Math.max(0.1, Math.min(5, Number(fitWidth) / width)).toFixed(4);
               viewport.setAttribute(
@@ -133,8 +164,11 @@ public final class MainActivity extends Activity {
                 if (!allowReload) return;
                 window.setTimeout(() => {
                   if (window.__codeServerAppViewportToken !== token) return;
-                  const visible = window.visualViewport ? window.visualViewport.width : width;
-                  if (Math.abs(visible - window.innerWidth) <= window.innerWidth * 0.03) return;
+                  // innerWidth follows the visual viewport in Chromium, so compare the
+                  // visible width against the layout width instead.
+                  const layout = document.documentElement.clientWidth || width;
+                  const visible = window.visualViewport ? window.visualViewport.width : layout;
+                  if (Math.abs(visible - layout) <= layout * 0.03) return;
                   const reloadKey = '__codeServerAppViewportReloadAt';
                   try {
                     const lastReload = Number(window.sessionStorage.getItem(reloadKey)) || 0;
@@ -195,6 +229,8 @@ public final class MainActivity extends Activity {
             }
             return null;
           };
+
+          window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
 
           const existingBridge = window.__codeServerAppKeyboard;
           if (existingBridge && existingBridge.version >= 11) {
@@ -3061,6 +3097,9 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        // Persist cookies (e.g. the Cloudflare Access session) right away, so the
+        // login survives if the system kills the app while it is in the background.
+        CookieManager.getInstance().flush();
         if (!keepAliveEnabled) {
             boolean activeViewIsCached = activeSessionKey != null;
             for (ProjectSession session : projectSessions.values()) {
