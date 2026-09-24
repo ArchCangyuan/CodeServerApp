@@ -25,6 +25,7 @@ struct ProjectProfile: Codable, Identifiable, Equatable {
 struct ContentView: View {
     @AppStorage("codeServerURL") private var serverURL = ""
     @AppStorage("keepAliveEnabled") private var keepAliveEnabled = false
+    @AppStorage("mouseModeEnabled") private var mouseModeEnabled = false
     @StateObject private var webViewStore = CodeServerWebViewStore()
     @State private var draftAddress = ""
     @State private var activeSessionAddress = ""
@@ -124,14 +125,19 @@ struct ContentView: View {
 
             CodeServerWebView(
                 address: activeSessionAddress.isEmpty ? serverURL : activeSessionAddress,
-                store: webViewStore
+                store: webViewStore,
+                mouseModeEnabled: mouseModeEnabled
             )
 
             SpecialKeyBar(
                 controlLocked: $controlLocked,
                 shiftLocked: $shiftLocked,
+                mouseModeEnabled: $mouseModeEnabled,
                 onKeyboard: {
                     webViewStore.forceKeyboard()
+                },
+                onMouseModeChanged: { enabled in
+                    webViewStore.announceMouseMode(enabled)
                 },
                 onKey: { key in
                     webViewStore.send(key)
