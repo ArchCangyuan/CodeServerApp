@@ -26,7 +26,11 @@ private let keyboardBridgeSource = #"""
     });
   } catch (_) {}
 
-  const setViewportWidth = (requestedWidth) => {
+  // fitWidth is the native view width in points. When given, the page scale is
+  // pinned to fit the new layout width for a moment, because web views keep
+  // their old scale on live viewport changes and would crop the page. If the
+  // page still does not fit, allowReload lets it fall back to one reload.
+  const setViewportWidth = (requestedWidth, fitWidth = 0, allowReload = false) => {
     const numericWidth = Number(requestedWidth) || 1280;
     const width = Math.max(400, Math.min(2400, Math.round(numericWidth)));
     let viewport = document.querySelector('meta[name="viewport"]');
@@ -35,10 +39,40 @@ private let keyboardBridgeSource = #"""
       viewport.setAttribute('name', 'viewport');
       (document.head || document.documentElement).appendChild(viewport);
     }
-    viewport.setAttribute(
-      'content',
-      `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`
-    );
+    const relaxedContent =
+      `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`;
+    const token = (window.__codeServerAppViewportToken || 0) + 1;
+    window.__codeServerAppViewportToken = token;
+    if (Number(fitWidth) > 0) {
+      const scale = Math.max(0.1, Math.min(5, Number(fitWidth) / width)).toFixed(4);
+      viewport.setAttribute(
+        'content',
+        `width=${width}, initial-scale=${scale}, minimum-scale=${scale}, `
+          + `maximum-scale=${scale}, user-scalable=yes`
+      );
+      window.setTimeout(() => {
+        if (window.__codeServerAppViewportToken !== token) return;
+        viewport.setAttribute('content', relaxedContent);
+        window.dispatchEvent(new Event('resize'));
+        if (!allowReload) return;
+        window.setTimeout(() => {
+          if (window.__codeServerAppViewportToken !== token) return;
+          const visible = window.visualViewport ? window.visualViewport.width : width;
+          if (Math.abs(visible - window.innerWidth) <= window.innerWidth * 0.03) return;
+          const reloadKey = '__codeServerAppViewportReloadAt';
+          try {
+            const lastReload = Number(window.sessionStorage.getItem(reloadKey)) || 0;
+            if (Date.now() - lastReload < 15000) return;
+            window.sessionStorage.setItem(reloadKey, String(Date.now()));
+          } catch (_) {
+            return;
+          }
+          window.location.reload();
+        }, 250);
+      }, 180);
+    } else {
+      viewport.setAttribute('content', relaxedContent);
+    }
     document.documentElement.style.zoom = '1';
     if (document.body) {
       document.body.style.zoom = '1';
@@ -1342,7 +1376,6 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         var lastInactiveAt: TimeInterval?
         var lastFinishedURL: String?
         var appliedZoomSteps: Int?
-        var zoomReloadInProgress = false
         var urlObservation: NSKeyValueObservation?
 
         init(key: String, webView: WKWebView) {
@@ -1454,7 +1487,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         } else {
             publishAddress(for: target, fallback: normalized)
             if target.appliedZoomSteps != layoutZoomSteps {
-                applyLayoutZoom(to: target, reloadAfterApply: target.webView.url != nil)
+                applyLayoutZoom(to: target, allowFallbackReload: target.webView.url != nil)
             }
         }
         syncModifiers(on: target.webView)
@@ -1477,10 +1510,16 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         layoutZoomSteps = nextSteps
         UserDefaults.standard.set(layoutZoomSteps, forKey: layoutZoomStepsKey)
         zoomPercent = Int(round(pow(layoutZoomFactor, Double(layoutZoomSteps)) * 100))
-        if let activeSession {
-            applyLayoutZoom(to: activeSession, reloadAfterApply: activeSession.webView.url != nil)
+        for session in sessions.values {
+            installUserScripts(in: session.webView.configuration.userContentController)
         }
-        showStatus("UI zoom \(zoomPercent)% – reloading to fit")
+        if let activeSession {
+            applyLayoutZoom(
+                to: activeSession,
+                allowFallbackReload: activeSession.webView.url != nil
+            )
+        }
+        showStatus("UI zoom \(zoomPercent)%")
     }
 
     func isSessionHot(_ address: String) -> Bool {
@@ -1619,13 +1658,7 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         configuration.defaultWebpagePreferences.preferredContentMode = .desktop
-        configuration.userContentController.addUserScript(
-            WKUserScript(
-                source: keyboardBridgeSource,
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: false
-            )
-        )
+        installUserScripts(in: configuration.userContentController)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         disableDoubleTapZoom(in: webView)
@@ -1643,6 +1676,25 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         webView.isHidden = true
         return webView
+    }
+
+    private func installUserScripts(in controller: WKUserContentController) {
+        controller.removeAllUserScripts()
+        // Seed the zoomed viewport width so the first layout already uses it.
+        controller.addUserScript(
+            WKUserScript(
+                source: "window.__codeServerAppViewportWidth = \(viewportWidth());",
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+        )
+        controller.addUserScript(
+            WKUserScript(
+                source: keyboardBridgeSource,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
+            )
+        )
     }
 
     private func disableDoubleTapZoom(in view: UIView) {
@@ -1683,14 +1735,24 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         Int(round(Double(desktopViewportWidth) / pow(layoutZoomFactor, Double(layoutZoomSteps))))
     }
 
-    private func applyLayoutZoom(to session: ProjectSession, reloadAfterApply: Bool) {
+    /// Applies the layout zoom in place by changing the virtual viewport width and
+    /// pinning the page scale to fit it. The page reloads only when the web view
+    /// still does not fit afterwards and a fallback reload is allowed.
+    private func applyLayoutZoom(to session: ProjectSession, allowFallbackReload: Bool) {
         let requestedSteps = layoutZoomSteps
         let requestedWidth = viewportWidth()
+        let viewWidth = session.webView.bounds.width > 0
+            ? session.webView.bounds.width
+            : hostView?.bounds.width ?? 0
         let script = """
         (() => {
           const width = \(requestedWidth);
           if (window.__codeServerAppSetViewportWidth) {
-            return window.__codeServerAppSetViewportWidth(width);
+            return window.__codeServerAppSetViewportWidth(
+              width,
+              \(Double(viewWidth)),
+              \(allowFallbackReload)
+            );
           }
           let viewport = document.querySelector('meta[name="viewport"]');
           if (!viewport) {
@@ -1711,12 +1773,6 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
                       self.sessions[session.key] === session,
                       requestedSteps == self.layoutZoomSteps else { return }
                 session.appliedZoomSteps = requestedSteps
-                if reloadAfterApply,
-                   session.webView.url != nil,
-                   !session.zoomReloadInProgress {
-                    session.zoomReloadInProgress = true
-                    session.webView.reload()
-                }
             }
         }
     }
@@ -1794,7 +1850,6 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
         if let session = sessions.values.first(where: { $0.webView === webView }),
-           !session.zoomReloadInProgress,
            session.lastFinishedURL != navigationAction.request.url?.absoluteString {
             session.appliedZoomSteps = nil
         }
@@ -1808,13 +1863,9 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         }
         session.lastFinishedURL = webView.url?.absoluteString
         publishAddress(for: session)
-        let completedZoomReload = session.zoomReloadInProgress
-        session.zoomReloadInProgress = false
-        let needsReload = !completedZoomReload
-            && ((session.appliedZoomSteps == nil && layoutZoomSteps != 0)
-                || (session.appliedZoomSteps != nil
-                    && session.appliedZoomSteps != layoutZoomSteps))
-        applyLayoutZoom(to: session, reloadAfterApply: needsReload)
+        let zoomChanged = (session.appliedZoomSteps == nil && layoutZoomSteps != 0)
+            || (session.appliedZoomSteps != nil && session.appliedZoomSteps != layoutZoomSteps)
+        applyLayoutZoom(to: session, allowFallbackReload: zoomChanged)
         syncModifiers(on: webView)
         syncMouseMode(on: webView)
     }

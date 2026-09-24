@@ -14,7 +14,9 @@ Native iOS and Android wrappers for [code-server](https://github.com/coder/code-
 - Native SwiftUI/`WKWebView` iOS app and native Java/Android `WebView` app
 - Safe-area handling with an optional immersive fullscreen toggle; pull down from the top edge to exit fullscreen
 - Desktop-site mode and an IME-aware supplemental key bar on both platforms
-- Persistent virtual-viewport zoom controls that automatically reload once to apply a full-width, non-cropped layout
+- Persistent virtual-viewport zoom controls that resize the layout in place, without reloading,
+  by pinning the page scale to fit the new width. They fall back to one reload only when the
+  web view still does not fit
 - A force-keyboard button backed by native Android and iOS input capture, keeping
   focus on canvas-based web RDP clients while forwarding text and editing keys
 - Cloudflare Access browser-RDP support that focuses IronRDP's Shadow DOM
