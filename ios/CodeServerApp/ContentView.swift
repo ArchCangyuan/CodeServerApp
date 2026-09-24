@@ -130,6 +130,27 @@ struct ContentView: View {
                 store: webViewStore,
                 mouseModeEnabled: mouseModeEnabled
             )
+            .overlay(alignment: .top) {
+                // Shown and hidden together with the address bar.
+                if !isFullscreen && isAddressBarVisible {
+                    ZoomSlider(
+                        steps: webViewStore.zoomSteps,
+                        onEditingChanged: { editing in
+                            if editing {
+                                addressBarHideToken = UUID()
+                            } else {
+                                showAddressBarTemporarily()
+                            }
+                        },
+                        onCommit: { steps in
+                            webViewStore.setZoom(steps: steps)
+                        }
+                    )
+                    .padding(.top, 8)
+                    .padding(.horizontal, 12)
+                    .transition(.opacity)
+                }
+            }
 
             SpecialKeyBar(
                 controlLocked: $controlLocked,
@@ -218,14 +239,6 @@ struct ContentView: View {
                 webViewStore.reload()
             }
 
-            toolbarButton(systemName: "minus.magnifyingglass", label: "Zoom out") {
-                webViewStore.changeZoom(by: -1)
-            }
-
-            toolbarButton(systemName: "plus.magnifyingglass", label: "Zoom in") {
-                webViewStore.changeZoom(by: 1)
-            }
-
             toolbarButton(
                 systemName: "arrow.up.left.and.arrow.down.right",
                 label: "Enter fullscreen"
@@ -308,6 +321,68 @@ struct ContentView: View {
         let shouldKeepAwake = keepAliveEnabled && scenePhase == .active
         UIApplication.shared.isIdleTimerDisabled = shouldKeepAwake
         webViewStore.setKeepAliveEnabled(keepAliveEnabled)
+    }
+}
+
+/// Translucent capsule slider for the discrete UI zoom levels. The percentage
+/// follows the thumb while dragging; the zoom is applied once on release.
+private struct ZoomSlider: View {
+    let steps: Int
+    let onEditingChanged: (Bool) -> Void
+    let onCommit: (Int) -> Void
+
+    @State private var value = 0.0
+    @State private var isEditing = false
+
+    private var range: ClosedRange<Double> {
+        Double(CodeServerWebViewStore.zoomStepRange.lowerBound)
+            ...Double(CodeServerWebViewStore.zoomStepRange.upperBound)
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "textformat.size.smaller")
+                .font(.footnote.weight(.semibold))
+                .foregroundColor(.secondary)
+
+            Slider(value: $value, in: range, step: 1) { editing in
+                isEditing = editing
+                onEditingChanged(editing)
+                if !editing {
+                    onCommit(Int(value.rounded()))
+                }
+            }
+            .frame(width: 180)
+            .accessibilityLabel("UI zoom")
+            .accessibilityValue("\(CodeServerWebViewStore.zoomPercent(forSteps: Int(value.rounded()))) percent")
+
+            Image(systemName: "textformat.size.larger")
+                .font(.body.weight(.semibold))
+                .foregroundColor(.secondary)
+
+            Text("\(CodeServerWebViewStore.zoomPercent(forSteps: Int(value.rounded())))%")
+                .font(.caption.monospacedDigit().weight(.semibold))
+                .frame(minWidth: 40, alignment: .trailing)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08)))
+        .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+        .onAppear {
+            value = Double(steps)
+        }
+        .onChange(of: steps) { newSteps in
+            if !isEditing {
+                value = Double(newSteps)
+            }
+        }
+        .onChange(of: value) { newValue in
+            // VoiceOver and other non-drag adjustments apply immediately.
+            if !isEditing {
+                onCommit(Int(newValue.rounded()))
+            }
+        }
     }
 }
 

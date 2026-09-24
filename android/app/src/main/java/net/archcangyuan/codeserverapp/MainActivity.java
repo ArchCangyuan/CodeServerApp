@@ -14,6 +14,7 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -52,6 +53,8 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
+import android.widget.SeekBar;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import org.json.JSONArray;
@@ -79,8 +82,8 @@ public final class MainActivity extends Activity {
     private static final String VIEWPORT_RELOAD_ZOOM_MIGRATED_KEY =
         "viewport_reload_zoom_migrated";
     private static final int DESKTOP_VIEWPORT_WIDTH = 1280;
-    private static final int MIN_LAYOUT_ZOOM_STEPS = -6;
-    private static final int MAX_LAYOUT_ZOOM_STEPS = 12;
+    private static final int MIN_LAYOUT_ZOOM_STEPS = -10;
+    private static final int MAX_LAYOUT_ZOOM_STEPS = 16;
     private static final double LAYOUT_ZOOM_FACTOR = 1.1;
     private static final long PROJECT_SESSION_TTL_MS = 30L * 60L * 1_000L;
     private static final int MAX_HOT_PROJECT_SESSIONS = 10;
@@ -103,7 +106,7 @@ public final class MainActivity extends Activity {
           // page still does not fit, allowReload lets it fall back to one reload.
           const setViewportWidth = (requestedWidth, fitWidth = 0, allowReload = false) => {
             const numericWidth = Number(requestedWidth) || 1280;
-            const width = Math.max(400, Math.min(2400, Math.round(numericWidth)));
+            const width = Math.max(200, Math.min(4000, Math.round(numericWidth)));
             let viewport = document.querySelector('meta[name="viewport"]');
             if (!viewport) {
               viewport = document.createElement('meta');
@@ -1573,6 +1576,9 @@ public final class MainActivity extends Activity {
     private LinearLayout addressBar;
     private EditText addressField;
     private FrameLayout webContainer;
+    private LinearLayout zoomOverlay;
+    private TextView zoomPercentLabel;
+    private boolean zoomSliderTracking;
     private WebView webView;
     private String activeSessionKey;
     private Button controlButton;
@@ -1591,8 +1597,8 @@ public final class MainActivity extends Activity {
         if (addressBar == null || addressBar.getVisibility() != View.VISIBLE) {
             return;
         }
-        if (addressField != null && addressField.hasFocus()) {
-            // Keep the bar while an address is being typed; losing focus reschedules.
+        if ((addressField != null && addressField.hasFocus()) || zoomSliderTracking) {
+            // Keep the bar while an address is typed or zoom is dragged; both reschedule.
             return;
         }
         if (webView == null || webView.getUrl() == null) {
@@ -1706,20 +1712,6 @@ public final class MainActivity extends Activity {
         reloadButton.setOnClickListener(view -> webView.reload());
         addressBar.addView(reloadButton);
 
-        Button zoomOutButton = createToolbarButton("−");
-        zoomOutButton.setContentDescription("Zoom out");
-        zoomOutButton.setFocusable(false);
-        zoomOutButton.setFocusableInTouchMode(false);
-        zoomOutButton.setOnClickListener(view -> changeZoom(-1));
-        addressBar.addView(zoomOutButton);
-
-        Button zoomInButton = createToolbarButton("+");
-        zoomInButton.setContentDescription("Zoom in");
-        zoomInButton.setFocusable(false);
-        zoomInButton.setFocusableInTouchMode(false);
-        zoomInButton.setOnClickListener(view -> changeZoom(1));
-        addressBar.addView(zoomInButton);
-
         fullscreenButton = createToolbarButton("⛶");
         fullscreenButton.setContentDescription("Enter fullscreen");
         fullscreenButton.setOnClickListener(view -> toggleFullscreen());
@@ -1738,15 +1730,33 @@ public final class MainActivity extends Activity {
             )
         );
 
-        webContainer = new FrameLayout(this);
+        // The zoom slider floats above the web views in a separate frame, so
+        // bringing a session's WebView to the front never covers it.
+        FrameLayout contentFrame = new FrameLayout(this);
         root.addView(
-            webContainer,
+            contentFrame,
             new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
                 1f
             )
         );
+        webContainer = new FrameLayout(this);
+        contentFrame.addView(
+            webContainer,
+            new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        );
+        zoomOverlay = createZoomOverlay();
+        FrameLayout.LayoutParams zoomParams = new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP | Gravity.CENTER_HORIZONTAL
+        );
+        zoomParams.topMargin = dp(8);
+        contentFrame.addView(zoomOverlay, zoomParams);
 
         webContainer.addOnLayoutChangeListener(
             (view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
@@ -2222,31 +2232,94 @@ public final class MainActivity extends Activity {
         activeSessionKey = null;
     }
 
-    private void changeZoom(int direction) {
-        if (webView == null || direction == 0) {
+    private LinearLayout createZoomOverlay() {
+        LinearLayout overlay = new LinearLayout(this);
+        overlay.setOrientation(LinearLayout.HORIZONTAL);
+        overlay.setGravity(Gravity.CENTER_VERTICAL);
+        overlay.setPadding(dp(14), dp(4), dp(12), dp(4));
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(Color.argb(190, 243, 243, 243));
+        background.setCornerRadius(dp(20));
+        background.setStroke(Math.max(1, dp(1) / 2), Color.argb(40, 0, 0, 0));
+        overlay.setBackground(background);
+        overlay.setElevation(dp(2));
+
+        TextView smaller = new TextView(this);
+        smaller.setText("A");
+        smaller.setTextSize(11);
+        smaller.setTextColor(Color.argb(170, 0, 0, 0));
+        smaller.setTypeface(Typeface.DEFAULT_BOLD);
+        overlay.addView(smaller);
+
+        SeekBar slider = new SeekBar(this);
+        slider.setMax(MAX_LAYOUT_ZOOM_STEPS - MIN_LAYOUT_ZOOM_STEPS);
+        slider.setProgress(layoutZoomSteps - MIN_LAYOUT_ZOOM_STEPS);
+        slider.setContentDescription("UI zoom");
+        slider.setProgressTintList(ColorStateList.valueOf(ACCENT));
+        slider.setThumbTintList(ColorStateList.valueOf(ACCENT));
+        slider.setProgressBackgroundTintList(ColorStateList.valueOf(Color.argb(90, 0, 0, 0)));
+        slider.setPadding(dp(12), 0, dp(12), 0);
+        slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                int steps = progress + MIN_LAYOUT_ZOOM_STEPS;
+                updateZoomPercentLabel(steps);
+                if (fromUser && !zoomSliderTracking) {
+                    // Keyboard or accessibility adjustments apply immediately.
+                    setLayoutZoomSteps(steps);
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+                zoomSliderTracking = true;
+                addressBarHandler.removeCallbacks(autoHideAddressBar);
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                zoomSliderTracking = false;
+                // Relayout once on release instead of on every step while dragging.
+                setLayoutZoomSteps(seekBar.getProgress() + MIN_LAYOUT_ZOOM_STEPS);
+                scheduleAddressBarAutoHide();
+            }
+        });
+        overlay.addView(slider, new LinearLayout.LayoutParams(dp(180), dp(36)));
+
+        TextView larger = new TextView(this);
+        larger.setText("A");
+        larger.setTextSize(17);
+        larger.setTextColor(Color.argb(170, 0, 0, 0));
+        larger.setTypeface(Typeface.DEFAULT_BOLD);
+        overlay.addView(larger);
+
+        zoomPercentLabel = new TextView(this);
+        zoomPercentLabel.setTextSize(12);
+        zoomPercentLabel.setTextColor(Color.BLACK);
+        zoomPercentLabel.setTypeface(Typeface.MONOSPACE);
+        zoomPercentLabel.setGravity(Gravity.END);
+        zoomPercentLabel.setMinWidth(dp(44));
+        overlay.addView(zoomPercentLabel);
+        updateZoomPercentLabel(layoutZoomSteps);
+        return overlay;
+    }
+
+    private void updateZoomPercentLabel(int steps) {
+        if (zoomPercentLabel == null) {
             return;
         }
+        int zoomPercent = (int) Math.round(Math.pow(LAYOUT_ZOOM_FACTOR, steps) * 100.0);
+        zoomPercentLabel.setText(zoomPercent + "%");
+    }
 
-        int nextSteps = Math.max(
-            MIN_LAYOUT_ZOOM_STEPS,
-            Math.min(MAX_LAYOUT_ZOOM_STEPS, layoutZoomSteps + direction)
-        );
-        if (nextSteps == layoutZoomSteps) {
+    private void setLayoutZoomSteps(int steps) {
+        int nextSteps = Math.max(MIN_LAYOUT_ZOOM_STEPS, Math.min(MAX_LAYOUT_ZOOM_STEPS, steps));
+        if (webView == null || nextSteps == layoutZoomSteps) {
             return;
         }
-
         layoutZoomSteps = nextSteps;
         preferences.edit().putInt(LAYOUT_ZOOM_STEPS_KEY, layoutZoomSteps).apply();
         applyLayoutZoom(webView, true);
-
-        int zoomPercent = (int) Math.round(
-            Math.pow(LAYOUT_ZOOM_FACTOR, layoutZoomSteps) * 100.0
-        );
-        Toast.makeText(
-            this,
-            "UI zoom " + zoomPercent + "%",
-            Toast.LENGTH_SHORT
-        ).show();
     }
 
     private int calculateLayoutViewportWidth() {
@@ -2498,6 +2571,9 @@ public final class MainActivity extends Activity {
             return;
         }
         addressBar.setVisibility(View.VISIBLE);
+        if (zoomOverlay != null) {
+            zoomOverlay.setVisibility(View.VISIBLE);
+        }
         scheduleAddressBarAutoHide();
     }
 
@@ -2521,6 +2597,9 @@ public final class MainActivity extends Activity {
         addressBarHandler.removeCallbacks(autoHideAddressBar);
         if (addressBar != null) {
             addressBar.setVisibility(View.GONE);
+        }
+        if (zoomOverlay != null) {
+            zoomOverlay.setVisibility(View.GONE);
         }
     }
 
