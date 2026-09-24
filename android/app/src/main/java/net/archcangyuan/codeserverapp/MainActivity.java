@@ -119,36 +119,24 @@ public final class MainActivity extends Activity {
               `width=${width}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`;
             const token = (window.__codeServerAppViewportToken || 0) + 1;
             window.__codeServerAppViewportToken = token;
-            // On a web RDP page (IronRDP) a layout resize makes the remote desktop resize
-            // or reconnect the session, and a reload always reconnects; both ask for the
-            // credentials again. There, zoom only changes the page scale: the layout width
-            // the session started with is kept and the page never reloads.
+            // On a web RDP page (IronRDP) a reload always reconnects the remote session,
+            // which asks for the credentials again, so there is never a fallback reload.
+            // Width changes still resize the remote desktop live, but are spaced at least
+            // 1.5 s apart (only the latest one is applied) so the session is not asked to
+            // resize repeatedly in quick succession.
             if (Number(fitWidth) > 0 && window.__codeServerAppIsRdpPage?.()) {
-              const layoutWidth = Math.max(
-                200,
-                Math.round(
-                  Number(window.__codeServerAppViewportWidth)
-                    || document.documentElement.clientWidth
-                    || width
-                )
-              );
-              const rdpScale = Math.max(
-                0.1,
-                Math.min(5, Math.max(Number(fitWidth) / layoutWidth, Number(fitWidth) / width))
-              ).toFixed(4);
-              viewport.setAttribute(
-                'content',
-                `width=${layoutWidth}, initial-scale=${rdpScale}, minimum-scale=${rdpScale}, `
-                  + `maximum-scale=${rdpScale}, user-scalable=yes`
-              );
-              window.setTimeout(() => {
-                if (window.__codeServerAppViewportToken !== token) return;
-                viewport.setAttribute(
-                  'content',
-                  `width=${layoutWidth}, minimum-scale=0.1, maximum-scale=5.0, user-scalable=yes`
+              allowReload = false;
+              const now = Date.now();
+              const nextAllowed = (window.__codeServerAppRdpResizeAt || 0) + 1500;
+              window.clearTimeout(window.__codeServerAppRdpResizeTimer);
+              if (now < nextAllowed) {
+                window.__codeServerAppRdpResizeTimer = window.setTimeout(
+                  () => setViewportWidth(requestedWidth, fitWidth, false),
+                  nextAllowed - now
                 );
-              }, 180);
-              return layoutWidth;
+                return Number(window.__codeServerAppViewportWidth) || width;
+              }
+              window.__codeServerAppRdpResizeAt = now;
             }
             if (Number(fitWidth) > 0) {
               const scale = Math.max(0.1, Math.min(5, Number(fitWidth) / width)).toFixed(4);
