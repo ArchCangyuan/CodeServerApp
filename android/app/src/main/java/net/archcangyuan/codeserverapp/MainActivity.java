@@ -1583,11 +1583,9 @@ public final class MainActivity extends Activity {
     private String activeSessionKey;
     private Button controlButton;
     private Button shiftButton;
-    private Button fullscreenButton;
     private Button mouseModeButton;
     private boolean controlLocked;
     private boolean shiftLocked;
-    private boolean fullscreen;
     private boolean keepAliveEnabled;
     private boolean mouseModeEnabled;
     private int layoutZoomSteps;
@@ -1711,11 +1709,6 @@ public final class MainActivity extends Activity {
         reloadButton.setContentDescription("Reload code-server");
         reloadButton.setOnClickListener(view -> webView.reload());
         addressBar.addView(reloadButton);
-
-        fullscreenButton = createToolbarButton("⛶");
-        fullscreenButton.setContentDescription("Enter fullscreen");
-        fullscreenButton.setOnClickListener(view -> toggleFullscreen());
-        addressBar.addView(fullscreenButton);
 
         Button settingsButton = createToolbarButton("⚙");
         settingsButton.setContentDescription("Settings");
@@ -1841,7 +1834,7 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             getWindow().setDecorFitsSystemWindows(false);
         }
-        applyFullscreenState();
+        hideSystemBars();
     }
 
     private void showSettings() {
@@ -2006,95 +1999,59 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void toggleFullscreen() {
-        fullscreen = !fullscreen;
-        applyFullscreenState();
-    }
-
-    private void applyFullscreenState() {
+    /**
+     * The app always runs fullscreen: system bars stay hidden and only appear
+     * transiently when swiped in from the screen edge.
+     */
+    private void hideSystemBars() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
-                if (fullscreen) {
-                    controller.hide(WindowInsets.Type.systemBars());
-                    controller.setSystemBarsBehavior(
-                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                    );
-                } else {
-                    controller.show(WindowInsets.Type.systemBars());
-                }
+                controller.hide(WindowInsets.Type.systemBars());
+                controller.setSystemBarsBehavior(
+                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                );
             }
         } else {
-            int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
-            if (fullscreen) {
-                flags |= View.SYSTEM_UI_FLAG_FULLSCREEN
+            getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
-            }
-            getWindow().getDecorView().setSystemUiVisibility(flags);
-        }
-
-        if (fullscreenButton != null) {
-            fullscreenButton.setContentDescription(
-                fullscreen ? "Exit fullscreen" : "Enter fullscreen"
-            );
-            fullscreenButton.setTextColor(fullscreen ? Color.WHITE : Color.BLACK);
-            fullscreenButton.setBackgroundTintList(
-                ColorStateList.valueOf(fullscreen ? ACCENT : KEY_BACKGROUND)
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
             );
         }
+    }
 
-        if (rootContainer != null) {
-            if (fullscreen) {
-                rootContainer.setPadding(0, 0, 0, 0);
-            }
-            rootContainer.requestApplyInsets();
-        }
-
-        if (addressBar != null) {
-            if (fullscreen) {
-                hideAddressBar();
-            } else {
-                showAddressBarTemporarily();
-            }
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            // Dialogs and other windows can bring the system bars back.
+            hideSystemBars();
         }
     }
 
     private void applySafeAreaInsets(View view, WindowInsets insets) {
         boolean imeVisible;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Insets safeArea = insets.getInsets(
-                WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()
-            );
             Insets ime = insets.getInsets(WindowInsets.Type.ime());
             imeVisible = insets.isVisible(WindowInsets.Type.ime()) || ime.bottom > 0;
 
-            if (fullscreen) {
-                view.setPadding(0, 0, 0, ime.bottom);
-            } else {
-                view.setPadding(
-                    safeArea.left,
-                    safeArea.top,
-                    safeArea.right,
-                    Math.max(safeArea.bottom, ime.bottom)
-                );
-            }
+            // System bars are hidden, so only the display cutout needs space.
+            Insets cutout = insets.getInsets(WindowInsets.Type.displayCutout());
+            view.setPadding(
+                cutout.left,
+                cutout.top,
+                cutout.right,
+                Math.max(cutout.bottom, ime.bottom)
+            );
         } else {
             int bottomInset = insets.getSystemWindowInsetBottom();
             int keyboardInset = bottomInset > dp(120) ? bottomInset : 0;
             imeVisible = keyboardInset > 0;
-            if (fullscreen) {
-                view.setPadding(0, 0, 0, keyboardInset);
-            } else {
-                view.setPadding(
-                    insets.getSystemWindowInsetLeft(),
-                    insets.getSystemWindowInsetTop(),
-                    insets.getSystemWindowInsetRight(),
-                    bottomInset
-                );
-            }
+            view.setPadding(0, 0, 0, keyboardInset);
         }
         if (webView instanceof RdpInputWebView) {
             ((RdpInputWebView) webView).setImeVisible(imeVisible);
@@ -2567,7 +2524,7 @@ public final class MainActivity extends Activity {
 
     /** Shows the address bar and hides it again after five seconds. */
     private void showAddressBarTemporarily() {
-        if (addressBar == null || fullscreen) {
+        if (addressBar == null) {
             return;
         }
         addressBar.setVisibility(View.VISIBLE);
@@ -2579,18 +2536,7 @@ public final class MainActivity extends Activity {
 
     private void scheduleAddressBarAutoHide() {
         addressBarHandler.removeCallbacks(autoHideAddressBar);
-        if (!fullscreen) {
-            addressBarHandler.postDelayed(autoHideAddressBar, ADDRESS_BAR_AUTO_HIDE_MS);
-        }
-    }
-
-    private void onTopEdgePull() {
-        if (fullscreen) {
-            fullscreen = false;
-            applyFullscreenState();
-        } else {
-            showAddressBarTemporarily();
-        }
+        addressBarHandler.postDelayed(autoHideAddressBar, ADDRESS_BAR_AUTO_HIDE_MS);
     }
 
     private void hideAddressBar() {
@@ -2694,9 +2640,6 @@ public final class MainActivity extends Activity {
 
     private void openProject(ProjectProfile project) {
         switchToProjectUrl(project.url);
-        if (fullscreen) {
-            hideAddressBar();
-        }
     }
 
     private void showProjectManager() {
@@ -3083,10 +3026,7 @@ public final class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (fullscreen) {
-            fullscreen = false;
-            applyFullscreenState();
-        } else if (webView != null && webView.canGoBack()) {
+        if (webView != null && webView.canGoBack()) {
             webView.goBack();
         } else {
             super.onBackPressed();
@@ -3546,7 +3486,7 @@ public final class MainActivity extends Activity {
                     cancel.setAction(MotionEvent.ACTION_CANCEL);
                     super.dispatchTouchEvent(cancel);
                     cancel.recycle();
-                    onTopEdgePull();
+                    showAddressBarTemporarily();
                     return true;
                 }
                 if (dy < -dp(8) || dx > dp(48)) {

@@ -34,7 +34,6 @@ struct ContentView: View {
     @State private var isShowingSettings = false
     @State private var controlLocked = false
     @State private var shiftLocked = false
-    @State private var isFullscreen = false
     @State private var isAddressBarVisible = true
     @State private var addressBarHideToken = UUID()
     @Environment(\.scenePhase) private var scenePhase
@@ -48,7 +47,8 @@ struct ContentView: View {
                 browserView
             }
         }
-        .statusBarHidden(isFullscreen)
+        // The app always runs fullscreen; the address bar is pulled in on demand.
+        .statusBarHidden(true)
         .onAppear {
             if draftAddress.isEmpty {
                 draftAddress = serverURL
@@ -120,7 +120,7 @@ struct ContentView: View {
 
     private var browserView: some View {
         VStack(spacing: 0) {
-            if !isFullscreen && isAddressBarVisible {
+            if isAddressBarVisible {
                 addressBar
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
@@ -132,7 +132,7 @@ struct ContentView: View {
             )
             .overlay(alignment: .top) {
                 // Shown and hidden together with the address bar.
-                if !isFullscreen && isAddressBarVisible {
+                if isAddressBarVisible {
                     ZoomSlider(
                         steps: webViewStore.zoomSteps,
                         onEditingChanged: { editing in
@@ -173,16 +173,11 @@ struct ContentView: View {
                 }
             )
         }
-        .ignoresSafeArea(.container, edges: isFullscreen ? .top : [])
-        .animation(.easeInOut(duration: 0.18), value: isFullscreen)
         .animation(.easeInOut(duration: 0.18), value: isAddressBarVisible)
         .onChange(of: webViewStore.pageLoadCount) { _ in
             showAddressBarTemporarily()
         }
         .onChange(of: webViewStore.topEdgePullCount) { _ in
-            if isFullscreen {
-                isFullscreen = false
-            }
             showAddressBarTemporarily()
         }
         .onChange(of: addressFieldFocused) { focused in
@@ -201,7 +196,7 @@ struct ContentView: View {
                     .padding(.vertical, 8)
                     .background(.black.opacity(0.78))
                     .clipShape(Capsule())
-                    .padding(.top, isFullscreen ? 18 : 8)
+                    .padding(.top, 8)
                     .transition(.opacity)
                     .allowsHitTesting(false)
             }
@@ -237,13 +232,6 @@ struct ContentView: View {
 
             toolbarButton(systemName: "arrow.clockwise", label: "Reload code-server") {
                 webViewStore.reload()
-            }
-
-            toolbarButton(
-                systemName: "arrow.up.left.and.arrow.down.right",
-                label: "Enter fullscreen"
-            ) {
-                isFullscreen = true
             }
 
             toolbarButton(systemName: "gearshape", label: "Settings") {
