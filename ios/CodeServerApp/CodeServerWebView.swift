@@ -1369,6 +1369,10 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
     @Published private(set) var zoomPercent: Int
     @Published private(set) var statusMessage: String?
     @Published private(set) var currentPageAddress = ""
+    /// Incremented when the active session finishes loading a page.
+    @Published private(set) var pageLoadCount = 0
+    /// Incremented when the user pulls down from the top edge of the web content.
+    @Published private(set) var topEdgePullCount = 0
 
     private final class ProjectSession {
         let key: String
@@ -1426,6 +1430,9 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         }
         view.onWidthChanged = { [weak self] in
             self?.syncMouseModeOnAllSessions()
+        }
+        view.onTopEdgePull = { [weak self] in
+            self?.topEdgePullCount += 1
         }
         for session in sessions.values {
             view.install(session.webView)
@@ -1863,6 +1870,9 @@ final class CodeServerWebViewStore: NSObject, ObservableObject, WKNavigationDele
         }
         session.lastFinishedURL = webView.url?.absoluteString
         publishAddress(for: session)
+        if session.key == activeSessionKey {
+            pageLoadCount += 1
+        }
         let zoomChanged = (session.appliedZoomSteps == nil && layoutZoomSteps != 0)
             || (session.appliedZoomSteps != nil && session.appliedZoomSteps != layoutZoomSteps)
         applyLayoutZoom(to: session, allowFallbackReload: zoomChanged)
@@ -1916,14 +1926,44 @@ final class WebViewSessionContainerView: UIView {
         didSet { keyboardCapture.onEnter = onEnter }
     }
     var onWidthChanged: (() -> Void)?
+    var onTopEdgePull: (() -> Void)?
 
     private let keyboardCapture = KeyboardCaptureTextView()
     private var lastLayoutWidth: CGFloat = 0
+    fileprivate let topEdgeZoneHeight: CGFloat = 32
+    private let topEdgePullDistance: CGFloat = 48
+    private var topEdgePullFired = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .systemBackground
         addSubview(keyboardCapture)
+
+        // Recognizes a downward pull that starts at the top edge without blocking
+        // taps there; the web view keeps receiving touches until the pull begins.
+        let topEdgePull = UIPanGestureRecognizer(
+            target: self,
+            action: #selector(handleTopEdgePull(_:))
+        )
+        topEdgePull.delegate = self
+        addGestureRecognizer(topEdgePull)
+    }
+
+    @objc private func handleTopEdgePull(_ recognizer: UIPanGestureRecognizer) {
+        switch recognizer.state {
+        case .began:
+            topEdgePullFired = false
+        case .changed:
+            let translation = recognizer.translation(in: self)
+            if !topEdgePullFired,
+               translation.y >= topEdgePullDistance,
+               abs(translation.x) < translation.y {
+                topEdgePullFired = true
+                onTopEdgePull?()
+            }
+        default:
+            topEdgePullFired = false
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -1963,6 +2003,27 @@ final class WebViewSessionContainerView: UIView {
             lastLayoutWidth = bounds.width
             onWidthChanged?()
         }
+    }
+}
+
+extension WebViewSessionContainerView: UIGestureRecognizerDelegate {
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard let pan = gestureRecognizer as? UIPanGestureRecognizer else { return true }
+        let translation = pan.translation(in: self)
+        let start = CGPoint(
+            x: pan.location(in: self).x - translation.x,
+            y: pan.location(in: self).y - translation.y
+        )
+        return start.y <= topEdgeZoneHeight
+            && translation.y > 0
+            && abs(translation.x) < translation.y
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        true
     }
 }
 

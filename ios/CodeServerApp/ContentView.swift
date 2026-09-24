@@ -35,6 +35,8 @@ struct ContentView: View {
     @State private var controlLocked = false
     @State private var shiftLocked = false
     @State private var isFullscreen = false
+    @State private var isAddressBarVisible = true
+    @State private var addressBarHideToken = UUID()
     @Environment(\.scenePhase) private var scenePhase
     @FocusState private var addressFieldFocused: Bool
 
@@ -118,7 +120,7 @@ struct ContentView: View {
 
     private var browserView: some View {
         VStack(spacing: 0) {
-            if !isFullscreen {
+            if !isFullscreen && isAddressBarVisible {
                 addressBar
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
@@ -152,9 +154,21 @@ struct ContentView: View {
         }
         .ignoresSafeArea(.container, edges: isFullscreen ? .top : [])
         .animation(.easeInOut(duration: 0.18), value: isFullscreen)
-        .overlay(alignment: .top) {
+        .animation(.easeInOut(duration: 0.18), value: isAddressBarVisible)
+        .onChange(of: webViewStore.pageLoadCount) { _ in
+            showAddressBarTemporarily()
+        }
+        .onChange(of: webViewStore.topEdgePullCount) { _ in
             if isFullscreen {
-                topEdgeExitGesture
+                isFullscreen = false
+            }
+            showAddressBarTemporarily()
+        }
+        .onChange(of: addressFieldFocused) { focused in
+            if focused {
+                addressBarHideToken = UUID()
+            } else {
+                showAddressBarTemporarily()
             }
         }
         .overlay(alignment: .top) {
@@ -229,23 +243,17 @@ struct ContentView: View {
         .background(Color(uiColor: .secondarySystemBackground))
     }
 
-    private var topEdgeExitGesture: some View {
-        VStack(spacing: 0) {
-            Color.clear
-                .frame(height: 42)
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 8)
-                        .onEnded { value in
-                            if value.translation.height >= 48,
-                               abs(value.translation.width) < 140 {
-                                isFullscreen = false
-                            }
-                        }
-                )
-            Spacer(minLength: 0)
+    /// Shows the address bar and hides it again after five seconds unless the
+    /// address field is being edited.
+    private func showAddressBarTemporarily() {
+        isAddressBarVisible = true
+        let token = UUID()
+        addressBarHideToken = token
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard addressBarHideToken == token, !addressFieldFocused else { return }
+            isAddressBarVisible = false
         }
-        .ignoresSafeArea(.container, edges: .top)
     }
 
     private func toolbarButton(

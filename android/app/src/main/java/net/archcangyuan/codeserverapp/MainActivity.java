@@ -84,6 +84,7 @@ public final class MainActivity extends Activity {
     private static final double LAYOUT_ZOOM_FACTOR = 1.1;
     private static final long PROJECT_SESSION_TTL_MS = 30L * 60L * 1_000L;
     private static final int MAX_HOT_PROJECT_SESSIONS = 10;
+    private static final long ADDRESS_BAR_AUTO_HIDE_MS = 5_000L;
     private static final int ACCENT = Color.rgb(103, 80, 164);
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
     private static final String DESKTOP_USER_AGENT =
@@ -1585,6 +1586,20 @@ public final class MainActivity extends Activity {
     private boolean mouseModeEnabled;
     private int layoutZoomSteps;
     private final Handler keepAliveHandler = new Handler(Looper.getMainLooper());
+    private final Handler addressBarHandler = new Handler(Looper.getMainLooper());
+    private final Runnable autoHideAddressBar = () -> {
+        if (addressBar == null || addressBar.getVisibility() != View.VISIBLE) {
+            return;
+        }
+        if (addressField != null && addressField.hasFocus()) {
+            // Keep the bar while an address is being typed; losing focus reschedules.
+            return;
+        }
+        if (webView == null || webView.getUrl() == null) {
+            return;
+        }
+        hideAddressBar();
+    };
     private final Runnable sessionKeepAlivePulse = new Runnable() {
         @Override
         public void run() {
@@ -1664,6 +1679,13 @@ public final class MainActivity extends Activity {
         addressField.setHint("http://192.168.1.10:8080");
         addressField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         addressField.setImeOptions(EditorInfo.IME_ACTION_GO);
+        addressField.setOnFocusChangeListener((view, hasFocus) -> {
+            if (hasFocus) {
+                addressBarHandler.removeCallbacks(autoHideAddressBar);
+            } else {
+                scheduleAddressBarAutoHide();
+            }
+        });
         addressField.setOnEditorActionListener((view, actionId, event) -> {
             boolean enterPressed = event != null
                 && event.getKeyCode() == KeyEvent.KEYCODE_ENTER
@@ -2025,7 +2047,7 @@ public final class MainActivity extends Activity {
             if (fullscreen) {
                 hideAddressBar();
             } else {
-                addressBar.setVisibility(View.VISIBLE);
+                showAddressBarTemporarily();
             }
         }
     }
@@ -2168,6 +2190,9 @@ public final class MainActivity extends Activity {
                 lastFinishedUrls.put(view, url);
                 updateAddressFromWebView(view, url);
                 installKeyboardBridge(view, true);
+                if (view == webView) {
+                    showAddressBarTemporarily();
+                }
             }
 
         });
@@ -2334,6 +2359,7 @@ public final class MainActivity extends Activity {
         preferences.edit().putString(ADDRESS_KEY, displayedAddress).apply();
         addressField.clearFocus();
         targetSession.webView.requestFocus();
+        showAddressBarTemporarily();
     }
 
     private ProjectSession findProjectSession(String address) {
@@ -2466,7 +2492,33 @@ public final class MainActivity extends Activity {
         switchToProjectUrl(normalized);
     }
 
+    /** Shows the address bar and hides it again after five seconds. */
+    private void showAddressBarTemporarily() {
+        if (addressBar == null || fullscreen) {
+            return;
+        }
+        addressBar.setVisibility(View.VISIBLE);
+        scheduleAddressBarAutoHide();
+    }
+
+    private void scheduleAddressBarAutoHide() {
+        addressBarHandler.removeCallbacks(autoHideAddressBar);
+        if (!fullscreen) {
+            addressBarHandler.postDelayed(autoHideAddressBar, ADDRESS_BAR_AUTO_HIDE_MS);
+        }
+    }
+
+    private void onTopEdgePull() {
+        if (fullscreen) {
+            fullscreen = false;
+            applyFullscreenState();
+        } else {
+            showAddressBarTemporarily();
+        }
+    }
+
     private void hideAddressBar() {
+        addressBarHandler.removeCallbacks(autoHideAddressBar);
         if (addressBar != null) {
             addressBar.setVisibility(View.GONE);
         }
@@ -2995,6 +3047,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         keepAliveHandler.removeCallbacks(sessionKeepAlivePulse);
+        addressBarHandler.removeCallbacks(autoHideAddressBar);
         boolean activeViewIsCached = activeSessionKey != null;
         for (ProjectSession session : new ArrayList<>(projectSessions.values())) {
             destroyWebView(session.webView);
@@ -3368,9 +3421,16 @@ public final class MainActivity extends Activity {
         }
     }
 
+    /**
+     * Watches for a downward pull from the top edge of the content while the address
+     * bar is hidden. Touches still reach the page until the pull is recognized, so
+     * taps near the top edge keep working; the page then receives a cancel.
+     */
     private final class EdgeGestureLayout extends LinearLayout {
+        private float edgePullStartX;
         private float edgePullStartY;
         private boolean trackingEdgePull;
+        private boolean consumingEdgePull;
 
         EdgeGestureLayout(Context context) {
             super(context);
@@ -3378,36 +3438,42 @@ public final class MainActivity extends Activity {
 
         @Override
         public boolean dispatchTouchEvent(MotionEvent event) {
-            if (fullscreen && addressBar != null && addressBar.getVisibility() != View.VISIBLE) {
-                switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    if (event.getY() <= dp(32)) {
-                        edgePullStartY = event.getY();
-                        trackingEdgePull = true;
-                        return true;
-                    }
-                    break;
-                case MotionEvent.ACTION_MOVE:
-                    if (trackingEdgePull) {
-                        if (event.getY() - edgePullStartY >= dp(48)) {
-                            trackingEdgePull = false;
-                            fullscreen = false;
-                            applyFullscreenState();
-                        }
-                        return true;
-                    }
-                    break;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    if (trackingEdgePull) {
-                        trackingEdgePull = false;
-                        return true;
-                    }
-                    break;
-                default:
-                    break;
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN) {
+                trackingEdgePull = false;
+                consumingEdgePull = false;
+                boolean barHidden = addressBar != null
+                    && addressBar.getVisibility() != View.VISIBLE;
+                float contentY = event.getY() - getPaddingTop();
+                if (barHidden && contentY >= 0f && contentY <= dp(32)) {
+                    edgePullStartX = event.getX();
+                    edgePullStartY = event.getY();
+                    trackingEdgePull = true;
                 }
-            } else if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+            }
+            if (consumingEdgePull) {
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    consumingEdgePull = false;
+                }
+                return true;
+            }
+            if (trackingEdgePull && action == MotionEvent.ACTION_MOVE) {
+                float dx = Math.abs(event.getX() - edgePullStartX);
+                float dy = event.getY() - edgePullStartY;
+                if (dy >= dp(48) && dx < dy) {
+                    trackingEdgePull = false;
+                    consumingEdgePull = true;
+                    MotionEvent cancel = MotionEvent.obtain(event);
+                    cancel.setAction(MotionEvent.ACTION_CANCEL);
+                    super.dispatchTouchEvent(cancel);
+                    cancel.recycle();
+                    onTopEdgePull();
+                    return true;
+                }
+                if (dy < -dp(8) || dx > dp(48)) {
+                    trackingEdgePull = false;
+                }
+            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
                 trackingEdgePull = false;
             }
             return super.dispatchTouchEvent(event);
